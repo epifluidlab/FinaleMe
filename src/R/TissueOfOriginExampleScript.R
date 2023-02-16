@@ -5,104 +5,79 @@
 # Author: yaping
 ###############################################################################
 
-
-percBestGlm<-function(obs,ref){
-	dataF<-data.frame(ref=ref,obs=obs)
-	perc.predict=rep(0,dim(ref)[2])
-	names(perc.predict)=colnames(dataF)[1:dim(ref)[2]]
-	
-	ans<-bestglm(dataF, IC="BICq")
-	selectNames<-names(ans$BestModel$coefficients)
-	selectNames<-selectNames[2:length(selectNames)]
-	
-	X <- as.matrix(dataF[,selectNames])
-	Y <- as.matrix(obs)
-	Rinv <- solve(chol(t(X) %*% X));
-	C <- cbind(rep(1,length(selectNames)), diag(length(selectNames)))
-	b <- c(1,rep(0,length(selectNames)))
-	d <- t(Y) %*% X  
-	result<-solve.QP(Dmat = Rinv, factorized = TRUE, dvec = d, Amat = C, bvec = b, meq = 1)
-	perc.predict[selectNames]=as.numeric(result$solution)
-	perc.predict
-}
-
-setwd("/home/unix/li/compbio/project/cfDNA/simulation_mixture/encode_mix/mix_3_samples")
 library(quadprog)
-s1<-read.table("GM12878.ENCFF681ASN.GRCh38.mean_methy.no_overlap.window-100000.step-100000.min_data-100.bed",sep="\t",header=F)
-rownames(s1)<-s1[,4]
-s2<-read.table("K562.ENCFF963XLT.GRCh38.mean_methy.no_overlap.window-100000.step-100000.min_data-100.bed",sep="\t",header=F)
-rownames(s2)<-s2[,4]
-s3<-read.table("HepG2.ENCFF957OIM.GRCh38.mean_methy.no_overlap.window-100000.step-100000.min_data-100.bed",sep="\t",header=F)
-rownames(s3)<-s3[,4]
-s4<-read.table("H1.ENCFF546TLK.GRCh38.mean_methy.no_overlap.window-100000.step-100000.min_data-100.bed",sep="\t",header=F)
-rownames(s4)<-s4[,4]
+tissue_of_origin<-function(dat){
+	dat<-dat[rowSums(is.na(dat))==0 & rowSums(is.infinite(as.matrix(dat)))==0,]
 
-common<-intersect(rownames(s1),rownames(s2))
-common<-intersect(common,rownames(s3))
-common<-intersect(common,rownames(s4))
+	X<-as.matrix(cbind(dat[,2:length(dat[1,])]))
+	Y<-dat[,1]
 
-ref=data.frame(s1=s1[common,5], s2=s2[common,5],s3=s3[common,5],s4=s4[common,5])
-rownames(ref)=common
-
-predict_ratio.no_overlap<-NULL
-obs_ratio.no_overlap<-NULL
-rmses.no_overlap<-NULL
-for(f in list.files(path = ".", pattern = "sampled_3000000.window-100000.step-100000.min_data-100.bed")){
-	data<-read.table(f,sep="\t",header=F)
-	rownames(data)<-data[,4]
-	common.file<-intersect(common,rownames(data))
-	obs<-data[common.file,5]
-	result<-percBestGlm(ref=ref[common.file,],obs=obs)
-	predict_ratio.no_overlap<-rbind(predict_ratio.no_overlap,as.numeric(result))
-	
-	r1<-as.numeric(gsub('GM12878.ENCFF681ASN.(.*).K562.ENCFF963XLT.*','\\1',f))
-	r2<-as.numeric(gsub('.*.K562.ENCFF963XLT.(.*).HepG2.ENCFF957OIM.*','\\1',f))
-	if(is.na(r2)){
-		r2<-as.numeric(gsub('.*.K562.ENCFF963XLT.(.*).H1.ENCFF546TLK.*','\\1',f))
-	}
-	r3<-as.numeric(gsub('.*.HepG2.ENCFF957OIM.(.*).sampled_3000000.*','\\1',f))
-	if(is.na(r3)){
-		r3=0
-	}
-	r4<-as.numeric(gsub('.*.H1.ENCFF546TLK.(.*).sampled_3000000.*','\\1',f))
-	if(is.na(r4)){
-		r4=0
-	}
-	rmses.no_overlap<-c(rmses.no_overlap,sqrt(((r1-result[1])^2+(r2-result[2])^2 + (r3-result[3])^2 + (r4-result[4])^2)/4))
-	obs_ratio.no_overlap<-rbind(obs_ratio.no_overlap,c(r1,r2,r3,r4))
-	print(f)
-	print(result)
+	Rinv <- solve(chol(t(X) %*% X));
+	C <- cbind(rep(1,dim(X)[2]), diag(dim(X)[2]))
+	b <- c(1,rep(0,dim(X)[2]))
+	d <- t(Y) %*% X
+	result<-solve.QP(Dmat = Rinv, factorized = TRUE, dvec = d, Amat = C, bvec=b, meq=1)
+	result$solution
 }
 
+setwd("/jet/home/dnaase/startup/projects/ccinference/broad_data/wgs_bam/too")
+raw.1kb<-read.table("b37.autosome.cpgIsland_plus_shore_1kb_intervals.add_value.methy.wgbs_ref_14_samples.bed.gz",sep="\t",header=F)
+name.order<-read.table("names_order.ref_panel_breast_prostate.txt",sep="\t",header=F)
 
-pdf("tissue_of_origin_20160817.heatmap.4tissues_encode.infer_best_subset.predicted.pdf", paper="special", height=5, width=20)
-par(oma=c(0, 0, 0, 0),mar=c(5, 5, 3, 1))
-m<-t(apply(predict_ratio.no_overlap, 1, function(x)abs(x)/sum(abs(x),na.rm=T)))
-image(1:nrow(m), 1:ncol(m), m, col = colorRampPalette(c("white","red"))(100), axes = FALSE, xlab="",ylab="")
-axis(2, 1:ncol(m), c("GM12878","K562","HepG2","H1"), las=2)
-axis(1, 1:nrow(m), rownames(m), las=1)
-for (y in 1:ncol(m))
-	for (x in 1:nrow(m))
-		text(x, y, format(m[x,y]*100,digits=2))
+methy.mat<-NULL
+for(i in seq(7,length(raw.1kb[1,]),2)){
+	j=i+1
+	cov = raw.1kb[,j]
+	cov[cov*1000<10]=0
+	s=as.numeric(raw.1kb[,i]/cov)
+	methy.mat<-cbind(methy.mat,s)
+}
+rownames(methy.mat)<-gsub("chr","",raw.1kb[,4])
+colnames(methy.mat)<-name.order[,2]
 
-dev.off()
+methy.mat=methy.mat[,-c(2,4,5,13)]
+name.order=name.order[-c(2,4,5,13),]
 
+row.sd<-apply(methy.mat,1, sd, na.rm = TRUE)
+quantile(row.sd,seq(0,1,0.1), na.rm=T)
 
-pdf("tissue_of_origin_20160817.heatmap.4tissues_encode.infer_best_subset.observed.pdf", paper="special", height=5, width=20)
-par(oma=c(0, 0, 0, 0),mar=c(5, 5, 3, 1))
-m<-t(apply(obs_ratio.no_overlap, 1, function(x)abs(x)/sum(abs(x),na.rm=T)))
-image(1:nrow(m), 1:ncol(m), m, col = colorRampPalette(c("white","red"))(100), axes = FALSE, xlab="",ylab="")
-axis(2, 1:ncol(m), c("GM12878","K562","HepG2","H1"), las=2)
-axis(1, 1:nrow(m), rownames(m), las=1)
-for (y in 1:ncol(m))
-	for (x in 1:nrow(m))
-		text(x, y, format(m[x,y]*100,digits=2))
+methy.mat.mostVar=methy.mat[row.sd>quantile(row.sd,seq(0,1,0.01), na.rm=T)[100],]
+methy.mat.mostVar=methy.mat.mostVar[rowSums(is.na(methy.mat.mostVar),na.rm=T)==0,]
+methy.mat.mostVar=methy.mat.mostVar[rowSums(is.infinite(methy.mat.mostVar),na.rm=T)==0,]
+methy.mat.mostVar[methy.mat.mostVar<0.1]=0
+methy.mat.mostVar[methy.mat.mostVar>=0.1]=1
 
-dev.off()
+methy.mat.mostVar=methy.mat.mostVar[,c(6,1,7,5,4,2,8,3,9,10)]
+name.order=name.order[c(6,1,7,5,4,2,8,3,9,10),]
 
-pdf("tissue_of_origin_20160817.heatmap.4tissues_encode.infer_best_subset.RMSE.pdf", paper="special", height=5, width=10)
-par(oma=c(0, 0, 0, 0),mar=c(4, 4, 3, 1))
-barplot(rmses.no_overlap*100,ylab="RMSE on percentage",xlab="Samples",main="",ylim=c(0,20),names.arg=1:nrow(m))
-abline(h=1,lty=2)
-dev.off()
+cfdna.1kb<-read.table("b37.autosome.cpgIsland_plus_shore_1kb_intervals.self_train_mincg10.bin1.add_value.methy.broad_deep_wgs_wgbs_trim_3end_50bp.bed.gz",sep="\t",header=F)
+cfdna.name.order<-read.table("names_order.deep_wgs_wgbs.txt",sep="\t",header=F)
 
+methy.cfmat<-NULL
+for(i in seq(7,length(cfdna.1kb[1,]),2)){
+	j=i+1
+	cov = cfdna.1kb[,j]
+	cov[cov*1000<10]=0
+	s=as.numeric(cfdna.1kb[,i]/cov)
+	methy.cfmat<-cbind(methy.cfmat,s)
+}
+rownames(methy.cfmat)<-cfdna.1kb[,4]
+colnames(methy.cfmat)<-cfdna.name.order[,2]
+methy.cfmat=methy.cfmat[rowSums(is.na(methy.cfmat),na.rm=T)==0,]
+methy.cfmat=methy.cfmat[rowSums(is.infinite(methy.cfmat),na.rm=T)==0,]
+methy.cfmat[methy.cfmat<0.1]=0
+methy.cfmat[methy.cfmat>=0.1]=1
+
+common<-intersect(rownames(methy.cfmat),rownames(methy.mat.mostVar))
+methy.cfmat.common<-methy.cfmat[common,]
+methy.mat.ref<-methy.mat.mostVar[common,]
+
+too_result.1kb<-NULL
+for(i in 1:length(methy.cfmat.common[1,])){
+	dat<-cbind(methy.cfmat.common[,i],methy.mat.ref)
+	res<-tissue_of_origin(dat)
+	too_result.1kb<-rbind(too_result.1kb,res)
+}
+colnames(too_result.1kb)<-name.order[,2]
+rownames(too_result.1kb)<-cfdna.name.order[,2]
+too_result.1kb[too_result.1kb<0.001]=0
