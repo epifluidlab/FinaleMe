@@ -6,7 +6,7 @@
       <configuration>
         <archive>
           <manifest>
-            <mainClass>main.java.org.cchmc.epifluidlab.methhmm.hmm.MethHMM</mainClass>
+            <mainClass>org.cchmc.epifluidlab.methhmm.hmm.MethHMM</mainClass>
           </manifest>
         </archive>
         <descriptorRefs>

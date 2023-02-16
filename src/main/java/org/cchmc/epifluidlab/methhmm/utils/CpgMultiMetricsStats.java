@@ -61,11 +61,11 @@ public class CpgMultiMetricsStats {
 	@Option(name="-minMapQ",usage="minimum mapping quality score required to check. Default: 30")
 	public int minMapQ = 30;
 
-	@Option(name="-maxFragLen",usage="maximum fragment length allowed to check. Default: 10000")
-	public int maxFragLen = 10000;
+	@Option(name="-maxFragLen",usage="maximum fragment length allowed to check. Default: 500")
+	public int maxFragLen = 500;
 
-	@Option(name="-maxDistToFragEnd",usage="maximum distant to the end of the fragment allowed to check. in order to be copnsistent with training model. Default: 97")
-	public int maxDistToFragEnd = 97;
+	@Option(name="-maxDistToFragEnd",usage="maximum distant to the end of the fragment allowed to check. in order to be copnsistent with training model. Default: 250")
+	public int maxDistToFragEnd = 250;
 
 	@Option(name="-totalReadsInBam",usage="total number of reads used to normalize coverage column. default estimate from bam file by program. Default: -1")
 	public long totalReadsInBam = -1;
@@ -73,8 +73,8 @@ public class CpgMultiMetricsStats {
 	@Option(name="-maxCov",usage="maximum coverage allowed to check. Default: 250")
 	public int maxCov = 250;
 	
-	@Option(name="-kmerLen",usage="the K-mer length to check. Default: 4")
-	public int kmerLen = 4;
+	@Option(name="-kmerLen",usage="the K-mer length to check. Default: 0")
+	public int kmerLen = 0;
 
 	@Option(name="-kmerString",usage="the fiel contain selected K-mer to check. Otherwise, use -kmerLen to automately generate all the k-mer. Default: null")
 	public String kmerString = null;
@@ -103,8 +103,8 @@ public class CpgMultiMetricsStats {
 	@Option(name="-skipSecondEnd",usage="skip the 2nd end for the statistics. Default: false")
 	public boolean skipSecondEnd = false;
 
-	@Option(name="-skipCpgDist",usage="Skip the calcualtion of CpG distance. Default: false")
-	public boolean skipCpgDist = false;
+	@Option(name="-includeCpgDist",usage="include the distance between CpGs. Default: false")
+	public boolean includeCpgDist = false;
 
 	@Option(name="-stringentPaired",usage="Only use paired end reads that faced to each other. Default: false")
 	public boolean stringentPaired = false;
@@ -229,7 +229,7 @@ public class CpgMultiMetricsStats {
 					
 					
 						HashMap<String,IntervalTree<String>> allCpgLocCollections = new HashMap<String,IntervalTree<String>>();
-						if(!skipCpgDist){
+						if(includeCpgDist){
 							log.info("Loading all CpG intervals ... ");
 							GZIPInputStream gzipInputStream = null;
 							BufferedReader br1;
@@ -559,7 +559,7 @@ public class CpgMultiMetricsStats {
 					
 					//basic
 					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
-					if(!skipCpgDist){
+					if(includeCpgDist){
 						writer.write("\tdist_nearest_CpG");
 					}
 					writer.write(header + "\n");
@@ -727,7 +727,7 @@ public class CpgMultiMetricsStats {
 							
 						IntervalTree<String> cpgLocCollections = null;
 						double nearestCpg = Double.NaN;
-						if(!skipCpgDist){
+						if(includeCpgDist){
 							cpgLocCollections = allCpgLocCollections.get(chr);
 							Iterator<Node<String>> upstreamCpgIt = null;
 							Iterator<Node<String>> downstreamCpgIt = null;
@@ -998,7 +998,7 @@ public class CpgMultiMetricsStats {
 								//System.err.println(CcInferenceUtils.getFragOffsetFromReadsOffset(r, offSet));
 							writer.write(chr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",normalizedFragCov)
 									 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
-							if(!skipCpgDist){
+							if(includeCpgDist){
 								writer.write("\t" + nearestCpg);
 							}
 							//overlap regions
