@@ -6,7 +6,7 @@
       <configuration>
         <archive>
           <manifest>
-            <mainClass>org.cchmc.epifluidlab.methhmm.hmm.MethHMM</mainClass>
+            <mainClass>org.cchmc.epifluidlab.finaleme.hmm.FinaleMe</mainClass>
           </manifest>
         </archive>
         <descriptorRefs>
@@ -18,14 +18,14 @@
 </build>
 	
 	<groupId>org.cchmc.epifluidlab</groupId>
-  <artifactId>MethHMM</artifactId>
+  <artifactId>FinaleMe</artifactId>
   <modelVersion>4.0.0</modelVersion>
-  <name>MethHMM</name>
+  <name>FinaleMe</name>
   <packaging>jar</packaging>
   <version>0.58</version>
 	<properties>
-		<maven.compiler.source>18</maven.compiler.source>
-		<maven.compiler.target>18</maven.compiler.target>
+		<maven.compiler.source>1.8</maven.compiler.source>
+		<maven.compiler.target>1.8</maven.compiler.target>
 	</properties>
   <repositories>
     <repository>
