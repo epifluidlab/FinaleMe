@@ -6,7 +6,7 @@ FinaleMe (FragmentatIoN AnaLysis of cEll-free DNA Methylation) is a Java program
 
 Cite our paper:
 
-Liu Y# et al. (2023) FinaleMe: Predicting DNA methylation by the fragmentation patterns of plasma cell-free DNA. Preprint
+Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation patterns of plasma cell-free DNA. BioRxiv Preprint doi: [https://doi.org/10.1101/2024.01.02.573710](https://doi.org/10.1101/2024.01.02.573710)
 
 
 ## Installation
