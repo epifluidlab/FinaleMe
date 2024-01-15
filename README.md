@@ -26,11 +26,15 @@ Or use the precompiled .jar file from Releases and other .jars from lib/ directo
 
 ### Other required data:
 
-- methylation prior file in standard big wig format (can use wgbs_buffyCoat_jensen2015GB.methy.hg19.bw file directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7647046.svg)](https://doi.org/10.5281/zenodo.7647046))
-- bed files to mask the Dark regions in the genome (can use wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed files directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7647046.svg)](https://doi.org/10.5281/zenodo.7647046))
+- methylation prior file in standard big wig format (can use wgbs_buffyCoat_jensen2015GB.methy.hg19.bw file directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7647046.svg)](https://doi.org/10.5281/zenodo.7647046)). Or you can generate your own by using WGBS data in buffycoat from healthy individuals (our data is from Jensen et al. 2015 Genome Biology paper)
+- bed files to mask the Dark regions in the genome (can use wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed files directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7647046.svg)](https://doi.org/10.5281/zenodo.7647046)). Or you can download these dark region files for other reference genome.
 - Chromosome sizes: can be obtained from the FASTA file of the reference genome: `samtools faidx input.fa`. See this [example](https://github.com/epifluidlab/cragr/blob/3d419a49/inst/extdata/human_g1k_v37.chrom.sizes).
 - CG_motif.bedgraph: bedgraph file with CpG's coordinate in the reference genome
 - hg19.bit: binary version of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
+
+### Small test input data
+- bam files from chr22 in healthy individuals can be downloaded here [https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1](https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1)
+
 ## Getting started
 
 ### Input
