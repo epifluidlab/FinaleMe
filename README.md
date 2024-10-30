@@ -55,7 +55,7 @@ The analysis consists of several steps:
 java -Xmx20G -cp "target/FinaleMe-0.58-jar-with-dependencies.jar:lib/gatk-package-distribution-3.3.jar:lib/sis-jhdf5-batteries_included.jar:lib/java-genomics-io.jar:lib/igv.jar" org.cchmc.epifluidlab.finaleme.utils.CpgMultiMetricsStats hg19.2bit CG_motif.hg19.common_chr.pos_only.bedgraph CG_motif.hg19.common_chr.pos_only.bedgraph input.bam CpgMultiMetricsStats.hg19.details.bed.gz -stringentPaired -excludeRegions wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed -valueWigs methyPrior:0:wgbs_buffyCoat_jensen2015GB.methy.hg19.bw -wgsMode
 ```
 
-* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with CpG's coordinate in the reference genome
+* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with CpG's coordinate in the reference genome, which can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
 * hg19.bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 #### Step 2: train the model 
@@ -84,7 +84,7 @@ perl -e '$cmd=`cat cfdna.methy_summary.cmd.txt`;chomp($cmd); `java -Xmx10G -cp "
 ```
 
 * R script is available within src/R/TissueOfOriginExampleScript.R
-
+* The reference methylomes used in the paper can be downloaded here: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
 
 ## License
 
