@@ -1,4 +1,5 @@
-# FinaleMe
+# <img alt="dna with letters FMe" src="" height="60"> FinaleMe
+
 
 FinaleMe (FragmentatIoN AnaLysis of cEll-free DNA Methylation) is a Java program to predict DNA methylation in deep and low-coverage cell-free DNA WGS data without other training data.
 
