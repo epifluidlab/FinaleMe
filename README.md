@@ -70,7 +70,7 @@ java -Xmx100G -cp "target/FinaleMe-0.58-jar-with-dependencies.jar:lib/jahmm-0.6.
 
 #### Step 4: convert predicted result to .bw file for the visualization in genome browser
 ```
-perl src/perl/bedpredict2bw.b37.pl test test.FinaleMe.mincg7.prediction.bed.gzucsc genome tools
+perl src/perl/bedpredict2bw.b37.pl test test.FinaleMe.mincg7.prediction.bed.gz hg19.chrom.sizes
 ```
 
 #### Step 5: tissues-of-origin analysis
