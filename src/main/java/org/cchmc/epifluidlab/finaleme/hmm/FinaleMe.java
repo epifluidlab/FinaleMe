@@ -12,6 +12,7 @@ import htsjdk.samtools.util.BlockCompressedOutputStream;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -157,6 +158,21 @@ public class FinaleMe {
 	@Option(name="-cpgIndexFile", usage="CG_motif bedgraph/bed file listing all CpG positions genome-wide, for building CpG index. Required with -patOutput.")
 	public String cpgIndexFile = null;
 
+	@Option(name="-bwOutput", usage="output decode summary as bigWig files (.methy.bw/.cov.bw/.methy_count.bw). Requires -chromSizeFile. default: false")
+	public boolean bwOutput = false;
+
+	@Option(name="-chromSizeFile", usage="chromosome sizes file required by bedGraphToBigWig when -bwOutput is enabled.")
+	public String chromSizeFile = null;
+
+	@Option(name="-bedGraphToBigWig", usage="path to bedGraphToBigWig executable. default: bedGraphToBigWig")
+	public String bedGraphToBigWig = "bedGraphToBigWig";
+
+	@Option(name="-bwStripChrPrefix", usage="strip leading 'chr' from chromosome names before bigWig conversion. default: false")
+	public boolean bwStripChrPrefix = false;
+
+	@Option(name="-bwConvertChrMToMT", usage="convert chrM/M chromosome name to MT before bigWig conversion. default: false")
+	public boolean bwConvertChrMToMT = false;
+
 	
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -201,6 +217,8 @@ public class FinaleMe {
 							if(help || args.length < 3) throw new CmdLineException(parser, USAGE, new Throwable());
 							parser.parseArgument(args);
 							if (patOutput && cpgIndexFile == null) throw new CmdLineException(parser, "-patOutput requires -cpgIndexFile");
+							if (bwOutput && chromSizeFile == null) throw new CmdLineException(parser, "-bwOutput requires -chromSizeFile");
+							if (aucMode && bwOutput) throw new CmdLineException(parser, "-bwOutput is not supported with -aucMode");
 							
 						
 						}
@@ -224,6 +242,10 @@ public class FinaleMe {
 					if (patOutput) {
 						cpgIndex = loadCpgIndex(cpgIndexFile);
 					}
+					LinkedHashMap<String, Integer> chromOrder = null;
+					if (bwOutput) {
+						chromOrder = loadChromOrder(chromSizeFile);
+					}
 					if(aucMode){
 						
 						aucMode(matrixObj, modelFile, outputFile);
@@ -241,7 +263,7 @@ public class FinaleMe {
 							}
 							miniDataPoints = miniDataPointsPre;
 						}
-						decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex);
+						decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
 					}
 					
 					
@@ -729,7 +751,7 @@ public class FinaleMe {
 	
 
 	//decoding HMM
-	private double decodeHmm(MatrixObj matrixObj, String hmmFile, String outputFile, String inputFile, boolean reestimate, CpgIndex cpgIndex) throws Exception{
+	private double decodeHmm(MatrixObj matrixObj, String hmmFile, String outputFile, String inputFile, boolean reestimate, CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception{
 		System.out.println("\nDecoding ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		List<ArrayList<String>> matrixLoc = new ArrayList<ArrayList<String>>();
@@ -924,6 +946,9 @@ public class FinaleMe {
 				log.info("Skipped " + skippedFragments + " fragments for .pat/.beta output due to missing/non-consecutive CpG index mapping.");
 			}
 		}
+		if (bwOutput && chromOrder != null) {
+			writeDecodeBigWigOutputs(methySummary, outputFile, chromOrder);
+		}
 
 		PearsonsCorrelation pearson =  new PearsonsCorrelation(predData);
 		System.out.println(pearson.getCorrelationMatrix());
@@ -1095,6 +1120,218 @@ public class FinaleMe {
 				betaOut.write((byte) (total & 0xFF));
 			}
 		}
+	}
+
+	private LinkedHashMap<String, Integer> loadChromOrder(String chromSizeFile) throws IOException {
+		log.info("Loading chromosome sizes file " + chromSizeFile + " ...");
+		LinkedHashMap<String, Integer> chromOrder = new LinkedHashMap<String, Integer>();
+		InputStream input = null;
+		BufferedReader br = null;
+		int index = 0;
+		try {
+			if (chromSizeFile.endsWith(".gz")) {
+				input = new GZIPInputStream(new FileInputStream(chromSizeFile));
+			} else {
+				input = new FileInputStream(chromSizeFile);
+			}
+			br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.isEmpty() || line.startsWith("#")) {
+					continue;
+				}
+				String[] splitLines = line.split("\t");
+				if (splitLines.length < 2) {
+					continue;
+				}
+				String chr = splitLines[0];
+				if (!chromOrder.containsKey(chr)) {
+					chromOrder.put(chr, index++);
+				}
+			}
+		} finally {
+			if (br != null) {
+				br.close();
+			}
+		}
+		if (chromOrder.isEmpty()) {
+			throw new IllegalArgumentException("No chromosome entries found in -chromSizeFile: " + chromSizeFile);
+		}
+		log.info("Loaded " + chromOrder.size() + " chromosome entries for bigWig sort order.");
+		return chromOrder;
+	}
+
+	private void writeDecodeBigWigOutputs(HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary, String outputFile, LinkedHashMap<String, Integer> chromOrder) throws Exception {
+		if (methySummary == null || methySummary.isEmpty()) {
+			log.info("Skip bigWig output because decode summary is empty.");
+			return;
+		}
+		ArrayList<DecodeSummaryRow> rows = toSortedDecodeRowsForBigWig(methySummary, chromOrder);
+		if (rows.isEmpty()) {
+			log.info("Skip bigWig output because no valid decode intervals were parsed.");
+			return;
+		}
+
+		String unknownChrom = null;
+		for (DecodeSummaryRow row : rows) {
+			if (!chromOrder.containsKey(row.chr)) {
+				unknownChrom = row.chr;
+				break;
+			}
+		}
+		if (unknownChrom != null) {
+			throw new IllegalArgumentException("Chromosome '" + unknownChrom + "' from decode output is not present in -chromSizeFile. " +
+					"Consider -bwStripChrPrefix and/or -bwConvertChrMToMT if naming conventions differ.");
+		}
+
+		String base = deriveBigWigBase(outputFile);
+		File methyBedGraph = new File(base + ".methy.bedgraph");
+		File covBedGraph = new File(base + ".cov.bedgraph");
+		File methyCountBedGraph = new File(base + ".methy_count.bedgraph");
+		File methyBw = new File(base + ".methy.bw");
+		File covBw = new File(base + ".cov.bw");
+		File methyCountBw = new File(base + ".methy_count.bw");
+
+		log.info("Writing temporary bedGraph files for bigWig conversion ...");
+		writeDecodeBedGraph(methyBedGraph, rows, 0);
+		writeDecodeBedGraph(covBedGraph, rows, 1);
+		writeDecodeBedGraph(methyCountBedGraph, rows, 2);
+
+		boolean success = false;
+		try {
+			runBedGraphToBigWig(methyBedGraph, methyBw);
+			runBedGraphToBigWig(covBedGraph, covBw);
+			runBedGraphToBigWig(methyCountBedGraph, methyCountBw);
+			success = true;
+			log.info("Wrote decode bigWig outputs: " + methyBw.getPath() + ", " + covBw.getPath() + ", " + methyCountBw.getPath());
+		} finally {
+			if (success) {
+				if (!methyBedGraph.delete()) log.warn("Could not delete temporary file: " + methyBedGraph.getPath());
+				if (!covBedGraph.delete()) log.warn("Could not delete temporary file: " + covBedGraph.getPath());
+				if (!methyCountBedGraph.delete()) log.warn("Could not delete temporary file: " + methyCountBedGraph.getPath());
+			} else {
+				log.warn("Keeping temporary bedGraph files after bigWig conversion failure for troubleshooting.");
+			}
+		}
+	}
+
+	private ArrayList<DecodeSummaryRow> toSortedDecodeRowsForBigWig(HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary, LinkedHashMap<String, Integer> chromOrder) {
+		ArrayList<DecodeSummaryRow> rows = new ArrayList<DecodeSummaryRow>(methySummary.size());
+		for (Map.Entry<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> entry : methySummary.entrySet()) {
+			String[] locTmp = entry.getKey().split(":");
+			if (locTmp.length < 3) {
+				continue;
+			}
+			int start;
+			int end;
+			try {
+				start = Integer.parseInt(locTmp[1]);
+				end = Integer.parseInt(locTmp[2]);
+			} catch (NumberFormatException e) {
+				continue;
+			}
+			Pair<Pair<Integer, Integer>, Pair<Integer, Integer>> counts = entry.getValue();
+			int methyPred = counts.getFirst().getFirst();
+			int totalPred = counts.getFirst().getSecond();
+			if (totalPred <= 0) {
+				continue;
+			}
+			String normalizedChr = normalizeChrForBigWig(locTmp[0]);
+			rows.add(new DecodeSummaryRow(normalizedChr, start, end, methyPred, totalPred));
+		}
+
+		Collections.sort(rows, (a, b) -> {
+			Integer aOrder = chromOrder.get(a.chr);
+			Integer bOrder = chromOrder.get(b.chr);
+			if (aOrder != null && bOrder != null) {
+				int cmp = Integer.compare(aOrder, bOrder);
+				if (cmp != 0) {
+					return cmp;
+				}
+			} else if (aOrder != null) {
+				return -1;
+			} else if (bOrder != null) {
+				return 1;
+			}
+			int cmp = a.chr.compareTo(b.chr);
+			if (cmp != 0) {
+				return cmp;
+			}
+			cmp = Integer.compare(a.start, b.start);
+			if (cmp != 0) {
+				return cmp;
+			}
+			return Integer.compare(a.end, b.end);
+		});
+		return rows;
+	}
+
+	private void writeDecodeBedGraph(File bedGraphFile, List<DecodeSummaryRow> rows, int metricMode) throws IOException {
+		try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(bedGraphFile), StandardCharsets.UTF_8))) {
+			for (DecodeSummaryRow row : rows) {
+				String value;
+				if (metricMode == 0) {
+					value = Double.toString(row.predictMethyPercent());
+				} else if (metricMode == 1) {
+					value = Integer.toString(row.totalPred);
+				} else {
+					value = Integer.toString(row.methyPred);
+				}
+				writer.write(row.chr);
+				writer.write('\t');
+				writer.write(Integer.toString(row.start));
+				writer.write('\t');
+				writer.write(Integer.toString(row.end));
+				writer.write('\t');
+				writer.write(value);
+				writer.write('\n');
+			}
+		}
+	}
+
+	private void runBedGraphToBigWig(File bedGraphFile, File bigWigFile) throws Exception {
+		log.info("Converting " + bedGraphFile.getPath() + " -> " + bigWigFile.getPath());
+		ProcessBuilder pb = new ProcessBuilder(bedGraphToBigWig, bedGraphFile.getPath(), chromSizeFile, bigWigFile.getPath());
+		pb.redirectErrorStream(true);
+		Process process = pb.start();
+		StringBuilder commandOutput = new StringBuilder();
+		try (BufferedReader processReader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+			String line;
+			while ((line = processReader.readLine()) != null) {
+				commandOutput.append(line).append('\n');
+			}
+		}
+		int exitCode = process.waitFor();
+		if (exitCode != 0) {
+			throw new IOException("bedGraphToBigWig failed (exit " + exitCode + ") for " + bedGraphFile.getPath() + ":\n" + commandOutput.toString());
+		}
+	}
+
+	private String deriveBigWigBase(String outputFile) {
+		if (outputFile.endsWith(".bed.gz")) {
+			return outputFile.substring(0, outputFile.length() - ".bed.gz".length());
+		}
+		if (outputFile.endsWith(".gz")) {
+			return outputFile.substring(0, outputFile.length() - ".gz".length());
+		}
+		if (outputFile.endsWith(".bed")) {
+			return outputFile.substring(0, outputFile.length() - ".bed".length());
+		}
+		return outputFile;
+	}
+
+	private String normalizeChrForBigWig(String chr) {
+		String normalized = chr;
+		if (bwConvertChrMToMT && (normalized.equals("chrM") || normalized.equals("M") || normalized.equals("chrMT"))) {
+			normalized = "MT";
+		}
+		if (bwStripChrPrefix && normalized.startsWith("chr")) {
+			normalized = normalized.substring(3);
+		}
+		if (bwConvertChrMToMT && normalized.equals("M")) {
+			normalized = "MT";
+		}
+		return normalized;
 	}
 
 	private LocTuple parseLoc(String loc) {
@@ -1484,6 +1721,26 @@ public class FinaleMe {
 			this.startCpgIndex = startCpgIndex;
 			this.pattern = pattern;
 			this.count = count;
+		}
+	}
+
+	private static class DecodeSummaryRow {
+		final String chr;
+		final int start;
+		final int end;
+		final int methyPred;
+		final int totalPred;
+
+		DecodeSummaryRow(String chr, int start, int end, int methyPred, int totalPred) {
+			this.chr = chr;
+			this.start = start;
+			this.end = end;
+			this.methyPred = methyPred;
+			this.totalPred = totalPred;
+		}
+
+		double predictMethyPercent() {
+			return 100.0 * (double) methyPred / (double) totalPred;
 		}
 	}
 

@@ -132,6 +132,22 @@ java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
 Viterbi decoding is parallelized across fragments.
 Set FinaleMe thread count with `-t` (for example, `-t 8`).
 
+You can also generate bigWig files directly during decode (so Step 4 is optional):
+```
+  -bwOutput \
+  -chromSizeFile hg19.chrom.sizes
+```
+This produces:
+- `*.methy.bw` (predicted methylation percent)
+- `*.cov.bw` (predicted total coverage)
+- `*.methy_count.bw` (predicted methylated count)
+
+If chromosome naming differs between decode output and your chrom size file, use:
+```
+  -bwStripChrPrefix \
+  -bwConvertChrMToMT
+```
+
 To emit UXM-compatible per-fragment outputs for deconvolution (`.pat.gz` + `.beta`), add:
 ```
   -patOutput \
@@ -141,7 +157,7 @@ This writes:
 - `*.pat.gz`: tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count`
 - `*.beta`: binary uint8 pairs `(methylated_count, total_count)` for each CpG index row
 
-#### Step 4: convert predicted result to .bw file for the visualization in genome browser
+#### Step 4 (optional): convert predicted result to .bw file for the visualization in genome browser
 ```
 perl src/perl/bedpredict2bw.b37.pl test test.FinaleMe.mincg7.prediction.bed.gz
 ```
