@@ -13,16 +13,24 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 
 ### System requirements:
 
-- Java (tested in openjdk-1.8.0 at Linux CentOS 8 (x64 platform) and Mac OSX 12.4 (aarch64 platform))
-- Apache Maven (tested in v3.8.6, only if you need to compile the source code from scratch)
+- Java 21 or later (tested with Oracle JDK 21 on Mac OSX and OpenJDK 21 on Linux)
+- Apache Maven 3.8+ (only if you need to compile the source code from scratch)
 - Perl (tested in v5.26.3), bedGraphToBigWig from UCSC tools (tested in v4), bedtools (tested in v2.29.2). (only if you need to convert predicted methylation level to big wig files)
 - R (tested in v4.2.1) and quadprog package. (only if you need to perform tissues-of-origin analysis)
 
-### Quick installation:
+### Build from source:
 
-    mvn compile assembly:single
+    mvn clean compile assembly:single
 
-Or use the precompiled .jar file from Releases and other .jars from lib/ directory without installation
+This produces `target/FinaleMe-0.60-jar-with-dependencies.jar`. The system-scope jars in `lib/` (e.g., `jahmm-0.6.2.jar`, `java-genomics-io.jar`) are **not** bundled in the fat jar and must be included in the classpath at runtime (see usage examples below).
+
+Or use the precompiled .jar file from Releases and other .jars from lib/ directory without installation.
+
+### Running tests:
+
+    mvn test
+
+This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward-backward probability, Viterbi decoding, Baum-Welch training iteration, and KL-divergence convergence.
 
 ### Other required data:
 
@@ -34,6 +42,23 @@ Or use the precompiled .jar file from Releases and other .jars from lib/ directo
 
 ### Small test input data
 - bam files from chr22 in healthy individuals can be downloaded here [https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1](https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1)
+
+## What's new in v0.60
+
+- **Java 21 required** (upgraded from Java 1.8)
+- **Parallelized feature extraction** by 5Mb genomic bins for multi-core speedup
+- **Parallelized HMM training** (Baum-Welch forward-backward) and Viterbi decoding
+- **Parallelized KL-divergence** convergence check
+- **Single-pass matrix file processing** (was reading the file twice)
+- **Fast BAM read counting** via index statistics (no more full BAM scan)
+- **Reduced memory usage** by replacing boxed types with primitive arrays and eliminating allGamma storage
+- **Replaced log4j** with SLF4J + Logback (fixes CVE-2021-4104)
+- **Removed GATK dependency** (replaced with inline utilities)
+- **Added unit tests** for HMM core (13 tests)
+
+See [PLAN.md](PLAN.md) for full details on all optimizations.
+
+> **Note:** Models trained with v0.58 or earlier are not compatible with v0.60 due to the internal data structure change from `TreeMap<Integer, Double[]>` to primitive arrays. You will need to retrain models with v0.60.
 
 ## Getting started
 
@@ -52,20 +77,47 @@ The analysis consists of several steps:
 
 #### Step 1: extract features from bam files for the training and decoding
 ```
-java -Xmx20G -cp "target/FinaleMe-0.58-jar-with-dependencies.jar:lib/gatk-package-distribution-3.3.jar:lib/sis-jhdf5-batteries_included.jar:lib/java-genomics-io.jar:lib/igv.jar" org.cchmc.epifluidlab.finaleme.utils.CpgMultiMetricsStats hg19.2bit CG_motif.hg19.common_chr.pos_only.bedgraph CG_motif.hg19.common_chr.pos_only.bedgraph input.bam CpgMultiMetricsStats.hg19.details.bed.gz -stringentPaired -excludeRegions wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed -valueWigs methyPrior:0:wgbs_buffyCoat_jensen2015GB.methy.hg19.bw -wgsMode
+java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/java-genomics-io.jar" \
+  org.cchmc.epifluidlab.finaleme.utils.CpgMultiMetricsStats \
+  hg19.2bit \
+  CG_motif.hg19.common_chr.pos_only.bedgraph \
+  CG_motif.hg19.common_chr.pos_only.bedgraph \
+  input.bam \
+  CpgMultiMetricsStats.hg19.details.bed.gz \
+  -stringentPaired \
+  -excludeRegions wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed \
+  -valueWigs methyPrior:0:wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
+  -wgsMode
 ```
+
+Feature extraction is now parallelized by 5Mb genomic bins, automatically using all available CPU cores.
 
 * CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with CpG's coordinate in the reference genome, which can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
 * hg19.bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 #### Step 2: train the model 
 ```
-java -Xmx100G -cp "target/FinaleMe-0.58-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" org.cchmc.epifluidlab.finaleme.hmm.FinaleMe test.FinaleMe.mincg7.model CpgMultiMetricsStats.hg19.details.bed.gz test.FinaleMe.mincg7.prediction.bed.gz -miniDataPoints 7 -gmm -covOutlier 3
+java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" \
+  org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
+  test.FinaleMe.mincg7.model \
+  CpgMultiMetricsStats.hg19.details.bed.gz \
+  test.FinaleMe.mincg7.prediction.bed.gz \
+  -miniDataPoints 7 -gmm -covOutlier 3
 ```
+
+Training uses parallelized Baum-Welch (forward-backward computed across sequences in parallel) and parallelized KL-divergence convergence checking.
+
 #### Step 3: decode and make the prediction of CpG methylation level
 ```
-java -Xmx100G -cp "target/FinaleMe-0.58-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" org.cchmc.epifluidlab.finaleme.hmm.FinaleMe test.FinaleMe.mincg7.model CpgMultiMetricsStats.hg19.details.bed.gz test.FinaleMe.mincg7.prediction.bed.gz -decodeModeOnly
+java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" \
+  org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
+  test.FinaleMe.mincg7.model \
+  CpgMultiMetricsStats.hg19.details.bed.gz \
+  test.FinaleMe.mincg7.prediction.bed.gz \
+  -decodeModeOnly
 ```
+
+Viterbi decoding is parallelized across fragments.
 
 #### Step 4: convert predicted result to .bw file for the visualization in genome browser
 ```

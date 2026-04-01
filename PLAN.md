@@ -24,6 +24,7 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 | 4B. Dependency and Java Version Upgrades | Done |
 | 4C. Add Unit Tests for HMM Core | Done |
 | 4D. Remove Dead Code | Done |
+| 4E. Update README for v0.60 | Done |
 
 ---
 
@@ -116,6 +117,14 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 - Removed unused method `decodeHmmAssignMethyState` (~130 lines)
 - Removed unused methods `estimateXiWithMethy` and 4-parameter `estimateGamma` (~100 lines)
 - Removed ~320 lines of commented-out code across all files
+
+### 4E. Update README for v0.60 (Done)
+- Updated Java requirement from 1.8 to Java 21, Maven from 3.8.6 to 3.8+
+- Added "Build from source" section clarifying that `lib/` jars are not bundled in the fat jar
+- Added "Running tests" section (`mvn test`, 13 JUnit 5 tests)
+- Added "What's new in v0.60" changelog with model incompatibility warning
+- Updated all `java -cp` commands: version 0.58 → 0.60, removed `gatk-package-distribution-3.3.jar` and `igv.jar` from classpath (no longer needed)
+- Added notes about parallelization in Steps 1-3
 
 ---
 
