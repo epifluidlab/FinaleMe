@@ -3,7 +3,12 @@
     "allow": [
       "Bash(xargs ls:*)",
       "Read(//Users/yaping/Documents/workspace/code/FinaleMe/**)",
-      "Bash(grep -v \"^\\\\./$\")"
+      "Bash(grep -v \"^\\\\./$\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:www.biorxiv.org)",
+      "Bash(jar tf:*)"
     ]
   }
 }

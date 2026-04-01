@@ -8,26 +8,34 @@ package org.cchmc.epifluidlab.finaleme.hmm;
 
 
 import htsjdk.samtools.util.IntervalTree;
+import htsjdk.samtools.util.BlockCompressedOutputStream;
 
+import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OutputStreamWriter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Callable;
+import java.nio.charset.StandardCharsets;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -143,6 +151,12 @@ public class FinaleMe {
 	@Option(name="-t",usage="number of threads for parallel training/decode. Use >0 to set explicitly; default uses all available cores.")
 	public int threads = -1;
 
+	@Option(name="-patOutput", usage="output UXM-compatible .pat.gz and .beta files for deconvolution. Requires -cpgIndexFile. default: false")
+	public boolean patOutput = false;
+
+	@Option(name="-cpgIndexFile", usage="CG_motif bedgraph/bed file listing all CpG positions genome-wide, for building CpG index. Required with -patOutput.")
+	public String cpgIndexFile = null;
+
 	
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -183,12 +197,13 @@ public class FinaleMe {
 
 					CmdLineParser parser = new CmdLineParser(this);
 					try
-					{
-						if(help || args.length < 2) throw new CmdLineException(parser, USAGE, new Throwable());
-						parser.parseArgument(args);
+						{
+							if(help || args.length < 3) throw new CmdLineException(parser, USAGE, new Throwable());
+							parser.parseArgument(args);
+							if (patOutput && cpgIndexFile == null) throw new CmdLineException(parser, "-patOutput requires -cpgIndexFile");
+							
 						
-					
-					}
+						}
 					catch (CmdLineException e)
 					{
 						System.err.println(e.getMessage());
@@ -201,10 +216,14 @@ public class FinaleMe {
 					String modelFile = arguments.get(0);
 					String inputFile = arguments.get(1);
 					String outputFile = arguments.get(2);
-					log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
+						log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
 					initiate();
 
 					MatrixObj matrixObj = processMatrixFile(inputFile);
+					CpgIndex cpgIndex = null;
+					if (patOutput) {
+						cpgIndex = loadCpgIndex(cpgIndexFile);
+					}
 					if(aucMode){
 						
 						aucMode(matrixObj, modelFile, outputFile);
@@ -222,7 +241,7 @@ public class FinaleMe {
 							}
 							miniDataPoints = miniDataPointsPre;
 						}
-						decodeHmm(matrixObj, modelFile, outputFile, inputFile, false);
+						decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex);
 					}
 					
 					
@@ -710,7 +729,7 @@ public class FinaleMe {
 	
 
 	//decoding HMM
-	private double decodeHmm(MatrixObj matrixObj, String hmmFile, String outputFile, String inputFile, boolean reestimate) throws Exception{
+	private double decodeHmm(MatrixObj matrixObj, String hmmFile, String outputFile, String inputFile, boolean reestimate, CpgIndex cpgIndex) throws Exception{
 		System.out.println("\nDecoding ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		List<ArrayList<String>> matrixLoc = new ArrayList<ArrayList<String>>();
@@ -737,6 +756,11 @@ public class FinaleMe {
 		
 		
 		HashMap<String,Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>> methySummary = new HashMap<String,Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>>(); //predict, observed
+		HashMap<String, Integer> patRecords = null;
+		long skippedFragments = 0;
+		if (patOutput && cpgIndex != null) {
+			patRecords = new HashMap<String, Integer>();
+		}
 
 		double likelihood = 0;
 		double likelihoodWithMethy = 0;
@@ -818,6 +842,48 @@ public class FinaleMe {
 				}
 				count++;
 			}
+
+			if (patRecords != null) {
+				if (locRow.size() != hiddenState.length) {
+					skippedFragments++;
+					continue;
+				}
+				String fragmentChr = null;
+				int startCpgIndex = -1;
+				int previousCpgIndex = -1;
+				boolean contiguous = true;
+				StringBuilder pattern = new StringBuilder(hiddenState.length);
+				for (int i = 0; i < hiddenState.length; i++) {
+					LocTuple locTuple = parseLoc(locRow.get(i));
+					if (locTuple == null) {
+						contiguous = false;
+						break;
+					}
+					int globalIndex = cpgIndex.getGlobalIndex(locTuple.chr, locTuple.start);
+					if (globalIndex < 0) {
+						contiguous = false;
+						break;
+					}
+					if (i == 0) {
+						fragmentChr = locTuple.chr;
+						startCpgIndex = globalIndex;
+					} else {
+						if (!fragmentChr.equals(locTuple.chr) || globalIndex != previousCpgIndex + 1) {
+							contiguous = false;
+							break;
+						}
+					}
+					pattern.append(hiddenState[i] == methylatedState ? 'C' : 'T');
+					previousCpgIndex = globalIndex;
+				}
+				if (contiguous && pattern.length() > 0) {
+					String key = fragmentChr + "\t" + startCpgIndex + "\t" + pattern.toString();
+					Integer countKey = patRecords.get(key);
+					patRecords.put(key, countKey == null ? 1 : countKey + 1);
+				} else {
+					skippedFragments++;
+				}
+			}
 		}
 		executor.shutdown();
 
@@ -848,6 +914,17 @@ public class FinaleMe {
 		}
 		writer.close();
 		output.close();
+
+		if (patRecords != null) {
+			String patFile = derivePatFile(outputFile);
+			ArrayList<PatRecord> sortedPatRecords = toSortedPatRecords(patRecords);
+			writePatOutput(patFile, sortedPatRecords);
+			writeBetaOutput(deriveBetaFile(patFile), cpgIndex, sortedPatRecords);
+			if (skippedFragments > 0) {
+				log.info("Skipped " + skippedFragments + " fragments for .pat/.beta output due to missing/non-consecutive CpG index mapping.");
+			}
+		}
+
 		PearsonsCorrelation pearson =  new PearsonsCorrelation(predData);
 		System.out.println(pearson.getCorrelationMatrix());
 		System.out.println(pearson.getCorrelationPValues());
@@ -858,6 +935,185 @@ public class FinaleMe {
 		System.out.println("methyState " + methylatedState + "\tLikelihoodWithMethy is:" + likelihoodWithMethy);	
 		return likelihood;
 
+	}
+
+	private CpgIndex loadCpgIndex(String cpgIndexFile) throws IOException {
+		log.info("Loading CpG index file " + cpgIndexFile + " ...");
+		LinkedHashMap<String, ArrayList<Integer>> chrToPositions = new LinkedHashMap<String, ArrayList<Integer>>();
+		InputStream input = null;
+		BufferedReader br = null;
+		try {
+			if (cpgIndexFile.endsWith(".gz")) {
+				input = new GZIPInputStream(new FileInputStream(cpgIndexFile));
+			} else {
+				input = new FileInputStream(cpgIndexFile);
+			}
+			br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.isEmpty() || line.startsWith("#")) {
+					continue;
+				}
+				String[] splitLines = line.split("\t");
+				if (splitLines.length < 2) {
+					continue;
+				}
+				String chr = splitLines[0];
+				int start;
+				try {
+					start = Integer.parseInt(splitLines[1]);
+				} catch (NumberFormatException e) {
+					continue;
+				}
+				ArrayList<Integer> positions = chrToPositions.get(chr);
+				if (positions == null) {
+					positions = new ArrayList<Integer>();
+					chrToPositions.put(chr, positions);
+				}
+				positions.add(start);
+			}
+		} finally {
+			if (br != null) {
+				br.close();
+			}
+		}
+
+		LinkedHashMap<String, int[]> chrPositions = new LinkedHashMap<String, int[]>();
+		HashMap<String, Integer> chrOffsets = new HashMap<String, Integer>();
+		int totalSites = 0;
+		for (Map.Entry<String, ArrayList<Integer>> entry : chrToPositions.entrySet()) {
+			ArrayList<Integer> positions = entry.getValue();
+			Collections.sort(positions);
+			int uniqueCount = 0;
+			int prev = Integer.MIN_VALUE;
+			for (int pos : positions) {
+				if (uniqueCount == 0 || pos != prev) {
+					uniqueCount++;
+					prev = pos;
+				}
+			}
+			int[] posArray = new int[uniqueCount];
+			int idx = 0;
+			prev = Integer.MIN_VALUE;
+			for (int pos : positions) {
+				if (idx == 0 || pos != prev) {
+					posArray[idx++] = pos;
+					prev = pos;
+				}
+			}
+			chrOffsets.put(entry.getKey(), totalSites);
+			chrPositions.put(entry.getKey(), posArray);
+			totalSites += posArray.length;
+		}
+		log.info("Loaded CpG index with " + totalSites + " sites across " + chrPositions.size() + " chromosomes.");
+		return new CpgIndex(chrPositions, chrOffsets, totalSites);
+	}
+
+	private String derivePatFile(String outputFile) {
+		if (outputFile.endsWith(".bed.gz")) {
+			return outputFile.substring(0, outputFile.length() - ".bed.gz".length()) + ".pat.gz";
+		}
+		return outputFile + ".pat.gz";
+	}
+
+	private String deriveBetaFile(String patFile) {
+		if (patFile.endsWith(".pat.gz")) {
+			return patFile.substring(0, patFile.length() - ".pat.gz".length()) + ".beta";
+		}
+		return patFile + ".beta";
+	}
+
+	private ArrayList<PatRecord> toSortedPatRecords(HashMap<String, Integer> patRecords) {
+		ArrayList<PatRecord> records = new ArrayList<PatRecord>(patRecords.size());
+		for (Map.Entry<String, Integer> entry : patRecords.entrySet()) {
+			String[] fields = entry.getKey().split("\t", 3);
+			if (fields.length < 3) {
+				continue;
+			}
+			int startCpgIndex;
+			try {
+				startCpgIndex = Integer.parseInt(fields[1]);
+			} catch (NumberFormatException e) {
+				continue;
+			}
+			records.add(new PatRecord(fields[0], startCpgIndex, fields[2], entry.getValue()));
+		}
+		Collections.sort(records, (a, b) -> {
+			int cmp = Integer.compare(a.startCpgIndex, b.startCpgIndex);
+			if (cmp != 0) {
+				return cmp;
+			}
+			cmp = a.chr.compareTo(b.chr);
+			if (cmp != 0) {
+				return cmp;
+			}
+			return a.pattern.compareTo(b.pattern);
+		});
+		return records;
+	}
+
+	private void writePatOutput(String patFile, List<PatRecord> records) throws IOException {
+		File patPath = new File(patFile);
+		log.info("Writing UXM .pat.gz output: " + patPath.getPath());
+		try (BlockCompressedOutputStream patOut = new BlockCompressedOutputStream(patPath)) {
+			for (PatRecord record : records) {
+				String line = record.chr + "\t" + record.startCpgIndex + "\t" + record.pattern + "\t" + record.count + "\n";
+				patOut.write(line.getBytes(StandardCharsets.UTF_8));
+			}
+		}
+	}
+
+	private void writeBetaOutput(String betaFile, CpgIndex cpgIndex, List<PatRecord> records) throws IOException {
+		log.info("Writing UXM .beta output: " + betaFile);
+		int[] methyCounts = new int[cpgIndex.totalSites];
+		int[] totalCounts = new int[cpgIndex.totalSites];
+		for (PatRecord record : records) {
+			for (int i = 0; i < record.pattern.length(); i++) {
+				int arrayIndex = record.startCpgIndex + i - 1;
+				if (arrayIndex < 0 || arrayIndex >= cpgIndex.totalSites) {
+					continue;
+				}
+				if (record.pattern.charAt(i) == 'C') {
+					methyCounts[arrayIndex] += record.count;
+				}
+				totalCounts[arrayIndex] += record.count;
+			}
+		}
+
+		try (BufferedOutputStream betaOut = new BufferedOutputStream(new FileOutputStream(betaFile))) {
+			for (int i = 0; i < cpgIndex.totalSites; i++) {
+				int methy = methyCounts[i];
+				int total = totalCounts[i];
+				if (total > 255) {
+					methy = (int) Math.round((double) methy * 255.0 / (double) total);
+					total = 255;
+				}
+				if (methy > total) {
+					methy = total;
+				}
+				betaOut.write((byte) (methy & 0xFF));
+				betaOut.write((byte) (total & 0xFF));
+			}
+		}
+	}
+
+	private LocTuple parseLoc(String loc) {
+		if (loc == null) {
+			return null;
+		}
+		int firstColon = loc.indexOf(':');
+		int secondColon = loc.indexOf(':', firstColon + 1);
+		if (firstColon < 0 || secondColon < 0) {
+			return null;
+		}
+		String chr = loc.substring(0, firstColon);
+		int start;
+		try {
+			start = Integer.parseInt(loc.substring(firstColon + 1, secondColon));
+		} catch (NumberFormatException e) {
+			return null;
+		}
+		return new LocTuple(chr, start);
 	}
 	
 	
@@ -1204,6 +1460,55 @@ public class FinaleMe {
 			}else{
 				return matrixTmp.subList(0, n);
 			}
+		}
+	}
+
+	private static class LocTuple {
+		final String chr;
+		final int start;
+
+		LocTuple(String chr, int start) {
+			this.chr = chr;
+			this.start = start;
+		}
+	}
+
+	private static class PatRecord {
+		final String chr;
+		final int startCpgIndex;
+		final String pattern;
+		final int count;
+
+		PatRecord(String chr, int startCpgIndex, String pattern, int count) {
+			this.chr = chr;
+			this.startCpgIndex = startCpgIndex;
+			this.pattern = pattern;
+			this.count = count;
+		}
+	}
+
+	private static class CpgIndex {
+		final LinkedHashMap<String, int[]> chrPositions;
+		final HashMap<String, Integer> chrOffsets;
+		final int totalSites;
+
+		CpgIndex(LinkedHashMap<String, int[]> chrPositions, HashMap<String, Integer> chrOffsets, int totalSites) {
+			this.chrPositions = chrPositions;
+			this.chrOffsets = chrOffsets;
+			this.totalSites = totalSites;
+		}
+
+		int getGlobalIndex(String chr, int start) {
+			int[] positions = chrPositions.get(chr);
+			Integer offset = chrOffsets.get(chr);
+			if (positions == null || offset == null) {
+				return -1;
+			}
+			int localIndex = Arrays.binarySearch(positions, start);
+			if (localIndex < 0) {
+				return -1;
+			}
+			return offset + localIndex + 1;
 		}
 	}
 

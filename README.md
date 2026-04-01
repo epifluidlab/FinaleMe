@@ -132,6 +132,15 @@ java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
 Viterbi decoding is parallelized across fragments.
 Set FinaleMe thread count with `-t` (for example, `-t 8`).
 
+To emit UXM-compatible per-fragment outputs for deconvolution (`.pat.gz` + `.beta`), add:
+```
+  -patOutput \
+  -cpgIndexFile CG_motif.hg19.common_chr.pos_only.bedgraph
+```
+This writes:
+- `*.pat.gz`: tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count`
+- `*.beta`: binary uint8 pairs `(methylated_count, total_count)` for each CpG index row
+
 #### Step 4: convert predicted result to .bw file for the visualization in genome browser
 ```
 perl src/perl/bedpredict2bw.b37.pl test test.FinaleMe.mincg7.prediction.bed.gz
