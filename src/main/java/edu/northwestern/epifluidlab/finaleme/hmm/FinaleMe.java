@@ -23,6 +23,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.ObjectStreamClass;
 import java.io.OutputStreamWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -189,6 +190,47 @@ public class FinaleMe {
 	private static long points = 0;
 	private MersenneTwister randomEngine;
 	private double maxCpgNum = Double.NEGATIVE_INFINITY;
+	private static final String LEGACY_PACKAGE_PREFIX = "org.cchmc.epifluidlab.finaleme.";
+	private static final String CURRENT_PACKAGE_PREFIX = "edu.northwestern.epifluidlab.finaleme.";
+
+	private static String remapLegacyClassName(String className) {
+		if (className == null || !className.contains(LEGACY_PACKAGE_PREFIX)) {
+			return className;
+		}
+		return className.replace(LEGACY_PACKAGE_PREFIX, CURRENT_PACKAGE_PREFIX);
+	}
+
+	private static final class LegacyPackageObjectInputStream extends ObjectInputStream {
+		LegacyPackageObjectInputStream(InputStream in) throws IOException {
+			super(in);
+		}
+
+		@Override
+		protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+			String originalName = desc.getName();
+			String remappedName = remapLegacyClassName(originalName);
+			if (!originalName.equals(remappedName)) {
+				ClassLoader loader = Thread.currentThread().getContextClassLoader();
+				if (loader == null) {
+					loader = FinaleMe.class.getClassLoader();
+				}
+				try {
+					return Class.forName(remappedName, false, loader);
+				} catch (ClassNotFoundException e) {
+					// Fall back to default resolution if remap target cannot be loaded.
+				}
+			}
+			return super.resolveClass(desc);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private BayesianNhmmV5<ObservationVector> loadHmmModel(String hmmFile) throws IOException, ClassNotFoundException {
+		try (LegacyPackageObjectInputStream objectinputstream =
+				new LegacyPackageObjectInputStream(new FileInputStream(hmmFile))) {
+			return (BayesianNhmmV5<ObservationVector>) objectinputstream.readObject();
+		}
+	}
 
 	private int resolveThreadCount()
 	{
@@ -762,9 +804,7 @@ public class FinaleMe {
 		
 		ArrayList<ArrayList<Integer>> matrixObserved = matrixObj.matrixObserved;
 
-	    ObjectInputStream objectinputstream = new ObjectInputStream(new FileInputStream(hmmFile));
-	    BayesianNhmmV5<ObservationVector> hmm = (BayesianNhmmV5<ObservationVector>) objectinputstream.readObject();
-		objectinputstream.close();
+	    BayesianNhmmV5<ObservationVector> hmm = loadHmmModel(hmmFile);
 		hmm.setBayesianFactor(bayesianFactor);
 		hmm.setMethyState(this.methylatedState);
 		hmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgNum : cpgNumClip);
@@ -1365,9 +1405,7 @@ public class FinaleMe {
 		}
 		ArrayList<ArrayList<Integer>> matrixObserved = matrixObj.matrixObserved;
 
-	    ObjectInputStream objectinputstream = new ObjectInputStream(new FileInputStream(hmmFile));
-	    BayesianNhmmV5<ObservationVector> hmm = (BayesianNhmmV5<ObservationVector>) objectinputstream.readObject();
-		objectinputstream.close();
+	    BayesianNhmmV5<ObservationVector> hmm = loadHmmModel(hmmFile);
 		hmm.setBayesianFactor(bayesianFactor);
 		hmm.setMethyState(this.methylatedState);
 		hmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgNum : cpgNumClip);
