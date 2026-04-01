@@ -20,11 +20,14 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 
 ### Build from source:
 
-    mvn clean compile assembly:single
+    ./scripts/sync-vendored-repo.sh
+    mvn clean package
 
-This produces `target/FinaleMe-0.60-jar-with-dependencies.jar`. The system-scope jars in `lib/` (e.g., `jahmm-0.6.2.jar`, `java-genomics-io.jar`) are **not** bundled in the fat jar and must be included in the classpath at runtime (see usage examples below).
+This produces `target/FinaleMe-0.60-jar-with-dependencies.jar`, which is self-contained for FinaleMe runtime usage (no extra `lib/*.jar` entries needed in `-cp` for Steps 1-3 below).
 
-Or use the precompiled .jar file from Releases and other .jars from lib/ directory without installation.
+`./scripts/sync-vendored-repo.sh` materializes a Maven-layout local repository under `lib-repo/` from `lib/*.jar`, so the build uses normal Maven dependencies instead of `systemPath`.
+
+Or use the precompiled `target/FinaleMe-0.60-jar-with-dependencies.jar` (from Releases/build) directly for FinaleMe Steps 1-3.
 
 ### Running tests:
 
@@ -59,6 +62,7 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 - **Removed GATK dependency** (replaced with inline utilities)
 - **Upgraded htsjdk** from 1.141 to 2.24.1
 - **Consolidated CpgMultiMetricsStats variants** using a shared abstract base and common interval-loading utilities
+- **Clean packaging model**: normal Maven dependencies (no `systemPath`) + single self-contained runtime jar for Steps 1-3
 - **Added unit tests** for HMM core (13 tests)
 
 See [PLAN.md](PLAN.md) for full details on all optimizations.
@@ -82,7 +86,7 @@ The analysis consists of several steps:
 
 #### Step 1: extract features from bam files for the training and decoding
 ```
-java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/java-genomics-io.jar" \
+java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
   org.cchmc.epifluidlab.finaleme.utils.CpgMultiMetricsStats \
   hg19.2bit \
   CG_motif.hg19.common_chr.pos_only.bedgraph \
@@ -104,7 +108,7 @@ You can set thread count explicitly with `-t` (for example, `-t 8`).
 
 #### Step 2: train the model 
 ```
-java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" \
+java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
   org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
   CpgMultiMetricsStats.hg19.details.bed.gz \
@@ -116,7 +120,7 @@ Training uses parallelized Baum-Welch (forward-backward computed across sequence
 
 #### Step 3: decode and make the prediction of CpG methylation level
 ```
-java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" \
+java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
   org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
   CpgMultiMetricsStats.hg19.details.bed.gz \

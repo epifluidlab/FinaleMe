@@ -25,6 +25,7 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 | 4C. Add Unit Tests for HMM Core | Done |
 | 4D. Remove Dead Code | Done |
 | 4E. Update README for v0.60 | Done |
+| 4F. Clean Packaging and Dependency Resolution | Done |
 
 ---
 
@@ -121,11 +122,18 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 
 ### 4E. Update README for v0.60 (Done)
 - Updated Java requirement from 1.8 to Java 21, Maven from 3.8.6 to 3.8+
-- Added "Build from source" section clarifying that `lib/` jars are not bundled in the fat jar
+- Added and maintained "Build from source" documentation for the current packaging model
 - Added "Running tests" section (`mvn test`, 13 JUnit 5 tests)
 - Added "What's new in v0.60" changelog with model incompatibility warning
-- Updated all `java -cp` commands: version 0.58 → 0.60, removed `gatk-package-distribution-3.3.jar` and `igv.jar` from classpath (no longer needed)
+- Updated all `java -cp` commands for v0.60 and single-fat-jar usage in core FinaleMe Steps 1-3.
 - Added notes about parallelization in Steps 1-3
+
+### 4F. Clean Packaging and Dependency Resolution (Done)
+- Removed all `systemPath` dependencies from `pom.xml` and switched to normal Maven dependencies.
+- Added vendored Maven repository support at `lib-repo/` (file repository) and sync script [scripts/sync-vendored-repo.sh](scripts/sync-vendored-repo.sh) to materialize Maven-layout artifacts from `lib/*.jar`.
+- Enabled standard `mvn package` assembly execution to always produce `target/FinaleMe-0.60-jar-with-dependencies.jar`.
+- Added project-local Maven cache configuration (`.mvn/maven.config`) for reproducible builds without relying on `~/.m2`.
+- Updated runtime commands for Steps 1-3 to use only the single fat jar in classpath.
 
 ---
 
@@ -135,6 +143,7 @@ All previously remaining items have been implemented:
 - Streaming read processing (3C)
 - CpgMultiMetricsStats consolidation (4A)
 - htsjdk upgrade (4B partial)
+- clean packaging and dependency resolution (4F)
 
 ---
 
