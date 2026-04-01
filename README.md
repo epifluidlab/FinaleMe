@@ -40,8 +40,24 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 - methylation prior file in standard big wig format (can use wgbs_buffyCoat_jensen2015GB.methy.hg19.bw file directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7779198.svg)](https://doi.org/10.5281/zenodo.7779198)). Or you can generate your own by using WGBS data in buffycoat from healthy individuals (our data is from Jensen et al. 2015 Genome Biology paper)
 - bed files to mask the Dark regions in the genome (can use wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed files directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7779198.svg)](https://doi.org/10.5281/zenodo.7779198)). Or you can download these dark region files for other reference genome.
 - Chromosome sizes: can be obtained from the FASTA file of the reference genome: `samtools faidx input.fa`. See this [example](https://github.com/epifluidlab/cragr/blob/3d419a49/inst/extdata/human_g1k_v37.chrom.sizes).
-- CG_motif.bedgraph: bedgraph file with CpG's coordinate in the reference genome
-- hg19.bit: binary version of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
+- CG_motif.bedgraph: bedgraph file with CpG coordinates in the reference genome (**forward strand only**, one entry per CpG dinucleotide). Each CpG dinucleotide (5'-CG-3') is listed once at the position of the C on the forward strand. For hg19, this yields ~28M positions. Both forward- and reverse-strand reads are captured at the same CpG position during feature extraction, so no fragments are lost.
+
+  To generate this file from a reference FASTA:
+  ```
+  # Extract all CG dinucleotide positions (forward-strand C position, 0-based BED format)
+  python3 -c "
+  from pysam import FastaFile
+  ref = FastaFile('hg19.fa')
+  for chrom in ref.references:
+      seq = ref.fetch(chrom).upper()
+      for i in range(len(seq) - 1):
+          if seq[i] == 'C' and seq[i+1] == 'G':
+              print(f'{chrom}\t{i}\t{i+1}\t1')
+  " > CG_motif.hg19.bedgraph
+  ```
+  Or download the pre-built file from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719).
+
+- hg19.2bit: binary version of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fasta files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 ### Small test input data
 - bam files from chr22 in healthy individuals can be downloaded here [https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1](https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1)
@@ -126,7 +142,7 @@ Feature extraction is now parallelized by 5Mb genomic bins and processed with a 
 Runtime progress is logged as CpGs processed out of total with percent completion.
 You can set thread count explicitly with `-t` (for example, `-t 8`).
 
-* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with CpG's coordinate in the reference genome, which can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
+* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with forward-strand CpG coordinates (see "Other required data" above for how to generate it). It can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
 * hg19.bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 #### Step 2: train the model 
@@ -182,6 +198,8 @@ This writes:
 - `*.pat.gz`: bgzip-compressed, tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count` — compatible with [UXM_deconv](https://github.com/nloyfer/UXM_deconv) and [wgbstools](https://github.com/nloyfer/wgbs_tools)
 - `*.beta`: binary uint8 pairs `(methylated_count, total_count)` for each CpG index row
 
+**Note on CpG strand handling**: The CG_motif bedgraph used in Step 1 lists each CpG dinucleotide once at the forward-strand C position (~28M sites for hg19). During feature extraction, reads from **both** forward and reverse strands are captured at the same CpG position — the reverse-strand read's G position (X+1) maps to the same CpG dinucleotide as the forward-strand C position (X). Therefore, the pat.gz output's ~28M CpG index space covers all fragment observations without losing any data. This matches the wgbstools/UXM CpG indexing convention, which also uses one index per CpG dinucleotide.
+
 Then run UXM deconvolution directly:
 ```
 uxm deconv test.FinaleMe.mincg7.prediction.pat.gz \
@@ -195,14 +213,50 @@ perl src/perl/bedpredict2bw.b37.pl test test.FinaleMe.mincg7.prediction.bed.gz
 ```
 
 #### Step 5: tissues-of-origin analysis
-* generate methylation density in 1kb window at autosomes across all available methylation prediction files
+
+There are two approaches for tissues-of-origin deconvolution:
+
+##### Option A: UXM deconvolution (recommended)
+
+This approach uses the per-fragment methylation patterns from the `.pat.gz` file generated in Step 3 (with `-patOutput`). It leverages the [UXM_deconv](https://github.com/nloyfer/UXM_deconv) method, which classifies each fragment as Unmethylated (U), miXed (X), or Methylated (M) and deconvolves against a reference atlas.
+
+**Prerequisites — install wgbstools and UXM_deconv:**
+
+1. Install [wgbstools](https://github.com/nloyfer/wgbs_tools) (required by UXM_deconv for pat file processing):
+   ```
+   git clone https://github.com/nloyfer/wgbs_tools.git
+   cd wgbs_tools
+   python setup.py
+   wgbstools init_genome --name hg19
+   ```
+
+2. Install [UXM_deconv](https://github.com/nloyfer/UXM_deconv):
+   ```
+   git clone https://github.com/nloyfer/UXM_deconv.git
+   cd UXM_deconv
+   pip install -r requirements.txt
+   ```
+
+**Run deconvolution:**
+```
+uxm deconv test.FinaleMe.mincg7.prediction.pat.gz \
+  -o test.FinaleMe.mincg7.prediction.uxm_result.csv \
+  -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
+```
+
+The output CSV contains estimated cell-type proportions for each sample. Reference atlases for hg19 and hg38 are included in the `UXM_deconv/supplemental/` directory. See the [UXM_deconv README](https://github.com/nloyfer/UXM_deconv#readme) for additional options (e.g., `--ignore`, `--include` for selecting specific cell types).
+
+##### Option B: quadratic programming with methylation density (original method)
+
+This approach uses the bigWig files from Step 4 to compute methylation density in genomic windows and deconvolves using quadratic programming against a reference methylome panel.
+
+* Generate methylation density in 1kb window at autosomes across all available methylation prediction files:
 ```
 ls *WGS.FinaleMe.mincg7.merged.cov.b37.bw | perl -ne 'chomp;$cov=$_;$m=$cov;$m=~s/cov/methy_count/;print " -bigWig $m -useMean0 0 -regionMode 0 -bigWig $cov -useMean0 0 -regionMode 0";' >> cfdna.methy_summary.cmd.txt
 
-cat cfdna.methy_summary.cmd.txt | perl -ne 'chomp;@f=split " -useMean0 0 -regionMode 0";for($i=1,$j=0;$j<=$#f;$j+=2,$i++){$name=$f[$j];$name=~s/ -bigWig (\S+)\S+methy_count.b37.bw/$1/;print "$i\t$name\n";}' > cfdna.names_order.txt
+cat cfdna.methy_summary.cmd.txt | perl -ne 'chomp;@f=split " -useMean0 0 -regionMode 0";for($i=1,$j=0;$j<=$#f;$j<=$#f;$j+=2,$i++){$name=$f[$j];$name=~s/ -bigWig (\S+)\S+methy_count.b37.bw/$1/;print "$i\t$name\n";}' > cfdna.names_order.txt
 
 perl -e '$cmd=`cat cfdna.methy_summary.cmd.txt`;chomp($cmd); `java -Xmx10G -cp "lib/dnaaseUtils-0.14-jar-with-dependencies.jar:lib/java-genomics-io.jar:lib/igv.jar" main.java.edu.mit.compbio.utils.AlignMultiWigInsideBed autosome_1kb_intervals.UCSC.cpgIsland_plus_shore.b37.bed output.add_value.methy.bed.gz $cmd`;'
-
 ```
 
 * R script is available within src/R/TissueOfOriginExampleScript.R
