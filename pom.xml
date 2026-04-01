@@ -41,13 +41,6 @@
 		<maven.compiler.source>21</maven.compiler.source>
 		<maven.compiler.target>21</maven.compiler.target>
 	</properties>
-  <repositories>
-    <repository>
-        <id>jsi</id>
-        <url>http://repo.springsource.org/libs-release-remote</url>
-    </repository>
-</repositories>
-
  <dependencies>
   	<dependency>
       <groupId>args4j</groupId>
@@ -74,10 +67,10 @@
 		<artifactId>commons-lang3</artifactId>
 		<version>3.4</version>
 	</dependency>
-		<dependency>
+	<dependency>
 		<groupId>com.github.samtools</groupId>
 		<artifactId>htsjdk</artifactId>
-		<version>1.141</version>
+		<version>2.24.1</version>
 	</dependency>
 	<dependency>
 		<groupId>org.apache.commons</groupId>

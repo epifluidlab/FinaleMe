@@ -28,10 +28,13 @@ import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -55,7 +58,7 @@ import edu.unc.genomics.io.BigWigFileReader;
 /**
  *
  */
-public class CpgMultiMetricsStats {
+public class CpgMultiMetricsStats extends AbstractCpgMultiMetricsStats {
 
 	@Option(name="-minBaseQ",usage="minimum base quality score required to check. Default: 5")
 	public int minBaseQ = 5;
@@ -120,6 +123,9 @@ public class CpgMultiMetricsStats {
 	
 	@Option(name="-useNoChrPrefixBam",usage="use bam file with GRch37 instead of hg19 coordinate. Default: false")
 	public boolean useNoChrPrefixBam = false;
+
+	@Option(name="-t",usage="number of threads for parallel 5Mb bin processing. Use >0 to set explicitly; default uses all available cores.")
+	public int threads = -1;
 	
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -196,89 +202,13 @@ public class CpgMultiMetricsStats {
 					//SAMSequenceDictionary dictSeq = SAMSequenceDictionaryExtractor.extractDictionary(new File(wgsBamFile));
 					//GenomeLocParser glpSeq = new GenomeLocParser(dictSeq);
 					
-					HashMap<String,IntervalTree<Integer>> ignoreLocCollections = null;
-					if(excludeRegions!=null && !excludeRegions.isEmpty()){
-						log.info("Excluding intervals ... ");
-						ignoreLocCollections = new HashMap<String,IntervalTree<Integer>>();
-						
-						for(String excludeRegion : excludeRegions){
-							BufferedReader br = new BufferedReader(new FileReader(excludeRegion));
-							String line;
-							
-							while( (line = br.readLine()) != null){
-								if(line.startsWith("#"))
-									continue;
-								String[] splitLines = line.split("\t");
-								if(splitLines.length<3){
-									continue;
-								}
-								String chr = splitLines[0];
-								int start = Integer.parseInt(splitLines[1]);
-								int end = Integer.parseInt(splitLines[2]);
-								IntervalTree<Integer> tree;
-								if(ignoreLocCollections.containsKey(chr)){
-									tree = ignoreLocCollections.get(chr);
-								}else{
-									tree = new IntervalTree<Integer>();
-								}
-								tree.put(start, end, 1);
-								ignoreLocCollections.put(chr, tree);
-							}
-							br.close();
-						
-						}
-					}
+						HashMap<String,IntervalTree<Integer>> ignoreLocCollections = loadExcludeRegions(excludeRegions, log);
 					
 					
-						HashMap<String,IntervalTree<String>> allCpgLocCollections = new HashMap<String,IntervalTree<String>>();
-						if(includeCpgDist){
-							log.info("Loading all CpG intervals ... ");
-							GZIPInputStream gzipInputStream = null;
-							BufferedReader br1;
-							if(allCpgFile.endsWith(".gz")){
-								gzipInputStream = new GZIPInputStream(new FileInputStream(allCpgFile));
-								br1 = new BufferedReader(new InputStreamReader(gzipInputStream));
-								
-							}else{
-								br1 = new BufferedReader(new FileReader(allCpgFile));
+							HashMap<String,IntervalTree<String>> allCpgLocCollections = new HashMap<String,IntervalTree<String>>();
+							if(includeCpgDist){
+								allCpgLocCollections = loadStrandedIntervals(allCpgFile, log, "Loading all CpG intervals ... ");
 							}
-								
-								String line1;
-								
-								while( (line1 = br1.readLine()) != null){
-									if(line1.startsWith("#"))
-										continue;
-									String[] splitLines = line1.split("\t");
-									if(splitLines.length<3){
-										continue;
-									}
-									String chr = splitLines[0];
-									int start = Integer.parseInt(splitLines[1]);
-									int end = Integer.parseInt(splitLines[2]);
-									IntervalTree<String> tree;
-									
-									if(allCpgLocCollections.containsKey(chr)){
-										tree = allCpgLocCollections.get(chr);
-									}else{
-										tree = new IntervalTree<String>();
-									}
-									String strand = ".";
-									if(splitLines.length >= 6){
-										if(splitLines[5].equalsIgnoreCase("-")){
-											strand = "-";
-										}else if(splitLines[5].equalsIgnoreCase("+")){
-											strand = "+";
-										}
-										//strand = splitLines[5].equalsIgnoreCase("-") ? "-" : "+";
-									}
-									tree.put(start, end, strand);
-									allCpgLocCollections.put(chr, tree);
-								}
-								if(allCpgFile.endsWith(".gz")){
-									gzipInputStream.close();
-								}
-								br1.close();
-						}
 						
 						
 						
@@ -481,53 +411,8 @@ public class CpgMultiMetricsStats {
 					}
 					
 					
-					log.info("Loading CpG interval file ... ");
-					HashMap<String,IntervalTree<String>> cpgCollections = new HashMap<String,IntervalTree<String>>();
-						GZIPInputStream gzipInputStream1 = null;
-						BufferedReader br;
-						if(allCpgFile.endsWith(".gz")){
-							gzipInputStream1 = new GZIPInputStream(new FileInputStream(cpgListFile));
-							br = new BufferedReader(new InputStreamReader(gzipInputStream1));
-							
-						}else{
-							br = new BufferedReader(new FileReader(cpgListFile));
-						}
-							
-							String line;
-							
-							while( (line = br.readLine()) != null){
-								if(line.startsWith("#"))
-									continue;
-								String[] splitLines = line.split("\t");
-								if(splitLines.length<3){
-									continue;
-								}
-								String chr = splitLines[0];
-								int start = Integer.parseInt(splitLines[1]);
-								int end = Integer.parseInt(splitLines[2]);
-								IntervalTree<String> tree;
-								
-								if(cpgCollections.containsKey(chr)){
-									tree = cpgCollections.get(chr);
-								}else{
-									tree = new IntervalTree<String>();
-								}
-								String strand = ".";
-								if(splitLines.length >= 6){
-									if(splitLines[5].equalsIgnoreCase("-")){
-										strand = "-";
-									}else if(splitLines[5].equalsIgnoreCase("+")){
-										strand = "+";
-									}
-									//strand = splitLines[5].equalsIgnoreCase("-") ? "-" : "+";
-								}
-								tree.put(start, end, strand);
-								cpgCollections.put(chr, tree);
-							}
-							if(cpgListFile.endsWith(".gz")){
-								gzipInputStream1.close();
-							}
-							br.close();
+						HashMap<String,IntervalTree<String>> cpgCollections =
+								loadStrandedIntervals(cpgListFile, log, "Loading CpG interval file ... ");
 
 					
 					double readsNumTotal = 0;
@@ -607,7 +492,20 @@ public class CpgMultiMetricsStats {
 						}
 					}
 
-					log.info("Processing " + genomicBins.size() + " genomic bins (" + BIN_SIZE/1_000_000 + "Mb each) in parallel ...");
+						log.info("Processing " + genomicBins.size() + " genomic bins (" + BIN_SIZE/1_000_000 + "Mb each) in parallel ...");
+						long totalCpgTargets = 0;
+						for(String[] bin : genomicBins){
+							String binChr = bin[0];
+							int binStart = Integer.parseInt(bin[1]);
+							int binEnd = Integer.parseInt(bin[2]);
+							IntervalTree<String> cpgChrCollections = cpgCollections.get(binChr);
+							Iterator<Node<String>> binCpgIt = cpgChrCollections.overlappers(binStart, binEnd);
+							while(binCpgIt.hasNext()){
+								binCpgIt.next();
+								totalCpgTargets++;
+							}
+						}
+						log.info("Total CpGs scheduled for processing: " + totalCpgTargets);
 
 					// Write header to output file
 					FileOutputStream output = new FileOutputStream(detailFile);
@@ -628,13 +526,16 @@ public class CpgMultiMetricsStats {
 					final HashMap<String, HashMap<String,IntervalTree<Integer>>> finalOverlapLocStringCollections = overlapLocStringCollections;
 					final HashMap<String, HashMap<String,IntervalTree<String>>> finalDistantLocStringCollections = distantLocStringCollections;
 					final LinkedHashSet<String> finalOverlapLocString = overlapLocString;
-					final LinkedHashSet<String> finalDistantLocString = distantLocString;
-					final LinkedHashSet<String> finalValueBedLocString = valueBedLocString;
-					final LinkedHashSet<String> finalValueWigLocString = valueWigLocString;
-					final LinkedHashSet<String> finalKmerCollections = kmerCollections;
+						final LinkedHashSet<String> finalDistantLocString = distantLocString;
+						final LinkedHashSet<String> finalValueBedLocString = valueBedLocString;
+						final LinkedHashSet<String> finalValueWigLocString = valueWigLocString;
+						final LinkedHashSet<String> finalKmerCollections = kmerCollections;
+						final long finalTotalCpgTargets = Math.max(1L, totalCpgTargets);
 
 					// Parallel processing of genomic bins
-					int nThreads = Runtime.getRuntime().availableProcessors();
+					int nThreads = threads > 0 ? threads : Runtime.getRuntime().availableProcessors();
+					nThreads = Math.max(1, nThreads);
+					log.info("Using " + nThreads + " threads for parallel genomic-bin processing ...");
 					ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 					AtomicLong globalCpgCount = new AtomicLong(0);
 					AtomicLong globalPoints = new AtomicLong(0);
@@ -699,26 +600,64 @@ public class CpgMultiMetricsStats {
 									bamChr = matcher1.replaceAll("");
 								}
 
-								IntervalTree<String> cpgChrCollections = finalCpgCollections.get(binChr);
-								Iterator<Node<String>> cpgIterator = cpgChrCollections.overlappers(binStart, binEnd);
-								long localCpgCount = 0;
+									IntervalTree<String> cpgChrCollections = finalCpgCollections.get(binChr);
+									Iterator<Node<String>> cpgIterator = cpgChrCollections.overlappers(binStart, binEnd);
+									List<Node<String>> cpgNodes = new ArrayList<Node<String>>();
+									while(cpgIterator.hasNext()){
+										cpgNodes.add(cpgIterator.next());
+									}
+									Collections.sort(cpgNodes, new Comparator<Node<String>>() {
+										@Override
+										public int compare(Node<String> a, Node<String> b) {
+											int cmp = Integer.compare(a.getStart(), b.getStart());
+											if(cmp != 0){
+												return cmp;
+											}
+											return Integer.compare(a.getEnd(), b.getEnd());
+										}
+									});
 
-								while(cpgIterator.hasNext()){
-									Node<String> cpg = cpgIterator.next();
-									int start = cpg.getStart();
-									int end = cpg.getEnd();
-									int fragMostLeft = start+1;
-									int fragMostRight = end;
+									// Streaming read window: single pass over BAM iterator for this bin
+									SAMRecordIterator binReadIt = binReader.queryOverlapping(bamChr, binStart + 1, binEnd);
+									List<SAMRecord> activeReads = new ArrayList<SAMRecord>();
+									SAMRecord nextCandidateRead = null;
+									long localCpgCount = 0;
 
-									SAMRecordIterator wgsIt = binReader.queryOverlapping(bamChr, start+1, end);
-									HashMap<String, SAMRecord> countedReads = new HashMap<String, SAMRecord>();
-									int readNumber = 0;
-									while(wgsIt.hasNext()){
-										SAMRecord r = wgsIt.next();
-										if(failFlagFilter(r)){
-											continue;
-										}else{
-											if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+									for(Node<String> cpg : cpgNodes){
+										int start = cpg.getStart();
+										int end = cpg.getEnd();
+										int fragMostLeft = start+1;
+										int fragMostRight = end;
+
+										// Add reads whose alignment start is now in range for current CpG
+										while(true){
+											if(nextCandidateRead == null){
+												nextCandidateRead = nextValidBinRead(binReadIt);
+											}
+											if(nextCandidateRead == null){
+												break;
+											}
+											if(nextCandidateRead.getAlignmentStart() <= end){
+												activeReads.add(nextCandidateRead);
+												nextCandidateRead = null;
+											}else{
+												break;
+											}
+										}
+
+										// Expire reads that cannot overlap this CpG or any downstream CpG
+										for(Iterator<SAMRecord> activeIt = activeReads.iterator(); activeIt.hasNext();){
+											SAMRecord activeRead = activeIt.next();
+											if(activeRead.getAlignmentEnd() < (start + 1)){
+												activeIt.remove();
+											}
+										}
+
+										HashMap<String, SAMRecord> countedReads = new HashMap<String, SAMRecord>();
+										int readNumber = 0;
+										for(SAMRecord r : activeReads){
+											// We stream by alignment windows; keep exact overlap semantics per CpG.
+											if(r.getAlignmentStart() > end || r.getAlignmentEnd() < (start + 1)){
 												continue;
 											}
 											readNumber++;
@@ -787,17 +726,15 @@ public class CpgMultiMetricsStats {
 												countedReads.put(readName, r);
 											}
 										}
-									}
-									wgsIt.close();
 
-									if(readNumber >= maxCov || countedReads.size()==0){
-										localCpgCount++;
-										if(localCpgCount % 1000 == 0){
-											long total = globalCpgCount.addAndGet(1000);
-											log.info("Processing CpG " + total + " ...");
+										if(readNumber >= maxCov || countedReads.size()==0){
+											localCpgCount++;
+											if(localCpgCount % 1000 == 0){
+												long total = globalCpgCount.addAndGet(1000);
+												logCpgProgress(total, finalTotalCpgTargets);
+											}
+											continue;
 										}
-										continue;
-									}
 
 									double normalizedFragCov = (double)readNumber/finalReadsNumTotal;
 
@@ -823,14 +760,14 @@ public class CpgMultiMetricsStats {
 										}else if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
 											upstreamCpgIt = cpgLocCollections.reverseIterator(start-2, end-2);
 											downstreamCpgIt = cpgLocCollections.iterator(start+1, end+1);
-										}else{
-											localCpgCount++;
-											if(localCpgCount % 1000 == 0){
-												long total = globalCpgCount.addAndGet(1000);
-												log.info("Processing CpG " + total + " ...");
+											}else{
+												localCpgCount++;
+												if(localCpgCount % 1000 == 0){
+													long total = globalCpgCount.addAndGet(1000);
+													logCpgProgress(total, finalTotalCpgTargets);
+												}
+												continue;
 											}
-											continue;
-										}
 
 										if(upstreamCpgIt== null || !upstreamCpgIt.hasNext()){
 											IntervalTree.Node<String> downstream = downstreamCpgIt.next();
@@ -1016,18 +953,20 @@ public class CpgMultiMetricsStats {
 										binWriter.write("\n");
 										binPoints++;
 									}
-									localCpgCount++;
-									if(localCpgCount % 1000 == 0){
-										long total = globalCpgCount.addAndGet(1000);
-										log.info("Processing CpG " + total + " ...");
-										binWriter.flush();
-									}
-								}
+										localCpgCount++;
+										if(localCpgCount % 1000 == 0){
+											long total = globalCpgCount.addAndGet(1000);
+											logCpgProgress(total, finalTotalCpgTargets);
+												binWriter.flush();
+											}
+										}
+									binReadIt.close();
 
-								// Flush remaining CpG count
-								if(localCpgCount % 1000 != 0){
-									globalCpgCount.addAndGet(localCpgCount % 1000);
-								}
+										// Flush remaining CpG count
+										if(localCpgCount % 1000 != 0){
+											long total = globalCpgCount.addAndGet(localCpgCount % 1000);
+											logCpgProgress(total, finalTotalCpgTargets);
+										}
 
 								binWriter.close();
 								binReader.close();
@@ -1050,10 +989,11 @@ public class CpgMultiMetricsStats {
 						for(Future<Long> future : futures){
 							future.get();
 						}
-					} catch (Exception e) {
-						throw new RuntimeException("Error in parallel feature extraction", e);
-					}
-					executor.shutdown();
+						} catch (Exception e) {
+							throw new RuntimeException("Error in parallel feature extraction", e);
+						}
+						executor.shutdown();
+						logCpgProgress(globalCpgCount.get(), finalTotalCpgTargets);
 
 					// Concatenate temp files into the output
 					byte[] buffer = new byte[8192];
@@ -1087,14 +1027,35 @@ public class CpgMultiMetricsStats {
 					points = globalPoints.get();
 					finish();
 
-	}
-	
-	
-	private boolean failFlagFilter(SAMRecord r){
-		return r.getReadUnmappedFlag() || r.getNotPrimaryAlignmentFlag() || r.getMappingQuality() < minMapQ
-				|| r.getReadFailsVendorQualityCheckFlag() || r.getDuplicateReadFlag() || !r.getReadPairedFlag() || !r.getProperPairFlag()
-				|| (skipSecondEnd && r.getReadPairedFlag() && r.getSecondOfPairFlag());
-	}
+		}
+		
+		
+		private SAMRecord nextValidBinRead(SAMRecordIterator iterator){
+			while(iterator.hasNext()){
+				SAMRecord r = iterator.next();
+				if(failFlagFilter(r)){
+					continue;
+				}
+				if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+					continue;
+				}
+				return r;
+			}
+			return null;
+		}
+
+		private void logCpgProgress(long processedCpgs, long totalCpgs){
+			long cappedProcessed = Math.min(processedCpgs, totalCpgs);
+			double percent = totalCpgs <= 0 ? 100.0 : (100.0 * cappedProcessed / (double) totalCpgs);
+			log.info(String.format(Locale.US, "CpG progress: %,d/%,d (%.2f%%)", cappedProcessed, totalCpgs, percent));
+		}
+		
+		
+		private boolean failFlagFilter(SAMRecord r){
+			return r.getReadUnmappedFlag() || r.getNotPrimaryAlignmentFlag() || r.getMappingQuality() < minMapQ
+					|| r.getReadFailsVendorQualityCheckFlag() || r.getDuplicateReadFlag() || !r.getReadPairedFlag() || !r.getProperPairFlag()
+					|| (skipSecondEnd && r.getReadPairedFlag() && r.getSecondOfPairFlag());
+		}
 	
 
 	

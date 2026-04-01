@@ -19,8 +19,8 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 | 2C. Cache flatPair in Baum-Welch | Done |
 | 3A. Replace Boxed Types with Primitives in HMM Model | Done |
 | 3B. Reduce allGamma Memory Footprint | Done |
-| 3C. Streaming Read Processing in Feature Extraction | Not yet (high risk) |
-| 4A. Consolidate CpgMultiMetricsStats Variants | Not yet |
+| 3C. Streaming Read Processing in Feature Extraction | Done |
+| 4A. Consolidate CpgMultiMetricsStats Variants | Done |
 | 4B. Dependency and Java Version Upgrades | Done |
 | 4C. Add Unit Tests for HMM Core | Done |
 | 4D. Remove Dead Code | Done |
@@ -88,25 +88,26 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 - **Previous**: Stored gamma arrays for ALL sequences simultaneously in `allGamma[sequences.size()][][]`
 - **Change**: Eliminated `allGamma` array entirely. During sequential accumulation of xi results, gamma is recomputed on-the-fly from xi for each sequence. Only `firstGamma[seq][state]` is stored for pi computation, and `pdfWeights[state][totalObs]` accumulates PDF weights incrementally. This avoids storing both allXi and allGamma simultaneously.
 
-### 3C. Streaming Read Processing in Feature Extraction (Not Yet Implemented)
+### 3C. Streaming Read Processing in Feature Extraction (Done)
 - **File**: [CpgMultiMetricsStats.java](src/main/java/org/cchmc/epifluidlab/finaleme/utils/CpgMultiMetricsStats.java)
-- **Current**: Per-CpG BAM index query with new `HashMap<String, SAMRecord>` at each position
-- **Planned Change**: Sliding window approach -- maintain active reads as CpG position advances, converting O(N*M) index queries to O(R) total read operations
-- **Risk**: High -- fundamental algorithm change requiring careful validation
+- **Previous**: Per-CpG BAM index query (`queryOverlapping`) with new `HashMap<String, SAMRecord>` at each CpG position
+- **Change**: Implemented per-bin streaming read processing. Each 5Mb worker now scans BAM once for the bin, maintains an active-read sliding window, and evaluates CpGs in coordinate order. This removes per-CpG BAM index seeks while preserving per-CpG deduplication and methylation-calling logic.
+- **Result**: O(R) BAM iterator pass per bin (plus per-overlap scoring), with significantly reduced random-index overhead on large BAMs.
 
 ---
 
 ## TIER 4: Architecture and Maintenance
 
-### 4A. Consolidate CpgMultiMetricsStats Variants (Not Yet Implemented)
-- Four near-identical classes (~3,559 lines total): `CpgMultiMetricsStats`, `CpgMultiMetricsStatsInMemory`, `CpgMultiMetricsStatsNoBam`, `CpgMultiMetricsStatsV2`
-- Extract abstract base class with shared logic; each variant overrides reference/BAM access strategy
+### 4A. Consolidate CpgMultiMetricsStats Variants (Done)
+- Added shared abstract base class: [AbstractCpgMultiMetricsStats.java](src/main/java/org/cchmc/epifluidlab/finaleme/utils/AbstractCpgMultiMetricsStats.java)
+- Refactored `CpgMultiMetricsStats`, `CpgMultiMetricsStatsInMemory`, `CpgMultiMetricsStatsNoBam`, and `CpgMultiMetricsStatsV2` to extend the shared base.
+- Moved shared interval-loading logic (gz/plain BED readers, exclude-region loading, stranded CpG interval loading) into the base class and reused across all four variants.
 
 ### 4B. Dependency and Java Version Upgrades (Done)
 - **log4j 1.2.17**: Replaced with SLF4J 2.0.9 + Logback 1.4.14 across all 23+ Java files
 - **Java target**: Upgraded from Java 1.8 to Java 21 (maven-compiler-plugin 3.11.0, source/target 21)
 - **GATK 3.3**: Removed entirely. `BaseUtils` replaced with inline `basesAreEqual()` and `simpleReverseComplement()` in `BaseUtilsMore.java`. Deleted unused `NotProperPairedReadFilter` and `InvertedDupsReadFilter`.
-- **htsjdk 1.141**: Kept as-is (upgrade requires API migration across all BAM processing code)
+- **htsjdk**: Upgraded from 1.141 to 2.24.1 in `pom.xml` and removed legacy HTTP Maven repository configuration.
 - **JUnit 5**: Added junit-jupiter 5.10.1 + maven-surefire-plugin 3.2.3
 
 ### 4C. Add Unit Tests for HMM Core (Done)
@@ -128,13 +129,12 @@ FinaleMe is a Java bioinformatics tool (~9,600 lines) for predicting DNA methyla
 
 ---
 
-## Implementation Order (for remaining work)
+## Implementation Order (Completed)
 
-| Phase | Work | Effort |
-|-------|------|--------|
-| 1 | Streaming read processing (3C) | 1-2 weeks |
-| 2 | Code consolidation (4A) | 1-2 weeks |
-| 3 | htsjdk upgrade (4B partial) | 2-3 weeks |
+All previously remaining items have been implemented:
+- Streaming read processing (3C)
+- CpgMultiMetricsStats consolidation (4A)
+- htsjdk upgrade (4B partial)
 
 ---
 

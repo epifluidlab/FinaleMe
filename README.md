@@ -51,9 +51,14 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 - **Parallelized KL-divergence** convergence check
 - **Single-pass matrix file processing** (was reading the file twice)
 - **Fast BAM read counting** via index statistics (no more full BAM scan)
+- **Streaming BAM feature extraction** within each 5Mb bin (active-read window; no per-CpG BAM index query)
+- **Feature extraction progress reporting** with processed/total CpGs and percentage
+- **TwoBitParser debug logs disabled by default** (via bundled Logback config)
 - **Reduced memory usage** by replacing boxed types with primitive arrays and eliminating allGamma storage
 - **Replaced log4j** with SLF4J + Logback (fixes CVE-2021-4104)
 - **Removed GATK dependency** (replaced with inline utilities)
+- **Upgraded htsjdk** from 1.141 to 2.24.1
+- **Consolidated CpgMultiMetricsStats variants** using a shared abstract base and common interval-loading utilities
 - **Added unit tests** for HMM core (13 tests)
 
 See [PLAN.md](PLAN.md) for full details on all optimizations.
@@ -90,7 +95,9 @@ java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/java-genomi
   -wgsMode
 ```
 
-Feature extraction is now parallelized by 5Mb genomic bins, automatically using all available CPU cores.
+Feature extraction is now parallelized by 5Mb genomic bins and processed with a per-bin streaming BAM read window, automatically using all available CPU cores.
+Runtime progress is logged as CpGs processed out of total with percent completion.
+You can set thread count explicitly with `-t` (for example, `-t 8`).
 
 * CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with CpG's coordinate in the reference genome, which can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
 * hg19.bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs ls:*)",
+      "Read(//Users/yaping/Documents/workspace/code/FinaleMe/**)",
+      "Bash(grep -v \"^\\\\./$\")"
+    ]
+  }
+}
