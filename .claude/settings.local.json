@@ -8,7 +8,21 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebSearch",
       "WebFetch(domain:www.biorxiv.org)",
-      "Bash(jar tf:*)"
+      "Bash(jar tf:*)",
+      "Bash(zcat /Users/yaping/Documents/workspace/code/UXM_deconv/tutorial/data/Lung_STL001.pat.gz)",
+      "Bash(gunzip -c /Users/yaping/Documents/workspace/code/UXM_deconv/tutorial/data/Lung_STL001.pat.gz)",
+      "Bash(grep -n \"coord_cols\" /Users/yaping/Documents/workspace/code/UXM_deconv/src/*.py)",
+      "Bash(ls /Users/yaping/Documents/workspace/code/UXM_deconv/tutorial/data/*.pat.gz)",
+      "Bash(wgbstools --version)",
+      "Bash(pip show:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(pip3 list:*)",
+      "Bash(conda list:*)",
+      "Bash(command -v wgbstools)",
+      "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools --version)",
+      "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools init:*)",
+      "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools genome:*)",
+      "Bash(JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home mvn -f /Users/yaping/Documents/workspace/code/FinaleMe/pom.xml test -q)"
     ]
   }
 }

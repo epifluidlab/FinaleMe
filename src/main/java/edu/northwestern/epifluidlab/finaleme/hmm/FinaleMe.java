@@ -1761,7 +1761,13 @@ public class FinaleMe {
 			if (positions == null || offset == null) {
 				return -1;
 			}
+			// Try exact match first (same coordinate system)
 			int localIndex = Arrays.binarySearch(positions, start);
+			if (localIndex < 0) {
+				// Try start+1: FinaleMe uses 0-based BED start (e.g. 10468),
+				// wgbstools CpG.bed.gz uses 0-based CpG position (e.g. 10469, the C in CG)
+				localIndex = Arrays.binarySearch(positions, start + 1);
+			}
 			if (localIndex < 0) {
 				return -1;
 			}

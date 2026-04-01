@@ -174,11 +174,20 @@ If chromosome naming differs between decode output and your chrom size file, use
 To emit UXM-compatible per-fragment outputs for deconvolution (`.pat.gz` + `.beta`), add:
 ```
   -patOutput \
-  -cpgIndexFile CG_motif.hg19.common_chr.pos_only.bedgraph
+  -cpgIndexFile /path/to/wgbs_tools/references/hg19/CpG.bed.gz
 ```
+**Important**: Use wgbstools' `CpG.bed.gz` as the CpG index file (not `CG_motif.bedgraph`) to ensure CpG indices match the UXM/wgbstools indexing system. The file can be found at `wgbs_tools/references/hg19/CpG.bed.gz` after running `wgbstools init_genome --name hg19`.
+
 This writes:
-- `*.pat.gz`: tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count`
+- `*.pat.gz`: bgzip-compressed, tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count` — compatible with [UXM_deconv](https://github.com/nloyfer/UXM_deconv) and [wgbstools](https://github.com/nloyfer/wgbs_tools)
 - `*.beta`: binary uint8 pairs `(methylated_count, total_count)` for each CpG index row
+
+Then run UXM deconvolution directly:
+```
+uxm deconv test.FinaleMe.mincg7.prediction.pat.gz \
+  -o test.FinaleMe.mincg7.prediction.uxm_result.csv \
+  -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
+```
 
 #### Step 4 (optional): convert predicted result to .bw file for the visualization in genome browser
 ```
