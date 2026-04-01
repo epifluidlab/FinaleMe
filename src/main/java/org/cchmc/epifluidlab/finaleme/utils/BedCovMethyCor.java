@@ -24,8 +24,8 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.math3.stat.correlation.PearsonsCorrelation;
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -57,7 +57,7 @@ public class BedCovMethyCor {
 
 	final private static String USAGE = "BedCovMethyCor [opts] hg19.chrom.size input.6plus2.bed[.gz] output.methy_cov_cor.txt.gz";
 	
-	private static Logger log = Logger.getLogger(BedCovMethyCor.class);
+	private static final Logger log = LoggerFactory.getLogger(BedCovMethyCor.class);
 
 	private static long startTime = -1;
 	private static long lineNum=0;
@@ -71,7 +71,7 @@ public class BedCovMethyCor {
 	public static void main(String[] args)
 			throws Exception {
 			BedCovMethyCor bcmc = new BedCovMethyCor();
-				BasicConfigurator.configure();
+				//BasicConfigurator.configure();
 				bcmc.doMain(args);
 	}
 			

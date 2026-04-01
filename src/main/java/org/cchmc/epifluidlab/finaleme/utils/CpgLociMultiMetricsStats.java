@@ -37,9 +37,9 @@ import java.util.zip.GZIPOutputStream;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
-import org.broadinstitute.gatk.utils.BaseUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -100,7 +100,7 @@ public class CpgLociMultiMetricsStats {
 
 	final private static String USAGE = "CpgLociMultiMetricsStats [opts] hg19.2bit cpg_list.bed wgs.bam cpg_loc_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgLociMultiMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgLociMultiMetricsStats.class);
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -532,7 +532,7 @@ public class CpgLociMultiMetricsStats {
 									byte basePrev = prev.getReadBases()[offSetPrev];
 									//int fragLenPrev = Math.abs(prev.getInferredInsertSize());
 									
-									if(!BaseUtils.basesAreEqual(base, basePrev)){
+									if(!BaseUtilsMore.basesAreEqual(base, basePrev)){
 										if(baseQ > baseQPrev){
 											countedReads.put(readName, r);
 											
@@ -574,7 +574,7 @@ public class CpgLociMultiMetricsStats {
 						//nearest cpg's distance in reference genome
 						boolean cpgNegStrand = false;
 						double nearestCpg = Double.NaN;
-						if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
+						if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
 							if(i < cpgCollections.size()-2){
 								if(i>=1){
 									Interval downstreamCpg = cpgCollections.getIntervals().get(i+2);
@@ -593,7 +593,7 @@ public class CpgLociMultiMetricsStats {
 									
 								}
 							}
-						}else if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
+						}else if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
 							cpgNegStrand = true;
 							if(i >= 2){
 								if(i < cpgCollections.size()-1){
@@ -615,7 +615,7 @@ public class CpgLociMultiMetricsStats {
 							}
 						}
 						if(cpgNegStrand){
-							refBasesExt = BaseUtils.simpleReverseComplement(refBasesExt);
+							refBasesExt = BaseUtilsMore.simpleReverseComplement(refBasesExt);
 						}
 						HashMap<String, Double> kmerMapsRef = new HashMap<String, Double>();
 						for(int j = 2; j <= kmerLen; j++){
@@ -781,10 +781,10 @@ public class CpgLociMultiMetricsStats {
 							
 							if(negStrand){
 								negStrandNum++;
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.G)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G)){
 										methyReads++;
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.A)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A)){
 										unmethyReads++;
 									}else{
 										continue;
@@ -793,10 +793,10 @@ public class CpgLociMultiMetricsStats {
 									continue;
 								}
 							}else{
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.C)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C)){
 										methyReads++;
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.T)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T)){
 										unmethyReads++;
 									}else{
 										continue;

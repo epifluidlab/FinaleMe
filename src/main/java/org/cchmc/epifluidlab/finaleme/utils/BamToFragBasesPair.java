@@ -32,7 +32,8 @@ import java.util.TreeMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -83,7 +84,7 @@ public class BamToFragBasesPair {
 
 	final private static String USAGE = "BamToFragBasesPair [opts] hg19.2bit cpg_list.bed[.gz] wgbs/wgs.bam fragBasePair.bed.gz";
 	
-	private static Logger log = Logger.getLogger(BamToFragBasesPair.class);
+	private static final Logger log = LoggerFactory.getLogger(BamToFragBasesPair.class);
 
 	private static long startTime = -1;
 	private static long reads = 0;

@@ -24,8 +24,8 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.math3.stat.correlation.PearsonsCorrelation;
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -57,7 +57,7 @@ public class DistFragEndMethyCor {
 
 	final private static String USAGE = "BedCovMethyCor [opts] hg19.chrom.size summary.withCgMethy.txt.gz output.methy_dist_cor.txt.gz";
 	
-	private static Logger log = Logger.getLogger(DistFragEndMethyCor.class);
+	private static final Logger log = LoggerFactory.getLogger(DistFragEndMethyCor.class);
 
 	private static long startTime = -1;
 	private static long lineNum=0;
@@ -71,7 +71,7 @@ public class DistFragEndMethyCor {
 	public static void main(String[] args)
 			throws Exception {
 			DistFragEndMethyCor bcmc = new DistFragEndMethyCor();
-				BasicConfigurator.configure();
+				//BasicConfigurator.configure();
 				bcmc.doMain(args);
 	}
 			

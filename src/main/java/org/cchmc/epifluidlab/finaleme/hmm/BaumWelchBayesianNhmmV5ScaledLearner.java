@@ -54,10 +54,6 @@ extends BaumWelchScaledLearner
 			throw new InternalError();
 		}
 			
-		/* gamma and xi arrays are those defined by Rabiner and Juang */
-		/* allGamma[n] = gamma array associated to observation sequence n */
-		double allGamma[][][] = new double[sequences.size()][][];
-
 		/* a[i][j] = aijNum[i][j] / aijDen[i]
 		 * aijDen[i] = expected number of transitions from state i
 		 * aijNum[i][j] = expected number of transitions from state i to j
@@ -71,11 +67,11 @@ extends BaumWelchScaledLearner
 			for (int j = 0; j < hmm.nbStates(); j++)
 				Arrays.fill(aijNum[j], 0.);
 
-		// Phase 1: Parallel forward-backward, xi, and gamma computation
+		// Phase 1: Parallel forward-backward and xi computation
 		int nThreads = Runtime.getRuntime().availableProcessors();
 		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 
-		// Each task computes: [xi, gamma, sequenceIndex]
+		// Each task computes xi (gamma is derived from xi on-the-fly during accumulation)
 		List<Future<Object[]>> futures = new ArrayList<Future<Object[]>>(sequences.size());
 		for (int idx = 0; idx < sequences.size(); idx++) {
 			final int seqIdx = idx;
@@ -86,21 +82,18 @@ extends BaumWelchScaledLearner
 					ForwardBackwardBayesianNhmmV5ScaledCalculator fbc =
 						generateForwardBackwardCalculator(obsSeqPair, hmm);
 					double[][][] xi = estimateXi(obsSeqPair, fbc, hmm);
-					double[][] gamma = estimateGamma(xi, fbc);
-					return new Object[]{xi, gamma, seqIdx};
+					return new Object[]{xi, seqIdx};
 				}
 			}));
 		}
 
-		// Phase 2: Sequential accumulation of parallel results
+		// Collect parallel results
 		double[][][][] allXi = new double[sequences.size()][][][];
 		try {
 			for (Future<Object[]> future : futures) {
 				Object[] result = future.get();
 				double[][][] xi = (double[][][]) result[0];
-				double[][] gamma = (double[][]) result[1];
-				int seqIdx = (Integer) result[2];
-				allGamma[seqIdx] = gamma;
+				int seqIdx = (Integer) result[1];
 				allXi[seqIdx] = xi;
 			}
 		} catch (Exception e) {
@@ -108,13 +101,42 @@ extends BaumWelchScaledLearner
 		}
 		executor.shutdown();
 
-		// Sequential accumulation into aijNum, aijDen, arij
+		// Pre-compute total observations for PDF weight arrays
+		int totalObs = 0;
+		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> seq : sequences)
+			totalObs += seq.getSecond().size();
+
+		// Memory-efficient accumulators: firstGamma for pi, pdfWeights for opdf fitting
+		double[][] firstGamma = new double[sequences.size()][hmm.nbStates()];
+		double[][] pdfWeights = new double[hmm.nbStates()][totalObs];
+		double[] pdfWeightSums = new double[hmm.nbStates()];
+
+		// Sequential accumulation into aijNum, aijDen, arij, firstGamma, pdfWeights
+		int obsOffset = 0;
 		for (int g = 0; g < sequences.size(); g++) {
 			double[][][] xi = allXi[g];
-			double[][] gamma = allGamma[g];
 			Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair = sequences.get(g);
 			List<? extends O> obsSeq = obsSeqPair.getSecond();
 			HashMap<Integer, Pair<Integer, Double>> cpgDistState = obsSeqPair.getFirst();
+
+			// Recompute gamma from xi on-the-fly (avoids storing allGamma)
+			double[][] gamma = estimateGamma(xi, (ForwardBackwardBayesianNhmmV5Calculator) null);
+
+			// Store first-timestep gamma for pi computation
+			System.arraycopy(gamma[0], 0, firstGamma[g], 0, hmm.nbStates());
+
+			// Accumulate PDF weights
+			for (int i = 0; i < hmm.nbStates(); i++) {
+				for (int t = 0; t < obsSeq.size(); t++) {
+					pdfWeights[i][obsOffset + t] = gamma[t][i];
+					pdfWeightSums[i] += gamma[t][i];
+					if(Double.isNaN(gamma[t][i]) || Double.isInfinite(gamma[t][i])){
+						System.err.println(gamma[t][i] + "\t" + pdfWeightSums[i] + "\t" + g + "\t" + t + "\t" + i);
+						System.exit(1);
+					}
+				}
+			}
+			obsOffset += obsSeq.size();
 
 			for (int i = 0; i < hmm.nbStates(); i++)
 				for (int t = 0; t < obsSeq.size() - 1; t++) {
@@ -151,7 +173,7 @@ extends BaumWelchScaledLearner
 				Pair<double[][], double[]> tmp = arij.get(r);
 				double[] denTmp = tmp.getSecond();
 				double[][] numTmp = tmp.getFirst();
-				
+
 				for (int i = 0; i < hmm.nbStates(); i++) {
 					if (denTmp[i] == 0.){
 						for (int j = 0; j < hmm.nbStates(); j++)
@@ -159,9 +181,9 @@ extends BaumWelchScaledLearner
 					}else{
 						for (int j = 0; j < hmm.nbStates(); j++)
 							nhmm.setArij(r, i, j, numTmp[i][j] / denTmp[i]);
-						
+
 					}
-						
+
 				}
 			}else{
 				for (int i = 0; i < hmm.nbStates(); i++) {
@@ -174,8 +196,8 @@ extends BaumWelchScaledLearner
 				}
 			}
 		}
-		
-		
+
+
 		/* pi computation */
 		for (int r = 1; r < hmm.nbCpgDistState(); r++) {
 			for (int i = 0; i < hmm.nbStates(); i++)
@@ -187,13 +209,14 @@ extends BaumWelchScaledLearner
 			Integer r = obsSeqPair.getFirst().get(0).getFirst();
 				for (int i = 0; i < hmm.nbStates(); i++){
 					nhmm.setPri(r, i,
-								nhmm.getPri(r, i) + allGamma[o][0][i] / sequences.size());
+								nhmm.getPri(r, i) + firstGamma[o][i] / sequences.size());
 				}
 		}
+		firstGamma = null; // allow GC
 
 		/* rescale pi */
 		HashMap<Integer, Double> sumPi = new HashMap<Integer, Double>();
-		
+
 		for (int r = 0; r <= hmm.nbCpgDistState(); r++) {
 			for (int i = 0; i < hmm.nbStates(); i++){
 				if(sumPi.containsKey(r)){
@@ -201,10 +224,10 @@ extends BaumWelchScaledLearner
 				}else{
 					sumPi.put(r, nhmm.getPri(r, i));
 				}
-				
+
 			}
 		}
-		
+
 		for (int r = 0; r <= hmm.nbCpgDistState(); r++) {
 			for (int i = 0; i < hmm.nbStates(); i++){
 				if(sumPi.get(r) == 0){
@@ -212,49 +235,27 @@ extends BaumWelchScaledLearner
 				}else{
 					nhmm.setPri(r, i, nhmm.getPri(r, i)/sumPi.get(r));
 				}
-				
+
 			}
 		}
-		/* pdfs computation */
+		/* pdfs computation -- weights already accumulated during sequential phase */
 		List<O> observations = CcInferenceUtils.flatPair(sequences);
 		for (int i = 0; i < hmm.nbStates(); i++) {
-			double[] weights = new double[observations.size()];
-			double sum = 0.;
-			
-			int j = 0;
-			
-			int o = 0;
-			for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair : sequences) {
-				List<? extends O> obsSeq = obsSeqPair.getSecond();
-				for (int t = 0; t < obsSeq.size(); t++, j++){
+			double sum = pdfWeightSums[i];
+			double[] weights = pdfWeights[i];
 
-						sum += allGamma[o][t][i];
-						weights[j] += allGamma[o][t][i];
-						if(Double.isNaN(weights[j]) || Double.isInfinite(weights[j])){
-							
-							System.err.println(weights[j] + "\t" + sum + "\t" + allGamma[o][t][i] + "\t" + o + "\t" + t + "\t" + i);
-							System.exit(1);
-						}
-				}
-					
-				o++;
-			}
-			
-			for (j--; j >= 0; j--){
+			for (int j = weights.length - 1; j >= 0; j--){
 				weights[j] /= sum;
 				if(Double.isNaN(weights[j]) || Double.isInfinite(weights[j])){
-					
 					System.err.println(weights[j] + "\t" + sum + "\t" +  j);
 					System.exit(1);
 				}
 			}
-				
-			
+
 			Opdf<O> opdf = nhmm.getOpdf(i);
 			opdf.fit(observations, weights);
-			
 		}
-		
+
 		return nhmm;
 	}
 

@@ -24,7 +24,8 @@ import java.util.List;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -49,7 +50,7 @@ public class AggregateCpgreadsToBedgraph {
 	private List<String> arguments = new ArrayList<String>();
 
 
-	private static Logger log = Logger.getLogger(AggregateCpgreadsToBedgraph.class);
+	private static final Logger log = LoggerFactory.getLogger(AggregateCpgreadsToBedgraph.class);
 	private static long startTime = -1;
 
 

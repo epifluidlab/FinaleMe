@@ -1,7 +1,5 @@
 package org.cchmc.epifluidlab.finaleme.utils;
 
-import org.broadinstitute.gatk.utils.BaseUtils;
-
 /*
  * Bis-SNP/BisSNP: It is a genotyping and methylation calling in bisulfite treated massively
  * parallel sequencing (Bisulfite-seq and NOMe-seq) on Illumina platform Copyright (C) <2011>
@@ -118,13 +116,13 @@ public class BaseUtilsMore {
 	static public boolean isBisulfiteMismatch(byte refBase, byte base, boolean negStrand, boolean secondPair) {
 		if (!negStrand) {
 			if (secondPair) {
-				if (BaseUtils.basesAreEqual(refBase, G) && BaseUtils.basesAreEqual(base, A)) {
+				if (BaseUtilsMore.basesAreEqual(refBase, G) && BaseUtilsMore.basesAreEqual(base, A)) {
 					return false;
 				} else {
 					return true;
 				}
 			} else {
-				if (BaseUtils.basesAreEqual(refBase, C) && BaseUtils.basesAreEqual(base, T)) {
+				if (BaseUtilsMore.basesAreEqual(refBase, C) && BaseUtilsMore.basesAreEqual(base, T)) {
 					return false;
 				} else {
 					return true;
@@ -133,13 +131,13 @@ public class BaseUtilsMore {
 
 		} else {
 			if (secondPair) {
-				if (BaseUtils.basesAreEqual(refBase, C) && BaseUtils.basesAreEqual(base, T)) {
+				if (BaseUtilsMore.basesAreEqual(refBase, C) && BaseUtilsMore.basesAreEqual(base, T)) {
 					return false;
 				} else {
 					return true;
 				}
 			} else {
-				if (BaseUtils.basesAreEqual(refBase, G) && BaseUtils.basesAreEqual(base, A)) {
+				if (BaseUtilsMore.basesAreEqual(refBase, G) && BaseUtilsMore.basesAreEqual(base, A)) {
 					return false;
 				} else {
 					return true;
@@ -288,7 +286,7 @@ public class BaseUtilsMore {
 	static public boolean iupacCodeEqualNotConsiderMethyStatus(byte pattern, byte observe) {
 		pattern = toUpperCase(pattern);
 		observe = toUpperCase(observe);
-		if (BaseUtils.basesAreEqual(observe, A)) {
+		if (BaseUtilsMore.basesAreEqual(observe, A)) {
 			switch (pattern) {
 			case 'A':
 			case 'R':
@@ -303,7 +301,7 @@ public class BaseUtilsMore {
 			default:
 				return false;
 			}
-		} else if (BaseUtils.basesAreEqual(observe, C)) {
+		} else if (BaseUtilsMore.basesAreEqual(observe, C)) {
 			switch (pattern) {
 			case 'C':
 			case 'Y':
@@ -317,7 +315,7 @@ public class BaseUtilsMore {
 			default:
 				return false;
 			}
-		} else if (BaseUtils.basesAreEqual(observe, G)) {
+		} else if (BaseUtilsMore.basesAreEqual(observe, G)) {
 			switch (pattern) {
 			case 'G':
 			case 'R':
@@ -331,7 +329,7 @@ public class BaseUtilsMore {
 			default:
 				return false;
 			}
-		} else if (BaseUtils.basesAreEqual(observe, T)) {
+		} else if (BaseUtilsMore.basesAreEqual(observe, T)) {
 			switch (pattern) {
 			case 'T':
 			case 'W':
@@ -372,7 +370,7 @@ public class BaseUtilsMore {
 			return true;
 		} else if (pattern == observe) {
 			return true;
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.R)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.R)) {
 			switch (observe) {
 			case 'C':
 			case 'T':
@@ -381,7 +379,7 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.Y)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.Y)) {
 			switch (observe) {
 			case 'A':
 			case 'G':
@@ -390,7 +388,7 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.S)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.S)) {
 			switch (observe) {
 			case 'A':
 			case 'T':
@@ -399,7 +397,7 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.W)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.W)) {
 			switch (observe) {
 			case 'G':
 			case 'C':
@@ -408,7 +406,7 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.K)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.K)) {
 			switch (observe) {
 			case 'A':
 			case 'C':
@@ -417,7 +415,7 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.M)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.M)) {
 			switch (observe) {
 			case 'G':
 			case 'T':
@@ -426,28 +424,28 @@ public class BaseUtilsMore {
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.B)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.B)) {
 			switch (observe) {
 			case 'A':
 				return false;
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.H)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.H)) {
 			switch (observe) {
 			case 'G':
 				return false;
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.V)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.V)) {
 			switch (observe) {
 			case 'T':
 				return false;
 			default:
 				return true;
 			}
-		} else if (BaseUtils.basesAreEqual(pattern, BaseUtilsMore.D)) {
+		} else if (BaseUtilsMore.basesAreEqual(pattern, BaseUtilsMore.D)) {
 			switch (observe) {
 			case 'C':
 				return false;
@@ -477,10 +475,10 @@ public class BaseUtilsMore {
 	static public byte makeIupacCodeFrom2Byte(byte a, byte b) {
 		a = toUpperCase(a);
 		b = toUpperCase(b);
-		if (BaseUtils.basesAreEqual(a, b)) {
+		if (BaseUtilsMore.basesAreEqual(a, b)) {
 			return a;
 		} else {
-			if (BaseUtils.basesAreEqual(a, A)) {
+			if (BaseUtilsMore.basesAreEqual(a, A)) {
 				switch (b) {
 
 				case 'C':
@@ -492,7 +490,7 @@ public class BaseUtilsMore {
 				default:
 					return 'N';
 				}
-			} else if (BaseUtils.basesAreEqual(a, C)) {
+			} else if (BaseUtilsMore.basesAreEqual(a, C)) {
 				switch (b) {
 				case 'A':
 					return 'M';
@@ -504,7 +502,7 @@ public class BaseUtilsMore {
 				default:
 					return 'N';
 				}
-			} else if (BaseUtils.basesAreEqual(a, G)) {
+			} else if (BaseUtilsMore.basesAreEqual(a, G)) {
 				switch (b) {
 				case 'A':
 					return 'R';
@@ -516,7 +514,7 @@ public class BaseUtilsMore {
 				default:
 					return 'N';
 				}
-			} else if (BaseUtils.basesAreEqual(a, T)) {
+			} else if (BaseUtilsMore.basesAreEqual(a, T)) {
 				switch (b) {
 				case 'A':
 					return 'W';
@@ -677,6 +675,28 @@ public class BaseUtilsMore {
 			return base;
 		}
 
+	}
+
+	public static boolean basesAreEqual(byte a, byte b) {
+		return a == b;
+	}
+
+	public static byte[] simpleReverseComplement(byte[] bases) {
+		byte[] result = new byte[bases.length];
+		for (int i = 0; i < bases.length; i++) {
+			result[bases.length - 1 - i] = complementBase(bases[i]);
+		}
+		return result;
+	}
+
+	private static byte complementBase(byte base) {
+		switch (base) {
+		case 'A': case 'a': return 'T';
+		case 'T': case 't': return 'A';
+		case 'C': case 'c': return 'G';
+		case 'G': case 'g': return 'C';
+		default: return base;
+		}
 	}
 
 	static public byte toUpperCase(byte b) {

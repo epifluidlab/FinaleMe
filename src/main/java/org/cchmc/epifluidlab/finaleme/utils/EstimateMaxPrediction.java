@@ -28,8 +28,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
 
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -69,7 +69,7 @@ public class EstimateMaxPrediction {
 
 	final private static String USAGE = "EstimateMaxPrediction [opts] cpg_list.bed[.gz] wgbs/wgs.bam";
 	
-	private static Logger log = Logger.getLogger(EstimateMaxPrediction.class);
+	private static final Logger log = LoggerFactory.getLogger(EstimateMaxPrediction.class);
 
 	private static long startTime = -1;
 	private static long pointTotal = 0;
@@ -84,7 +84,7 @@ public class EstimateMaxPrediction {
 	 */
 	public static void main(String[] args) throws Exception {
 		EstimateMaxPrediction emp = new EstimateMaxPrediction();
-		BasicConfigurator.configure();
+		//BasicConfigurator.configure();
 		emp.doMain(args);
 	}
 	

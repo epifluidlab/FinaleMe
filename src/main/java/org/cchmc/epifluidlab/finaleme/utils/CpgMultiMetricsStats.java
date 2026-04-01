@@ -32,6 +32,8 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -40,9 +42,9 @@ import java.util.zip.GZIPOutputStream;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
-import org.broadinstitute.gatk.utils.BaseUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -128,7 +130,7 @@ public class CpgMultiMetricsStats {
 
 	final private static String USAGE = "CpgMultiMetricsStats [opts] hg19.2bit cpg_list.bed all_cpg.bed wgs.bam cpg_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMultiMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMultiMetricsStats.class);
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -576,516 +578,501 @@ public class CpgMultiMetricsStats {
 					log.info((long)readsNumTotal + " reads in total ...");
 					readsNumTotal = readsNumTotal/1000000;
 					log.info("Output value for each CpG in each DNA fragment ... ");
+
+					// Build list of 5Mb genomic bins from CpG collections
+					final int BIN_SIZE = 5_000_000;
+					List<String[]> genomicBins = new ArrayList<String[]>(); // [chr, binStart, binEnd]
+					for(String chr : cpgCollections.keySet()){
+						if(chr.equalsIgnoreCase("chrM")){
+							continue;
+						}
+						IntervalTree<String> cpgChrCollections = cpgCollections.get(chr);
+						// Find min/max coordinates for this chromosome's CpGs
+						int minCoord = Integer.MAX_VALUE;
+						int maxCoord = Integer.MIN_VALUE;
+						Iterator<Node<String>> it = cpgChrCollections.iterator();
+						while(it.hasNext()){
+							Node<String> node = it.next();
+							if(node.getStart() < minCoord) minCoord = node.getStart();
+							if(node.getEnd() > maxCoord) maxCoord = node.getEnd();
+						}
+						// Create bins
+						for(int binStart = (minCoord / BIN_SIZE) * BIN_SIZE; binStart <= maxCoord; binStart += BIN_SIZE){
+							int binEnd = binStart + BIN_SIZE;
+							// Check if any CpGs exist in this bin
+							Iterator<Node<String>> binIt = cpgChrCollections.overlappers(binStart, binEnd);
+							if(binIt.hasNext()){
+								genomicBins.add(new String[]{chr, String.valueOf(binStart), String.valueOf(binEnd)});
+							}
+						}
+					}
+
+					log.info("Processing " + genomicBins.size() + " genomic bins (" + BIN_SIZE/1_000_000 + "Mb each) in parallel ...");
+
+					// Write header to output file
 					FileOutputStream output = new FileOutputStream(detailFile);
 					OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
-					
-					//basic
 					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
 					if(includeCpgDist){
 						writer.write("\tdist_nearest_CpG");
 					}
 					writer.write(header + "\n");
-					//fragment k-mer
-					
-					
-					//
-					
-					long i = 0;
-					String prevChr = "";
-					for(String chr : cpgCollections.keySet()){
-						if(chr.equalsIgnoreCase("chrM")){
-							continue;
-							
-						}
-						if(prevChr.equalsIgnoreCase("")){
-							prevChr = chr;
-							refParser.setCurrentSequence(chr);
-						}
-						String bamChr = chr;
-						if(useNoChrPrefixBam){
-							
-							Pattern replace = Pattern.compile("^chr");
-			                Matcher matcher1 = replace.matcher(bamChr);
-			                bamChr=matcher1.replaceAll("");
-						}
-						IntervalTree<String> cpgChrCollections = cpgCollections.get(chr);
-						Iterator<Node<String>> cpgIterator = cpgChrCollections.iterator();
-						while(cpgIterator.hasNext()){
-							Node<String> cpg = cpgIterator.next();
-							int start = cpg.getStart();
-							int end = cpg.getEnd();
-							int fragMostLeft = start+1;
-							int fragMostRight = end;
-							
-							SAMRecordIterator wgsIt = wgsReader.queryOverlapping(bamChr,start+1,end);//start 1-based, inclusive start of interval of interest. Zero implies start of the reference sequence.
-							HashMap<String, SAMRecord> countedReads = new HashMap<String, SAMRecord>();
-							//log.info("testincpg" + i + "\t" + cpgCollections.size() + "\t" + wgsIt.hasNext() + "\t" + chr + "\t" + start + "\t" + end);
-							int readNumber =0;
-							//log.info(r.getReadName() + "\t" + failFlagFilter(r));
-							while(wgsIt.hasNext()){
-								SAMRecord r = wgsIt.next();
-								//log.info(r.getReadName() + "\t" + failFlagFilter(r));
-								if(failFlagFilter(r)){
-									continue;
-								}else{
-									if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
-										continue;
+					writer.flush();
+
+					// Capture final variables for lambda/anonymous class access
+					final double finalReadsNumTotal = readsNumTotal;
+					final String finalRefFile = refFile;
+					final String finalWgsBamFile = wgsBamFile;
+					final HashMap<String,IntervalTree<String>> finalCpgCollections = cpgCollections;
+					final HashMap<String,IntervalTree<String>> finalAllCpgLocCollections = allCpgLocCollections;
+					final HashMap<String, HashMap<String,IntervalTree<Integer>>> finalOverlapLocStringCollections = overlapLocStringCollections;
+					final HashMap<String, HashMap<String,IntervalTree<String>>> finalDistantLocStringCollections = distantLocStringCollections;
+					final LinkedHashSet<String> finalOverlapLocString = overlapLocString;
+					final LinkedHashSet<String> finalDistantLocString = distantLocString;
+					final LinkedHashSet<String> finalValueBedLocString = valueBedLocString;
+					final LinkedHashSet<String> finalValueWigLocString = valueWigLocString;
+					final LinkedHashSet<String> finalKmerCollections = kmerCollections;
+
+					// Parallel processing of genomic bins
+					int nThreads = Runtime.getRuntime().availableProcessors();
+					ExecutorService executor = Executors.newFixedThreadPool(nThreads);
+					AtomicLong globalCpgCount = new AtomicLong(0);
+					AtomicLong globalPoints = new AtomicLong(0);
+
+					// Create temp files for each bin, submit tasks
+					List<File> tempFiles = new ArrayList<File>();
+					List<Future<Long>> futures = new ArrayList<Future<Long>>();
+
+					for(int binIdx = 0; binIdx < genomicBins.size(); binIdx++){
+						final String[] bin = genomicBins.get(binIdx);
+						final String binChr = bin[0];
+						final int binStart = Integer.parseInt(bin[1]);
+						final int binEnd = Integer.parseInt(bin[2]);
+						final File tempFile = File.createTempFile("cpg_bin_" + binIdx + "_", ".tmp");
+						tempFile.deleteOnExit();
+						tempFiles.add(tempFile);
+
+						futures.add(executor.submit(new Callable<Long>() {
+							@Override
+							public Long call() throws Exception {
+								long binPoints = 0;
+
+								// Per-thread I/O resources
+								SamReader binReader = SamReaderFactory.makeDefault()
+									.validationStringency(ValidationStringency.SILENT)
+									.open(new File(finalWgsBamFile));
+								TwoBitParser binRefParser = new TwoBitParser(new File(finalRefFile));
+								binRefParser.setCurrentSequence(binChr);
+
+								// Per-thread TabixFeatureReaders
+								HashMap<String, Pair<Integer, TabixFeatureReader<BEDFeature, ?>>> binValueBedReaders = null;
+								if(valueBeds != null){
+									binValueBedReaders = new HashMap<String, Pair<Integer, TabixFeatureReader<BEDFeature, ?>>>();
+									for(String valueBedString : valueBeds){
+										String[] splitStrings = valueBedString.split(":");
+										String vbName = splitStrings[0];
+										int vbExt = Integer.parseInt(splitStrings[1]);
+										String vbFile = splitStrings[2];
+										binValueBedReaders.put(vbName, new Pair<Integer, TabixFeatureReader<BEDFeature, ?>>(vbExt, new TabixFeatureReader(vbFile, new BEDCodec())));
 									}
-									readNumber++;
-									boolean negStrand = r.getReadNegativeStrandFlag();
-									boolean secondEnd = r.getReadPairedFlag() && r.getSecondOfPairFlag();
-									if(secondEnd){
-										negStrand = !negStrand;
+								}
+
+								// Per-thread BigWigFileReaders
+								HashMap<String, Pair<Integer, BigWigFileReader>> binValueWigReaders = null;
+								if(valueWigs != null){
+									binValueWigReaders = new HashMap<String, Pair<Integer, BigWigFileReader>>();
+									for(String valueWigString : valueWigs){
+										String[] splitStrings = valueWigString.split(":");
+										String vwName = splitStrings[0];
+										int vwExt = Integer.parseInt(splitStrings[1]);
+										String vwFile = splitStrings[2];
+										binValueWigReaders.put(vwName, new Pair<Integer, BigWigFileReader>(vwExt, new BigWigFileReader(new File(vwFile).toPath())));
 									}
-									
-									int bisulfitePos = 0;
-									if(!wgsMode){
-										if(r.getTransientAttribute("BS") != null){ //if the reads had been processed before
-											bisulfitePos = Integer.parseInt((String) r.getTransientAttribute("BS"));
-										}else{
-											bisulfitePos = CcInferenceUtils.bisulfiteIncompleteReads(r);
-											r.setTransientAttribute("BS", bisulfitePos);
-											
-										}
-									}
-									
-									//log.info("testin" + readsNumTotal + "\t" + bisulfitePos);
-									int offSet = r.getReadPositionAtReferencePosition(end)-1;
-									if(bisulfitePos < 0){
-										continue;
-									}else if(bisulfitePos > 0){
-										if((!negStrand && offSet < bisulfitePos) || (negStrand && offSet >= bisulfitePos)){
+								}
+
+								OutputStreamWriter binWriter = new OutputStreamWriter(new FileOutputStream(tempFile), "UTF-8");
+
+								String bamChr = binChr;
+								if(useNoChrPrefixBam){
+									Pattern replace = Pattern.compile("^chr");
+									Matcher matcher1 = replace.matcher(bamChr);
+									bamChr = matcher1.replaceAll("");
+								}
+
+								IntervalTree<String> cpgChrCollections = finalCpgCollections.get(binChr);
+								Iterator<Node<String>> cpgIterator = cpgChrCollections.overlappers(binStart, binEnd);
+								long localCpgCount = 0;
+
+								while(cpgIterator.hasNext()){
+									Node<String> cpg = cpgIterator.next();
+									int start = cpg.getStart();
+									int end = cpg.getEnd();
+									int fragMostLeft = start+1;
+									int fragMostRight = end;
+
+									SAMRecordIterator wgsIt = binReader.queryOverlapping(bamChr, start+1, end);
+									HashMap<String, SAMRecord> countedReads = new HashMap<String, SAMRecord>();
+									int readNumber = 0;
+									while(wgsIt.hasNext()){
+										SAMRecord r = wgsIt.next();
+										if(failFlagFilter(r)){
 											continue;
-										}
-									}
-									if(offSet<0){
-									//	log.info(r.getReadName() + "\t" + offSet + "\t" + end + "\t" + r.getAlignmentStart() + "\t" + r.getAlignmentEnd());
-									continue;
-									}
-									
-									if(r.getAlignmentStart() < fragMostLeft){
-										fragMostLeft = r.getAlignmentStart();
-									}
-									if(r.getMateAlignmentStart() < fragMostLeft){
-										fragMostLeft = r.getMateAlignmentStart();
-									}
-									
-									if(r.getAlignmentEnd() > fragMostRight){
-										fragMostRight = r.getAlignmentEnd();
-									}
-									int mateEnd = CcInferenceUtils.getMateAlignmentEndByMateCigar(r);
-									if(mateEnd > fragMostRight){
-										fragMostRight = mateEnd;
-									}
-									
-									String readName = r.getReadName();
-									if(countedReads.containsKey(readName)){//to filter overlapped fragments, which affect a lot in cfDNA
-										SAMRecord prev = countedReads.get(readName);
-										int offSetPrev = prev.getReadPositionAtReferencePosition(end)-1;
-										if(offSet < r.getBaseQualities().length && offSetPrev < prev.getBaseQualities().length){
-											byte baseQ = r.getBaseQualities()[offSet];
-											byte base = CcInferenceUtils.toUpperCase(r.getReadBases()[offSet]);
-											
-											
-											byte baseQPrev = prev.getBaseQualities()[offSetPrev];
-											byte basePrev = CcInferenceUtils.toUpperCase(prev.getReadBases()[offSetPrev]);
-											
-											if(!BaseUtils.basesAreEqual(base, basePrev)){
-												if(baseQ > baseQPrev){
-													countedReads.put(readName, r);
-												}else if(baseQ < baseQPrev){
-													
+										}else{
+											if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+												continue;
+											}
+											readNumber++;
+											boolean negStrand = r.getReadNegativeStrandFlag();
+											boolean secondEnd = r.getReadPairedFlag() && r.getSecondOfPairFlag();
+											if(secondEnd){
+												negStrand = !negStrand;
+											}
+
+											int bisulfitePos = 0;
+											if(!wgsMode){
+												if(r.getTransientAttribute("BS") != null){
+													bisulfitePos = Integer.parseInt((String) r.getTransientAttribute("BS"));
 												}else{
-													if(!secondEnd){
-														countedReads.put(readName, r);
-													}
+													bisulfitePos = CcInferenceUtils.bisulfiteIncompleteReads(r);
+													r.setTransientAttribute("BS", bisulfitePos);
 												}
 											}
+
+											int offSet = r.getReadPositionAtReferencePosition(end)-1;
+											if(bisulfitePos < 0){
+												continue;
+											}else if(bisulfitePos > 0){
+												if((!negStrand && offSet < bisulfitePos) || (negStrand && offSet >= bisulfitePos)){
+													continue;
+												}
+											}
+											if(offSet<0){
+												continue;
+											}
+
+											if(r.getAlignmentStart() < fragMostLeft){
+												fragMostLeft = r.getAlignmentStart();
+											}
+											if(r.getMateAlignmentStart() < fragMostLeft){
+												fragMostLeft = r.getMateAlignmentStart();
+											}
+
+											if(r.getAlignmentEnd() > fragMostRight){
+												fragMostRight = r.getAlignmentEnd();
+											}
+											int mateEnd = CcInferenceUtils.getMateAlignmentEndByMateCigar(r);
+											if(mateEnd > fragMostRight){
+												fragMostRight = mateEnd;
+											}
+
+											String readName = r.getReadName();
+											if(countedReads.containsKey(readName)){
+												SAMRecord prev = countedReads.get(readName);
+												int offSetPrev = prev.getReadPositionAtReferencePosition(end)-1;
+												if(offSet < r.getBaseQualities().length && offSetPrev < prev.getBaseQualities().length){
+													byte baseQ = r.getBaseQualities()[offSet];
+													byte base = CcInferenceUtils.toUpperCase(r.getReadBases()[offSet]);
+													byte baseQPrev = prev.getBaseQualities()[offSetPrev];
+													byte basePrev = CcInferenceUtils.toUpperCase(prev.getReadBases()[offSetPrev]);
+
+													if(!BaseUtilsMore.basesAreEqual(base, basePrev)){
+														if(baseQ > baseQPrev){
+															countedReads.put(readName, r);
+														}else if(baseQ == baseQPrev && !secondEnd){
+															countedReads.put(readName, r);
+														}
+													}
+												}
+											}else{
+												countedReads.put(readName, r);
+											}
 										}
-										
-										
-									}else{
-										countedReads.put(readName, r);
 									}
-								}
-								
-							}
-							wgsIt.close();
-						//if(end==152011200){
-						//	log.info(countedReads.size() + " reads finally used ...");
-						//}
-						//log.info(countedReads.size() + " reads finally used ...");
-						if(readNumber >= maxCov || countedReads.size()==0){
-							continue;
-						}
-						//log.info("test" + readsNumTotal + "\t" + countedReads.size());
-						double normalizedFragCov = (double)readNumber/readsNumTotal;
-						//System.err.println(normalizedFragCov + "\t" + countedReads.size() + "\t" + readsNumTotal);
-						
-						//System.err.println(normalizedFragCov + "\t" + countedReads.size() + "\t" + readsNumTotal);
-						if(!chr.equalsIgnoreCase(prevChr)){
-							refParser.close();
-							refParser.setCurrentSequence(chr);
-							prevChr = chr;
-						}
-						byte[] refBasesExt = CcInferenceUtils.toUpperCase(refParser.loadFragment(end-1-kmerExt, kmerExt*2+1).getBytes());
-						byte refBase = refBasesExt[kmerExt];
-						
-						//if(end==152011200){
-						//	log.info(new String(refBasesExt) + "\t" + (end-1-kmerExt) + "\t" + (kmerExt*2+1) + "\t" + kmerExt + "\t" + (char)refBasesExt[kmerExt]);
-							
-						//}
-						
-						
-						HashMap<String, Double> kmerMapsRef = new HashMap<String, Double>();
-						if(!useFragBaseKmer){
-							for(int j = 2; j <= kmerLen; j++){
-								kmerMapsRef.putAll(CcInferenceUtils.kmerFreqSearch(refBasesExt, j));
-								
-							}
-						}
-						
-						//nearest cpg's distance in reference genome
-							
-						IntervalTree<String> cpgLocCollections = null;
-						double nearestCpg = Double.NaN;
-						if(includeCpgDist){
-							cpgLocCollections = allCpgLocCollections.get(chr);
-							Iterator<Node<String>> upstreamCpgIt = null;
-							Iterator<Node<String>> downstreamCpgIt = null;
-							if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
-								upstreamCpgIt = cpgLocCollections.reverseIterator(start-1, end-1);
-								downstreamCpgIt = cpgLocCollections.iterator(start+2, end+2);
-								
-							}else if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
-								upstreamCpgIt = cpgLocCollections.reverseIterator(start-2, end-2);
-								downstreamCpgIt = cpgLocCollections.iterator(start+1, end+1);
-							}else{
-								continue;
-							}
-							
-							if(upstreamCpgIt== null || !upstreamCpgIt.hasNext()){
-								IntervalTree.Node<String> downstream = downstreamCpgIt.next();
-								nearestCpg = CcInferenceUtils.intervalDistance(downstream,cpg);
-								//System.err.println(downstream.toString());
-							}else if(downstreamCpgIt==null || !downstreamCpgIt.hasNext()){
-								IntervalTree.Node<String> upstream = upstreamCpgIt.next();
-								nearestCpg = CcInferenceUtils.intervalDistance(upstream,cpg);
-								//System.err.println(upstream.toString());
-							}else{
-								IntervalTree.Node<String> upstream = upstreamCpgIt.next();
-								IntervalTree.Node<String> downstream = downstreamCpgIt.next();
-								//System.err.println(upstream.toString());
-								//System.err.println(downstream.toString());
-								
-								int dist1 = CcInferenceUtils.intervalDistance(upstream, cpg);
-								int dist2 = CcInferenceUtils.intervalDistance(downstream, cpg);
-								if(Math.abs(dist1) < Math.abs(dist2)){
-									nearestCpg = dist1;
-								}else{
-									nearestCpg = dist2;
-								}
-							}
-						}
-						
-						//overlap with feature in reference genome
-						
-						HashMap<String, Integer> overlapStatCollections = new HashMap<String, Integer>();
-						if(overlapRegions!=null && !overlapRegions.isEmpty()){
-							for(String key : overlapLocStringCollections.keySet()){
-								HashMap<String,IntervalTree<Integer>> tmp = overlapLocStringCollections.get(key);
-								if(tmp.containsKey(chr)){
-									if(tmp.get(chr).minOverlapper(start, end)==null){
-										overlapStatCollections.put(key, 0);
-									}else{
-										overlapStatCollections.put(key, 1);
+									wgsIt.close();
+
+									if(readNumber >= maxCov || countedReads.size()==0){
+										localCpgCount++;
+										if(localCpgCount % 1000 == 0){
+											long total = globalCpgCount.addAndGet(1000);
+											log.info("Processing CpG " + total + " ...");
+										}
+										continue;
 									}
-									
-								}else{
-									overlapStatCollections.put(key,0);
-								}
-								
-							}
-						}
-						
-						//distance with feature in reference genome
-						HashMap<String, Integer> distStatCollections = new HashMap<String, Integer>();
-						if(distantRegions!=null && !distantRegions.isEmpty()){
-							for(String key : distantLocStringCollections.keySet()){
-								IntervalTree<String> locCollections = distantLocStringCollections.get(key).get(chr);
-								
-								//IntervalTree.Node<String> upstream = locCollections.max(start, end);
-								//IntervalTree.Node<String> downstream = locCollections.min(start, end);
-								int distanceNearest = Integer.MAX_VALUE;
-								if(locCollections!=null && locCollections.size()>0){
-									Iterator<Node<String>> upstreamIt = locCollections.reverseIterator(start, end);
-									Iterator<Node<String>> downstreamIt = locCollections.iterator(start, end);
-									if(!upstreamIt.hasNext()){
-										IntervalTree.Node<String> downstream = locCollections.min(start, end);
-										distanceNearest = CcInferenceUtils.intervalDistance(downstream,cpg);
-										//System.err.println(downstream.toString());
-									}else if(!downstreamIt.hasNext()){
-										IntervalTree.Node<String> upstream = locCollections.max(start, end);
-										distanceNearest = CcInferenceUtils.intervalDistance(upstream,cpg);
-										//System.err.println(upstream.toString());
-									}else{
-										IntervalTree.Node<String> upstream = locCollections.max(start, end);
-										IntervalTree.Node<String> downstream = locCollections.min(start, end);
-										//System.err.println(upstream.toString());
-										//System.err.println(downstream.toString());
-										
-										int dist1 = CcInferenceUtils.intervalDistance(upstream, cpg);
-										int dist2 = CcInferenceUtils.intervalDistance(downstream, cpg);
-										if(Math.abs(dist1) < Math.abs(dist2)){
-											distanceNearest = dist1;
+
+									double normalizedFragCov = (double)readNumber/finalReadsNumTotal;
+
+									byte[] refBasesExt = CcInferenceUtils.toUpperCase(binRefParser.loadFragment(end-1-kmerExt, kmerExt*2+1).getBytes());
+									byte refBase = refBasesExt[kmerExt];
+
+									HashMap<String, Double> kmerMapsRef = new HashMap<String, Double>();
+									if(!useFragBaseKmer){
+										for(int j = 2; j <= kmerLen; j++){
+											kmerMapsRef.putAll(CcInferenceUtils.kmerFreqSearch(refBasesExt, j));
+										}
+									}
+
+									// nearest CpG distance
+									double nearestCpg = Double.NaN;
+									if(includeCpgDist){
+										IntervalTree<String> cpgLocCollections = finalAllCpgLocCollections.get(binChr);
+										Iterator<Node<String>> upstreamCpgIt = null;
+										Iterator<Node<String>> downstreamCpgIt = null;
+										if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
+											upstreamCpgIt = cpgLocCollections.reverseIterator(start-1, end-1);
+											downstreamCpgIt = cpgLocCollections.iterator(start+2, end+2);
+										}else if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
+											upstreamCpgIt = cpgLocCollections.reverseIterator(start-2, end-2);
+											downstreamCpgIt = cpgLocCollections.iterator(start+1, end+1);
 										}else{
-											distanceNearest = dist2;
+											localCpgCount++;
+											if(localCpgCount % 1000 == 0){
+												long total = globalCpgCount.addAndGet(1000);
+												log.info("Processing CpG " + total + " ...");
+											}
+											continue;
+										}
+
+										if(upstreamCpgIt== null || !upstreamCpgIt.hasNext()){
+											IntervalTree.Node<String> downstream = downstreamCpgIt.next();
+											nearestCpg = CcInferenceUtils.intervalDistance(downstream,cpg);
+										}else if(downstreamCpgIt==null || !downstreamCpgIt.hasNext()){
+											IntervalTree.Node<String> upstream = upstreamCpgIt.next();
+											nearestCpg = CcInferenceUtils.intervalDistance(upstream,cpg);
+										}else{
+											IntervalTree.Node<String> upstream = upstreamCpgIt.next();
+											IntervalTree.Node<String> downstream = downstreamCpgIt.next();
+											int dist1 = CcInferenceUtils.intervalDistance(upstream, cpg);
+											int dist2 = CcInferenceUtils.intervalDistance(downstream, cpg);
+											nearestCpg = Math.abs(dist1) < Math.abs(dist2) ? dist1 : dist2;
 										}
 									}
-								}
-								
-								
-								distStatCollections.put(key, distanceNearest);
-							}
-						}
-						
-						//value in bed file
-						HashMap<String, Double> valBedStatCollections = new HashMap<String, Double>();
-						if(valueBedReaders != null){
-							for(String key : valueBedReaders.keySet()){
-								int range = valueBedReaders.get(key).getFirst();
-								boolean mean0 = range < 0 ? true : false;
-								if(mean0){
-									range = 0-range;
-								}
-								TabixFeatureReader<BEDFeature, ?> bedReader = valueBedReaders.get(key).getSecond();
-								CloseableTribbleIterator<BEDFeature> featureIt = bedReader.query(chr, (start-range < 0 ? 1 : start-range+1), end+range);
-								DescriptiveStatistics statFeature = new DescriptiveStatistics();
-								while(featureIt.hasNext()){
-									BEDFeature term = featureIt.next();
-									if(!Double.isNaN(term.getScore())){
-										statFeature.addValue(term.getScore());
+
+									// overlap with feature in reference genome
+									HashMap<String, Integer> overlapStatCollections = new HashMap<String, Integer>();
+									if(overlapRegions!=null && !overlapRegions.isEmpty()){
+										for(String key : finalOverlapLocStringCollections.keySet()){
+											HashMap<String,IntervalTree<Integer>> tmp = finalOverlapLocStringCollections.get(key);
+											if(tmp.containsKey(binChr)){
+												overlapStatCollections.put(key, tmp.get(binChr).minOverlapper(start, end)==null ? 0 : 1);
+											}else{
+												overlapStatCollections.put(key, 0);
+											}
+										}
 									}
-									
-								}
-								featureIt.close();
-								if(statFeature.getN()>0){
-									if(mean0){
-										valBedStatCollections.put(key, (double)statFeature.getSum()/(double)(range*2+1));
-									}else{
-										valBedStatCollections.put(key, statFeature.getMean());
+
+									// distance with feature in reference genome
+									HashMap<String, Integer> distStatCollections = new HashMap<String, Integer>();
+									if(distantRegions!=null && !distantRegions.isEmpty()){
+										for(String key : finalDistantLocStringCollections.keySet()){
+											IntervalTree<String> locCollections = finalDistantLocStringCollections.get(key).get(binChr);
+											int distanceNearest = Integer.MAX_VALUE;
+											if(locCollections!=null && locCollections.size()>0){
+												Iterator<Node<String>> upstreamIt = locCollections.reverseIterator(start, end);
+												Iterator<Node<String>> downstreamIt = locCollections.iterator(start, end);
+												if(!upstreamIt.hasNext()){
+													IntervalTree.Node<String> downstream = locCollections.min(start, end);
+													distanceNearest = CcInferenceUtils.intervalDistance(downstream,cpg);
+												}else if(!downstreamIt.hasNext()){
+													IntervalTree.Node<String> upstream = locCollections.max(start, end);
+													distanceNearest = CcInferenceUtils.intervalDistance(upstream,cpg);
+												}else{
+													IntervalTree.Node<String> upstream = locCollections.max(start, end);
+													IntervalTree.Node<String> downstream = locCollections.min(start, end);
+													int dist1 = CcInferenceUtils.intervalDistance(upstream, cpg);
+													int dist2 = CcInferenceUtils.intervalDistance(downstream, cpg);
+													distanceNearest = Math.abs(dist1) < Math.abs(dist2) ? dist1 : dist2;
+												}
+											}
+											distStatCollections.put(key, distanceNearest);
+										}
 									}
-									
-								}else{
-									valBedStatCollections.put(key, Double.NaN);
-								}
-								
-							}
-						}
-						
-						
-						//value in wig file
-						HashMap<String, Double> valWigStatCollections = new HashMap<String, Double>();
-						if(valueWigReaders != null){
-							for(String key : valueWigReaders.keySet()){
-								int range = valueWigReaders.get(key).getFirst();
-								if(range < 0){
-									BigWigFileReader wigReader = valueWigReaders.get(key).getSecond();
-									range = 0-range;
-									SummaryStatistics statFeature = wigReader.queryStats(chr, (start-range < 0 ? 1 : start-range), end+range);
-									
-									if(statFeature.getN()>0){
-										valWigStatCollections.put(key, (double)statFeature.getSum()/(double)(range*2+1));
-									}else{
-										valWigStatCollections.put(key, Double.NaN);
+
+									// value in bed file
+									HashMap<String, Double> valBedStatCollections = new HashMap<String, Double>();
+									if(binValueBedReaders != null){
+										for(String key : binValueBedReaders.keySet()){
+											int range = binValueBedReaders.get(key).getFirst();
+											boolean mean0 = range < 0;
+											if(mean0) range = -range;
+											TabixFeatureReader<BEDFeature, ?> bedReader = binValueBedReaders.get(key).getSecond();
+											CloseableTribbleIterator<BEDFeature> featureIt = bedReader.query(binChr, (start-range < 0 ? 1 : start-range+1), end+range);
+											DescriptiveStatistics statFeature = new DescriptiveStatistics();
+											while(featureIt.hasNext()){
+												BEDFeature term = featureIt.next();
+												if(!Double.isNaN(term.getScore())) statFeature.addValue(term.getScore());
+											}
+											featureIt.close();
+											if(statFeature.getN()>0){
+												valBedStatCollections.put(key, mean0 ? (double)statFeature.getSum()/(double)(range*2+1) : statFeature.getMean());
+											}else{
+												valBedStatCollections.put(key, Double.NaN);
+											}
+										}
 									}
-									
-								}else{
-									BigWigFileReader wigReader = valueWigReaders.get(key).getSecond();
-									SummaryStatistics statFeature = wigReader.queryStats(chr, start-range, end+range);
-									if(statFeature.getN()>0){
-										valWigStatCollections.put(key, statFeature.getMean());
-									}else{
-										valWigStatCollections.put(key, Double.NaN);
+
+									// value in wig file
+									HashMap<String, Double> valWigStatCollections = new HashMap<String, Double>();
+									if(binValueWigReaders != null){
+										for(String key : binValueWigReaders.keySet()){
+											int range = binValueWigReaders.get(key).getFirst();
+											BigWigFileReader wigReader = binValueWigReaders.get(key).getSecond();
+											if(range < 0){
+												range = -range;
+												SummaryStatistics statFeature = wigReader.queryStats(binChr, (start-range < 0 ? 1 : start-range), end+range);
+												valWigStatCollections.put(key, statFeature.getN()>0 ? (double)statFeature.getSum()/(double)(range*2+1) : Double.NaN);
+											}else{
+												SummaryStatistics statFeature = wigReader.queryStats(binChr, start-range, end+range);
+												valWigStatCollections.put(key, statFeature.getN()>0 ? statFeature.getMean() : Double.NaN);
+											}
+										}
+									}
+
+									for(String readName : countedReads.keySet()){
+										SAMRecord r = countedReads.get(readName);
+										boolean negStrand = r.getReadNegativeStrandFlag();
+										boolean secondEnd = r.getReadPairedFlag() && r.getSecondOfPairFlag();
+										if(secondEnd){
+											negStrand = !negStrand;
+										}
+										int offSet = r.getReadPositionAtReferencePosition(end)-1;
+										if(offSet<0) continue;
+										char methyStat = '.';
+										byte[] bases = r.getReadBases();
+										byte base = bases[offSet];
+										byte[] baseQs = r.getBaseQualities();
+										byte baseQ = baseQs[offSet];
+										if(baseQ <= minBaseQ) continue;
+
+										if(negStrand){
+											if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
+												if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G)){
+													methyStat = 'm';
+												}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A)){
+													methyStat = 'u';
+												}else{
+													continue;
+												}
+											}else{
+												continue;
+											}
+										}else{
+											if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
+												if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C)){
+													methyStat = 'm';
+												}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T)){
+													methyStat = 'u';
+												}else{
+													continue;
+												}
+											}else{
+												continue;
+											}
+										}
+
+										int fragLen = Math.abs(r.getInferredInsertSize());
+										if(fragLen > maxFragLen) continue;
+										int cpgOffset = CcInferenceUtils.getFragOffsetFromReadsOffset(r, offSet);
+										int distToFragEnd = CcInferenceUtils.getDistFragEndFromReadsOffset(r, offSet);
+										if(distToFragEnd > maxDistToFragEnd) continue;
+
+										char fragStrand = negStrand ? '-' : '+';
+
+										int fragStart = Math.min(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
+										int fragEnd = Math.max(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
+										if(r.getInferredInsertSize() == 0) continue;
+
+										byte[] refBasesFrag = binRefParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
+										if(negStrand && useStrandSpecificFragBase){
+											SequenceUtil.reverseComplement(refBasesFrag);
+										}
+										HashMap<String, Double> kmerMapsFrag = new HashMap<String, Double>();
+										if(useFragBaseKmer){
+											for(int j = 2; j <= kmerLen; j++){
+												kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
+											}
+										}
+
+										binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",normalizedFragCov)
+												 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
+										if(includeCpgDist) binWriter.write("\t" + nearestCpg);
+										if(overlapStatCollections.size()>0){
+											for(String key : finalOverlapLocString) binWriter.write("\t" + overlapStatCollections.get(key));
+										}
+										if(distStatCollections.size() > 0){
+											for(String key : finalDistantLocString) binWriter.write("\t" + distStatCollections.get(key));
+										}
+										if(valBedStatCollections.size()>0){
+											for(String key : finalValueBedLocString) binWriter.write("\t" + String.format("%.3f",valBedStatCollections.get(key)));
+										}
+										if(valWigStatCollections.size()>0){
+											for(String key : finalValueWigLocString) binWriter.write("\t" + String.format("%.3f",valWigStatCollections.get(key)));
+										}
+										if(kmerMapsRef.size()>0){
+											for(String key : finalKmerCollections) binWriter.write("\t" + String.format("%.3f",kmerMapsRef.get(key)));
+										}
+										if(kmerMapsFrag.size()>0){
+											for(String key : finalKmerCollections) binWriter.write("\t" + String.format("%.3f",kmerMapsFrag.get(key)));
+										}
+										binWriter.write("\n");
+										binPoints++;
+									}
+									localCpgCount++;
+									if(localCpgCount % 1000 == 0){
+										long total = globalCpgCount.addAndGet(1000);
+										log.info("Processing CpG " + total + " ...");
+										binWriter.flush();
 									}
 								}
-								
-								
-								
-							}
-						}
-						
-						for(String readName : countedReads.keySet()){
-							SAMRecord r = countedReads.get(readName);
-							boolean negStrand = r.getReadNegativeStrandFlag();
-							boolean secondEnd = r.getReadPairedFlag() && r.getSecondOfPairFlag();
-							if(secondEnd){
-								negStrand = !negStrand;
-							}
-							int offSet = r.getReadPositionAtReferencePosition(end)-1;
-							if(offSet<0){ //even it is within the reference interval, but it might be Deletion in the reads
-								continue;
-							}
-							char methyStat = '.';
-							byte[] bases = r.getReadBases();
-							
-							//System.err.println(readName + "\t" + offSet + "\t" + new String(bases) + "\t" + negStrand + "\t" + secondEnd + "\t" + end + "\t" + r.getAlignmentStart() + "\t" + r.getAlignmentEnd());
-							byte base = bases[offSet];
-							byte[] baseQs = r.getBaseQualities();
-							byte baseQ = baseQs[offSet];
-							if(baseQ <= minBaseQ){
-								continue;
-							}
-							//if(end==152011200){
-								//log.info(readName + "\t" + refBase);
-							//}
-							if(negStrand){
-								//if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.A));
-								//}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.G)){
-										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.A)){
-										methyStat = 'u';
-									}else{
-										continue;
-									}
-								}else{
-									continue;
+
+								// Flush remaining CpG count
+								if(localCpgCount % 1000 != 0){
+									globalCpgCount.addAndGet(localCpgCount % 1000);
 								}
-							}else{
-								if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.T));
+
+								binWriter.close();
+								binReader.close();
+								binRefParser.closeParser();
+								if(binValueBedReaders != null){
+									for(String key : binValueBedReaders.keySet()) binValueBedReaders.get(key).getSecond().close();
 								}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.C)){
-										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.T)){
-										methyStat = 'u';
-									}else{
-										continue;
-									}
-								}else{
-									continue;
+								if(binValueWigReaders != null){
+									for(String key : binValueWigReaders.keySet()) binValueWigReaders.get(key).getSecond().close();
 								}
+
+								globalPoints.addAndGet(binPoints);
+								return binPoints;
 							}
-							
-							//if(end==152011200){
-								//log.info("after " + readName);
-							//}
-							
-							int fragLen = Math.abs(r.getInferredInsertSize());
-							if(fragLen > maxFragLen){
-								continue;
-							}
-							int cpgOffset = CcInferenceUtils.getFragOffsetFromReadsOffset(r, offSet);
-							//int distToFragEnd = Math.min((fragLen-cpgOffset), cpgOffset);
-							int distToFragEnd = CcInferenceUtils.getDistFragEndFromReadsOffset(r, offSet);
-							if(distToFragEnd > maxDistToFragEnd){
-								continue;
-							}
-							//if(negStrand){
-							//	offSet = fragLen-offSet;
-							//}
-							
-							char fragStrand = negStrand ? '-' : '+';
-							
-							
-							//get k-mer for the fragment
-							int fragStart = Math.min(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
-							int fragEnd = Math.max(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
-							if(r.getInferredInsertSize() == 0){
-								continue;
-							}
-							
-							//byte[] refBasesFragAll = refParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
-							//byte[] refBasesFrag = new byte[fragLen]; //TODO check if it is correct here!!!!
-							//System.err.println(r.getAlignmentStart() + "\t" + r.getMateAlignmentStart() + "\t" + fragLen + "\t" + refBasesFragAll.length + "\t" + fragStart + "\t" + fragMostLeft + "\t" + r.getReadName());
-							//for(int j = fragStart-fragMostLeft, index = 0; index < fragLen; j++, index++){ 
-							//	refBasesFrag[index] = refBasesFragAll[j];
-							//}
-							byte[] refBasesFrag = refParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
-							if(negStrand && useStrandSpecificFragBase){
-								SequenceUtil.reverseComplement(refBasesFrag);
-							}
-							HashMap<String, Double> kmerMapsFrag = new HashMap<String, Double>();
-							if(useFragBaseKmer){
-								for(int j = 2; j <= kmerLen; j++){
-									kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
-								}
-							}
-							
-							
-								//System.err.println(CcInferenceUtils.getFragOffsetFromReadsOffset(r, offSet));
-							writer.write(chr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",normalizedFragCov)
-									 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
-							if(includeCpgDist){
-								writer.write("\t" + nearestCpg);
-							}
-							//overlap regions
-							if(overlapStatCollections.size()>0){
-								for(String key : overlapLocString){
-									writer.write("\t" + overlapStatCollections.get(key));
-								}
-							}
-							
-							//distant regions
-							if(distStatCollections.size() > 0){
-								for(String key : distantLocString){
-									writer.write("\t" + distStatCollections.get(key));
-								}
-							}
-							
-							//valBed regions
-							if(valBedStatCollections.size()>0){
-								for(String key : valueBedLocString){
-									writer.write("\t" + String.format("%.3f",valBedStatCollections.get(key)));
-								}
-							}
-							
-							//valWig regions
-							if(valWigStatCollections.size()>0){
-								for(String key : valueWigLocString){
-									writer.write("\t" + String.format("%.3f",valWigStatCollections.get(key)));
-								}
-							}
-							//k-mer in reference genome
-							//if(kmerMapsRef.size()>0 && useRefSeqBaseKmer){
-							if(kmerMapsRef.size()>0 ){
-								for(String key : kmerCollections){
-									writer.write("\t" + String.format("%.3f",kmerMapsRef.get(key)));
-								}
-							}
-							
-							//k-mer in fragment
-							//if(kmerMapsFrag.size()>0 && !useRefSeqBaseKmer){
-							if(kmerMapsFrag.size()>0 ){
-								for(String key : kmerCollections){
-									writer.write("\t" + String.format("%.3f",kmerMapsFrag.get(key)));
-								}
-							}
-							
-							writer.write("\n");
-							points++;
-							
-							
-						}
-						i++;
-						if(i % 1000 == 0){
-							log.info("Processing Cpg " + i + " ...");
-							writer.flush();
-						}
-						}
+						}));
 					}
+
+					// Wait for all bin tasks to complete
+					try {
+						for(Future<Long> future : futures){
+							future.get();
+						}
+					} catch (Exception e) {
+						throw new RuntimeException("Error in parallel feature extraction", e);
+					}
+					executor.shutdown();
+
+					// Concatenate temp files into the output
+					byte[] buffer = new byte[8192];
+					for(File tempFile : tempFiles){
+						FileInputStream fis = new FileInputStream(tempFile);
+						int bytesRead;
+						while((bytesRead = fis.read(buffer)) != -1){
+							writer.write(new String(buffer, 0, bytesRead, "UTF-8"));
+						}
+						fis.close();
+						tempFile.delete();
+					}
+
 					writer.close();
 					output.close();
-					
-					
-					wgsReader.close();
-					refParser.closeParser();;
 
-					
+					wgsReader.close();
+					refParser.closeParser();
+
 					if(valueBedReaders != null){
 						for(String key : valueBedReaders.keySet()){
 							valueBedReaders.get(key).getSecond().close();
@@ -1096,7 +1083,8 @@ public class CpgMultiMetricsStats {
 							valueWigReaders.get(key).getSecond().close();
 						}
 					}
-					
+
+					points = globalPoints.get();
 					finish();
 
 	}

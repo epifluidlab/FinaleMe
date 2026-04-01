@@ -20,7 +20,8 @@ import java.util.List;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -47,7 +48,7 @@ public class CpgMetricsAddKmer {
 
 	final private static String USAGE = "CpgMetricsAddKmer [opts] hg19.2bit input.txt[.gz] output.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMetricsAddKmer.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMetricsAddKmer.class);
 
 	private static long startTime = -1;
 	private static long points = 0;

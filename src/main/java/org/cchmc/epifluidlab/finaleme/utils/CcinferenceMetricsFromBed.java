@@ -27,7 +27,8 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -67,7 +68,7 @@ public class CcinferenceMetricsFromBed {
 
 	final private static String USAGE = "CcinferenceMetricsFromBed [opts] cpg_list.hg19.bed[.gz] wgs/wgbs.hg19.bed.gz cpg_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CcinferenceMetricsFromBed.class);
+	private static final Logger log = LoggerFactory.getLogger(CcinferenceMetricsFromBed.class);
 
 	private static long startTime = -1;
 	private static long points = 0;

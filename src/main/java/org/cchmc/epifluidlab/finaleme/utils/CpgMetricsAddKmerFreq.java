@@ -19,7 +19,8 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -38,7 +39,7 @@ public class CpgMetricsAddKmerFreq {
 
 	final private static String USAGE = "CpgMetricsAddKmerFreq [opts] input.txt[.gz] output.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMetricsAddKmerFreq.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMetricsAddKmerFreq.class);
 
 	private static long startTime = -1;
 	private static long points = 0;

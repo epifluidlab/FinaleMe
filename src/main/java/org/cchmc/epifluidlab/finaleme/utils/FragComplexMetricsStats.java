@@ -23,8 +23,8 @@ import java.util.List;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.lang3.tuple.Triple;
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -62,7 +62,7 @@ public class FragComplexMetricsStats {
 
 	final private static String USAGE = "FragComplexMetricsStats [opts] wgs.bam(sorted by name) fragment_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(FragComplexMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(FragComplexMetricsStats.class);
 
 	private static long startTime = -1;
 	private static long readPairs = 0;
@@ -74,7 +74,7 @@ public class FragComplexMetricsStats {
 	 */
 	public static void main(String[] args) throws Exception {
 		FragComplexMetricsStats fcms = new FragComplexMetricsStats();
-		BasicConfigurator.configure();
+		//BasicConfigurator.configure();
 		fcms.doMain(args);
 	}
 	

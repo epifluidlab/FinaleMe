@@ -11,9 +11,9 @@ import htsjdk.samtools.*;
 import htsjdk.samtools.util.IntervalTree;
 import htsjdk.samtools.util.IntervalTree.Node;
 import htsjdk.samtools.util.SequenceUtil;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
-import org.broadinstitute.gatk.utils.BaseUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -76,7 +76,7 @@ public class CpgMultiMetricsStatsV2 {
 
 	final private static String USAGE = "CpgMultiMetricsStats [opts] hg19.2bit cpg_list.bed all_cpg.bed wgs.bam cpg_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMultiMetricsStatsV2.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMultiMetricsStatsV2.class);
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -370,7 +370,7 @@ public class CpgMultiMetricsStatsV2 {
 											byte baseQPrev = prev.getBaseQualities()[offSetPrev];
 											byte basePrev = CcInferenceUtils.toUpperCase(prev.getReadBases()[offSetPrev]);
 											
-											if(!BaseUtils.basesAreEqual(base, basePrev)){
+											if(!BaseUtilsMore.basesAreEqual(base, basePrev)){
 												if(baseQ > baseQPrev){
 													countedReads.put(readName, r);
 												}else if(baseQ < baseQPrev){
@@ -442,12 +442,12 @@ public class CpgMultiMetricsStatsV2 {
 							//}
 							if(negStrand){
 								//if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.A));
+									//log.info(refBase + "\t" + base + "\t" + BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A));
 								//}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.G)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G)){
 										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.A)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A)){
 										methyStat = 'u';
 									}else{
 										continue;
@@ -457,12 +457,12 @@ public class CpgMultiMetricsStatsV2 {
 								}
 							}else{
 								//if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.T));
+									//log.info(refBase + "\t" + base + "\t" + BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T));
 								//}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.C)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C)){
 										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.T)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T)){
 										methyStat = 'u';
 									}else{
 										continue;

@@ -36,7 +36,6 @@ import java.util.regex.Pattern;
 import org.apache.commons.lang.ArrayUtils;
 import org.apache.commons.lang3.tuple.Triple;
 import org.apache.commons.math3.util.Pair;
-import org.broadinstitute.gatk.utils.BaseUtils;
 
 import htsjdk.samtools.Cigar;
 import htsjdk.samtools.CigarElement;
@@ -572,7 +571,7 @@ public class CcInferenceUtils implements Serializable{
 				int refPos = read1.getReferencePositionAtReadPosition(j);
 				int read2Pos = read2.getReadPositionAtReferencePosition(refPos)-1;
 				if(read2Pos >= 0){
-					if(!BaseUtils.basesAreEqual(readBasesRead1[i], readBasesRead2[read2Pos])){
+					if(!BaseUtilsMore.basesAreEqual(readBasesRead1[i], readBasesRead2[read2Pos])){
 						if(readBasesQRead1[i] < readBasesRead2[read2Pos]){
 							refBases.add(refBasesRead2[read2Pos]);
 							readBases.add(readBasesRead2[read2Pos]);
@@ -622,7 +621,7 @@ public class CcInferenceUtils implements Serializable{
 				int refPos = read2.getReferencePositionAtReadPosition(j);
 				int read1Pos = read1.getReadPositionAtReferencePosition(refPos)-1;
 				if(read1Pos >= 0){
-					if(!BaseUtils.basesAreEqual(readBasesRead2[i], readBasesRead1[read1Pos])){
+					if(!BaseUtilsMore.basesAreEqual(readBasesRead2[i], readBasesRead1[read1Pos])){
 						if(readBasesQRead2[i] < readBasesRead1[read1Pos]){
 							refBases.add(refBasesRead1[read1Pos]);
 							readBases.add(readBasesRead1[read1Pos]);
@@ -776,8 +775,8 @@ public class CcInferenceUtils implements Serializable{
 
 		if(bisulfiteIncompletReads){
 			if(negativeStrand){
-				bases = BaseUtils.simpleReverseComplement(bases);
-				refBases = BaseUtils.simpleReverseComplement(refBases);
+				bases = BaseUtilsMore.simpleReverseComplement(bases);
+				refBases = BaseUtilsMore.simpleReverseComplement(refBases);
 				
 			}
 		}
@@ -791,7 +790,7 @@ public class CcInferenceUtils implements Serializable{
 		
 		for(int i = 0; i < readLength; i++){
 			if(mismatchFilter){
-				if( !BaseUtils.basesAreEqual(refBases[i], bases[i]) && BaseUtilsMore.isBisulfiteMismatch(refBases[i], bases[i],false, false)) //already get reverse complement for negative strand, so no need to provide flag again...
+				if( !BaseUtilsMore.basesAreEqual(refBases[i], bases[i]) && BaseUtilsMore.isBisulfiteMismatch(refBases[i], bases[i],false, false)) //already get reverse complement for negative strand, so no need to provide flag again...
 					numberOfMismatches++;
 				if(numberOfMismatches > maxMismatches * readLength){
 					//System.err.println(new String(refBases) + "\t" + new String(bases) + "\t" + numberOfMismatches + "\t" + negativeStrand + "\t" + secondEnd);
@@ -818,7 +817,7 @@ public class CcInferenceUtils implements Serializable{
 					if(BaseUtilsMore.iupacCodeEqualNotConsiderMethyStatus(patterns[index], bases[j])){
 						numMatchesInReads++;
 					}
-					if(index == (posCinPatConv5-1) && BaseUtils.basesAreEqual(bases[j], BaseUtilsMore.T)){
+					if(index == (posCinPatConv5-1) && BaseUtilsMore.basesAreEqual(bases[j], BaseUtilsMore.T)){
 						conv=true;
 					}
 					
@@ -873,7 +872,7 @@ public class CcInferenceUtils implements Serializable{
 		int count = 0;
 		for(int i = 0; i < strings.length - patterns.length + 1; i++){
 			for(int j=i, index=0; index < patterns.length; j++,index++){
-				if(BaseUtils.basesAreEqual(strings[j], patterns[index])){
+				if(BaseUtilsMore.basesAreEqual(strings[j], patterns[index])){
 					count++;
 				}
 			}
@@ -889,7 +888,7 @@ public class CcInferenceUtils implements Serializable{
 		for(int i = 0; i < strings.length - patterns.length + 1; i++, totalCount++){
 			int matches = 0;
 			for(int j=i, index = 0; index < patterns.length; j++,index++){
-				if(BaseUtils.basesAreEqual(strings[j], patterns[index])){
+				if(BaseUtilsMore.basesAreEqual(strings[j], patterns[index])){
 					matches++;
 				}
 			}

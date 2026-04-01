@@ -33,9 +33,9 @@ import java.util.zip.GZIPOutputStream;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
-import org.broadinstitute.gatk.utils.BaseUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -84,7 +84,7 @@ public class CpgMultiMetricsStatsNoBam {
 
 	final private static String USAGE = "CpgMultiMetricsStats [opts] hg19.2bit cpg_list.bed all_cpg.bed cpg_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMultiMetricsStatsNoBam.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMultiMetricsStatsNoBam.class);
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -545,11 +545,11 @@ public class CpgMultiMetricsStatsNoBam {
 							cpgLocCollections = allCpgLocCollections.get(chr);
 							Iterator<Node<String>> upstreamCpgIt = null;
 							Iterator<Node<String>> downstreamCpgIt = null;
-							if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
+							if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
 								upstreamCpgIt = cpgLocCollections.reverseIterator(start-1, end-1);
 								downstreamCpgIt = cpgLocCollections.iterator(start+2, end+2);
 								
-							}else if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
+							}else if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
 								upstreamCpgIt = cpgLocCollections.reverseIterator(start-2, end-2);
 								downstreamCpgIt = cpgLocCollections.iterator(start+1, end+1);
 							}else{

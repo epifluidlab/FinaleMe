@@ -41,10 +41,10 @@ import java.util.zip.GZIPOutputStream;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.core.sequence.DNASequence;
 import org.biojava.nbio.core.sequence.io.FastaReaderHelper;
-import org.broadinstitute.gatk.utils.BaseUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -120,7 +120,7 @@ public class CpgMultiMetricsStatsInMemory {
 
 	final private static String USAGE = "CpgMultiMetricsStatsInMemory [opts] hg19.fa cpg_list.bed[.gz] all_cpg.bed[.gz] wgs.bam cpg_detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CpgMultiMetricsStatsInMemory.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMultiMetricsStatsInMemory.class);
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -656,7 +656,7 @@ public class CpgMultiMetricsStatsInMemory {
 										byte baseQPrev = prev.getBaseQualities()[offSetPrev];
 										byte basePrev = CcInferenceUtils.toUpperCase(prev.getReadBases()[offSetPrev]);
 										
-										if(!BaseUtils.basesAreEqual(base, basePrev)){
+										if(!BaseUtilsMore.basesAreEqual(base, basePrev)){
 											if(baseQ > baseQPrev){
 												countedReads.put(readName, r);
 											}else if(baseQ < baseQPrev){
@@ -709,11 +709,11 @@ public class CpgMultiMetricsStatsInMemory {
 							Iterator<Node<String>> upstreamCpgIt = null;
 							Iterator<Node<String>> downstreamCpgIt = null;
 							
-							if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
+							if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
 								upstreamCpgIt = cpgLocCollections.reverseIterator(start-1, end-1);
 								downstreamCpgIt = cpgLocCollections.iterator(start+2, end+2);
 								
-							}else if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
+							}else if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
 								upstreamCpgIt = cpgLocCollections.reverseIterator(start-2, end-2);
 								downstreamCpgIt = cpgLocCollections.iterator(start+1, end+1);
 							}else{
@@ -899,12 +899,12 @@ public class CpgMultiMetricsStatsInMemory {
 							
 							if(negStrand){
 								//if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.G) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.A));
+									//log.info(refBase + "\t" + base + "\t" + BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A));
 								//}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.G)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.G)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.G)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.G)){
 										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.A)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.A)){
 										methyStat = 'u';
 									}else{
 										continue;
@@ -914,12 +914,12 @@ public class CpgMultiMetricsStatsInMemory {
 								}
 							}else{
 								//if(end==152011200){
-									//log.info(refBase + "\t" + base + "\t" + BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.C) + "\t" + BaseUtils.basesAreEqual(base, BaseUtilsMore.T));
+									//log.info(refBase + "\t" + base + "\t" + BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C) + "\t" + BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T));
 								//}
-								if(BaseUtils.basesAreEqual(refBase, BaseUtilsMore.C)){
-									if(BaseUtils.basesAreEqual(base, BaseUtilsMore.C)){
+								if(BaseUtilsMore.basesAreEqual(refBase, BaseUtilsMore.C)){
+									if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.C)){
 										methyStat = 'm';
-									}else if(BaseUtils.basesAreEqual(base, BaseUtilsMore.T)){
+									}else if(BaseUtilsMore.basesAreEqual(base, BaseUtilsMore.T)){
 										methyStat = 'u';
 									}else{
 										continue;

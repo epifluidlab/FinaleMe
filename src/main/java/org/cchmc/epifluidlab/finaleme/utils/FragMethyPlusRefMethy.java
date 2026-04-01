@@ -25,7 +25,8 @@ import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -73,7 +74,7 @@ public class FragMethyPlusRefMethy {
 
 	final private static String USAGE = "FragMethyPlusRefMethy [opts] wgs.bam reads_tissue_of_origin_probability.txt.gz";
 	
-	private static Logger log = Logger.getLogger(FragMethyPlusRefMethy.class);
+	private static final Logger log = LoggerFactory.getLogger(FragMethyPlusRefMethy.class);
 
 	private static long startTime = -1;
 	private static long reads = 0;

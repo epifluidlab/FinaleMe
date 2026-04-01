@@ -7,7 +7,8 @@
 package org.cchmc.epifluidlab.finaleme.utils;
 
 import htsjdk.samtools.*;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -53,7 +54,7 @@ public class MethyCorMatrixWithinReadsSortBam {
 
 	final private static String USAGE = "MethyCorMatrixWithinReadsSortBam [opts] wgbs.sortByName.bam cor.detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(MethyCorMatrixWithinReadsSortBam.class);
+	private static final Logger log = LoggerFactory.getLogger(MethyCorMatrixWithinReadsSortBam.class);
 
 	private static long startTime = -1;
 	private static long points = 1;

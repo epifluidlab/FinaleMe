@@ -12,8 +12,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.TreeMap;
-
 import org.apache.commons.math3.util.Pair;
 
 import be.ac.ulg.montefiore.run.jahmm.Observation;
@@ -29,8 +27,8 @@ public class BayesianNhmmV5<O extends Observation>
 implements Serializable, Cloneable {
 
 	
-	private TreeMap<Integer, Double[]> pi;
-	private TreeMap<Integer, Double[][]>  a;
+	private double[][] pi;
+	private double[][][] a;
 	private ArrayList<Opdf<O>> opdfs;
 	private int nbStates;
 	private int nbCpgDistStates;
@@ -44,7 +42,7 @@ implements Serializable, Cloneable {
 	/**
 	 * 
 	 */
-	private static final long serialVersionUID = -1203330572216045699L;
+	private static final long serialVersionUID = -1203330572216045700L;
 
 
 	public BayesianNhmmV5(int nbStates, int nbCpgDistStates, double bayesianFactor) {
@@ -54,13 +52,9 @@ implements Serializable, Cloneable {
 			"positive");
 		this.nbStates = nbStates;
 		this.nbCpgDistStates = nbCpgDistStates;
-		pi = new TreeMap<Integer, Double[]>();
+		pi = new double[nbCpgDistStates + 1][nbStates];
 		this.bayesianFactor = bayesianFactor;
-		a = new TreeMap<Integer, Double[][]>();
-		for(int i = 0; i<= nbCpgDistStates; i++){
-			a.put(i, new Double[nbStates][nbStates]);
-			pi.put(i, new Double[nbStates]);
-		}
+		a = new double[nbCpgDistStates + 1][nbStates][nbStates];
 		opdfs = new ArrayList<Opdf<O>>(nbStates);
 		for (int i = 0; i < nbStates; i++)
 			opdfs.add(null);
@@ -76,21 +70,17 @@ implements Serializable, Cloneable {
 			"strictly positive");
 		this.nbStates = nbStates;
 		this.nbCpgDistStates = nbCpgDistStates;
-		pi = new TreeMap<Integer, Double[]>();
-		a = new TreeMap<Integer, Double[][]>();
+		pi = new double[nbCpgDistStates + 1][nbStates];
+		a = new double[nbCpgDistStates + 1][nbStates][nbStates];
 		opdfs = new ArrayList<Opdf<O>>(nbStates);
 		this.bayesianFactor = bayesianFactor;
-			
+
 			for(int n = 0; n<= nbCpgDistStates; n++){
-				Double[][] t = new Double[nbStates][nbStates];
-				Double[] pit = new Double[nbStates];
 				for (int i = 0; i < nbStates; i++) {
-					pit[i] = 1. / ((double) nbStates);
+					pi[n][i] = 1. / ((double) nbStates);
 					for (int j = 0; j < nbStates; j++)
-						t[i][j] = 1. / ((double) nbStates);
+						a[n][i][j] = 1. / ((double) nbStates);
 				}
-				a.put(n, t);
-				pi.put(n, pit);
 			}
 		
 		for (int i = 0; i < nbStates; i++) {
@@ -158,8 +148,8 @@ implements Serializable, Cloneable {
 		}
 		//System.err.println(methyPrior + "\t" + methyPriorScale + "\t" + unmethyPriorScale + "\t" + stateSum + "\t" + pi.get(dist)[stateNb] + "\t" + stateNb);
 		*/
-		double methyPriorScale = pi.get(dist)[1]*methyPrior;
-		double unmethyPriorScale = pi.get(dist)[0]*(1-methyPrior);
+		double methyPriorScale = pi[dist][1]*methyPrior;
+		double unmethyPriorScale = pi[dist][0]*(1-methyPrior);
 		//double methyPriorScale = methyPrior+pi.get(dist)[1];
 		//double unmethyPriorScale = 1-methyPrior+pi.get(dist)[0];
 		//double methyPriorScale = 1-methyPrior+pi.get(dist)[1];
@@ -180,16 +170,12 @@ implements Serializable, Cloneable {
 	
 	public double getPri(int nbCpgDistStates, int stateNb)
 	{
-		//System.err.println(nbCpgDistStates + "\t" + stateNb + "\t" + pi.length + "\t" + pi[0].length + "\t" + pi[nbCpgDistStates][stateNb]);
-		return pi.get(nbCpgDistStates)[stateNb]; //TODO: should be 
+		return pi[nbCpgDistStates][stateNb];
 	}
 	
 	public void setPri(int nbCpgDistStates, int stateNb, double value)
 	{
-		//System.err.println(nbCpgDistStates + "\t" + stateNb + "\t" + pi.length + "\t" + pi[0].length + "\t" + pi[nbCpgDistStates][stateNb]);
-		Double[] t = pi.get(nbCpgDistStates);
-		t[stateNb]=value;
-		pi.put(nbCpgDistStates, t); 
+		pi[nbCpgDistStates][stateNb] = value;
 	}
 	
 	public double getBayesianFactor()
@@ -260,8 +246,8 @@ implements Serializable, Cloneable {
 		
 		return state/stateSum;
 		*/
-		double methyPriorScale = 1-methyPrior+a.get(dist)[i][1];
-		double unmethyPriorScale = methyPrior+a.get(dist)[i][0];
+		double methyPriorScale = 1-methyPrior+a[dist][i][1];
+		double unmethyPriorScale = methyPrior+a[dist][i][0];
 		//double methyPriorScale = 1.5+a.get(dist)[i][1];
 		//double unmethyPriorScale = 0+a.get(dist)[i][0];
 		//System.err.println(methyPrior + "\t" + methyPriorScale + "\t" + unmethyPriorScale  + "\t" + pi.get(dist)[1]  + "\t" + pi.get(dist)[0] + "\t" + stateNb);
@@ -275,14 +261,12 @@ implements Serializable, Cloneable {
 	
 	public double getArij(int nbCpgDistStates, int i, int j)
 	{
-		return a.get(nbCpgDistStates)[i][j];
+		return a[nbCpgDistStates][i][j];
 	}
 	
 	public void setArij(int nbCpgDistStates, int i, int j, double value)
 	{
-		Double t[][] = a.get(nbCpgDistStates);
-		t[i][j]=value;
-		a.put(nbCpgDistStates, t);
+		a[nbCpgDistStates][i][j] = value;
 	}
 	
 	
@@ -593,21 +577,17 @@ implements Serializable, Cloneable {
 	 */
 	public String toString(NumberFormat nf)
 	{
-		//String s = "HMM with " + nbStates() + " state(s)\n" + pi.keySet().toArray(new Integer[pi.keySet().size()])[pi.keySet().size()/2] + "\n";
 		String s = "HMM with " + nbStates() + " state(s)\n";
-		//s += "  Poisson lambda: " + poisson.getMean() + "\n";
-		
+		int midDist = nbCpgDistStates / 2;
+
 		for (int i = 0; i < nbStates(); i++) {
 			s += "\nState " + i + "\n";
-			//s += "  Pi: " + getPri(1,i) + "\n";
-			s += "  Pi: " + nf.format(getPri(pi.keySet().toArray(new Integer[pi.keySet().size()])[pi.keySet().size()/2],i)) + " (" + nf.format(getPri(pi.firstKey(),i))+ ", " + nf.format(getPri(pi.lastKey(),i)) + ") " + "\n";
-			
-			
+			s += "  Pi: " + nf.format(getPri(midDist,i)) + " (" + nf.format(getPri(0,i))+ ", " + nf.format(getPri(nbCpgDistStates,i)) + ") " + "\n";
+
 			s += "  Aij:";
-			
+
 			for (int j = 0; j < nbStates(); j++){
-			//	s += " " + nf.format(getArij(1,i,j));
-				s += " " + nf.format(getArij(pi.keySet().toArray(new Integer[pi.keySet().size()])[pi.keySet().size()/2],i,j)) + " (" + nf.format(getArij(pi.firstKey(),i,j)) + ", " + nf.format(getArij(pi.lastKey(),i,j)) + ") ";
+				s += " " + nf.format(getArij(midDist,i,j)) + " (" + nf.format(getArij(0,i,j)) + ", " + nf.format(getArij(nbCpgDistStates,i,j)) + ") ";
 			}
 				
 			s += "\n";
@@ -626,23 +606,12 @@ implements Serializable, Cloneable {
 	public BayesianNhmmV5<O> clone()throws CloneNotSupportedException{
 
 				BayesianNhmmV5<O> hmm = new BayesianNhmmV5<O>(nbStates(), nbCpgDistStates, bayesianFactor);
-				hmm.pi = (TreeMap<Integer, Double[]>) pi.clone();
-				for (Integer key : a.keySet()){
-						hmm.pi.put(key, pi.get(key).clone());
-					
+				for (int r = 0; r <= nbCpgDistStates; r++){
+					System.arraycopy(pi[r], 0, hmm.pi[r], 0, nbStates);
+					for (int i = 0; i < nbStates; i++)
+						System.arraycopy(a[r][i], 0, hmm.a[r][i], 0, nbStates);
 				}
-				
-				hmm.a = (TreeMap<Integer, Double[][]>) a.clone();
-				for (Integer key : a.keySet()){
-					Double[][] t = hmm.a.get(key);
-					for (int i = 0; i < a.get(key).length; i++){
-						
-						t[i] = a.get(key)[i].clone();
-					}
-					hmm.a.put(key, t);
-				}
-					
-				
+
 				for (int i = 0; i < hmm.opdfs.size(); i++)
 					hmm.opdfs.set(i, opdfs.get(i).clone());
 				hmm.setMaxCpgNum(this.maxCpgInFrag);

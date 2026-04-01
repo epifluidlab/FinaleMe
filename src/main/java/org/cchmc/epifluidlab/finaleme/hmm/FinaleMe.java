@@ -36,7 +36,8 @@ import org.apache.commons.math3.random.MersenneTwister;
 import org.apache.commons.math3.stat.correlation.PearsonsCorrelation;
 import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.cchmc.epifluidlab.finaleme.utils.ObservationVector;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -149,7 +150,7 @@ public class FinaleMe {
 
 	final private static String USAGE = "FinaleMe [opts] model input_matrix.txt[.gz] prediction.txt.gz";
 	
-	private static Logger log = Logger.getLogger(FinaleMe.class);
+	private static final Logger log = LoggerFactory.getLogger(FinaleMe.class);
 
 	private static long startTime = -1;
 	private static long points = 0;

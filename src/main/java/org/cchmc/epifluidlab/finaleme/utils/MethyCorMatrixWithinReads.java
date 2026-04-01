@@ -27,7 +27,8 @@ import java.util.List;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -71,7 +72,7 @@ public class MethyCorMatrixWithinReads {
 
 	final private static String USAGE = "MethyCorMatrixWithinReads [opts] locus.bed wgbs.bam cor.detail.txt.gz methy.detail.txt.gz";
 	
-	private static Logger log = Logger.getLogger(MethyCorMatrixWithinReads.class);
+	private static final Logger log = LoggerFactory.getLogger(MethyCorMatrixWithinReads.class);
 
 	private static long startTime = -1;
 	private static long points = 1;

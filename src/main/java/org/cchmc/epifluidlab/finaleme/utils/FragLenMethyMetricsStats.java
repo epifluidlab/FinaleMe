@@ -30,8 +30,8 @@ import org.apache.commons.math3.exception.MathIllegalArgumentException;
 import org.apache.commons.math3.exception.MathIllegalStateException;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -72,7 +72,7 @@ public class FragLenMethyMetricsStats {
 
 	final private static String USAGE = "FragLenMethyMetricsStats [opts] wgs.bam fragment_detail.txt.gz fragLenMethySummary.txt.gz fragMethyLenSummary.txt.gz";
 	
-	private static Logger log = Logger.getLogger(FragLenMethyMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(FragLenMethyMetricsStats.class);
 
 	private static long startTime = -1;
 
@@ -83,7 +83,7 @@ public class FragLenMethyMetricsStats {
 	 */
 	public static void main(String[] args) throws Exception {
 		FragLenMethyMetricsStats flmms = new FragLenMethyMetricsStats();
-		BasicConfigurator.configure();
+		//BasicConfigurator.configure();
 		flmms.doMain(args);
 	}
 	

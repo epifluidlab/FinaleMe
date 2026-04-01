@@ -39,8 +39,8 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.zip.GZIPInputStream;
 
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -64,7 +64,7 @@ public class MergeVcfDupsByPatientId {
 
 	final private static String USAGE = "MergeVcfDupsByPatientId [opts] sampleSheet.txt input.vcf.gz outputMerged.vcf.gz";
 	
-	private static Logger log = Logger.getLogger(MergeVcfDupsByPatientId.class);
+	private static final Logger log = LoggerFactory.getLogger(MergeVcfDupsByPatientId.class);
 	private static long startTime = -1;
 	private static long number = 0;
 	private static VariantContextWriter writer;
@@ -75,7 +75,7 @@ public class MergeVcfDupsByPatientId {
 	 */
 	public static void main(String[] args) throws Exception {
 		MergeVcfDupsByPatientId mvdbp = new MergeVcfDupsByPatientId();
-		BasicConfigurator.configure();
+		//BasicConfigurator.configure();
 		mvdbp.doMain(args);
 	}
 	

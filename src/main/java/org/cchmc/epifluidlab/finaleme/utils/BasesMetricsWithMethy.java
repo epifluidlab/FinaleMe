@@ -21,7 +21,8 @@ import java.util.List;
 import java.util.zip.GZIPInputStream;
 
 import org.apache.commons.math3.util.Pair;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.biojava.nbio.genome.parsers.twobit.TwoBitParser;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -59,7 +60,7 @@ public class BasesMetricsWithMethy {
 
 	final private static String USAGE = "BasesMetricsWithMethy [opts] hg19.2bit interval.bed[.gz] cpg_methy.strand.6plus2.bed[.gz] wgbs/wgs.bedpe[.gz] metrics.h5";
 	
-	private static Logger log = Logger.getLogger(CpgMultiMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(CpgMultiMetricsStats.class);
 
 	private static long startTime = -1;
 	private static long points = 0;

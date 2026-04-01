@@ -34,8 +34,8 @@ import java.util.zip.GZIPOutputStream;
 import org.apache.commons.math3.exception.MathIllegalArgumentException;
 import org.apache.commons.math3.exception.MathIllegalStateException;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -63,7 +63,7 @@ public class CovFragLenWindowMetricsStats {
 
 	final private static String USAGE = "CovFragLenMetricsStats [opts] interval.bed wgs.bam summary.txt.gz";
 	
-	private static Logger log = Logger.getLogger(CovFragLenWindowMetricsStats.class);
+	private static final Logger log = LoggerFactory.getLogger(CovFragLenWindowMetricsStats.class);
 
 	private static long startTime = -1;
 
@@ -74,7 +74,7 @@ public class CovFragLenWindowMetricsStats {
 	 */
 	public static void main(String[] args) throws Exception {
 		CovFragLenWindowMetricsStats cfms = new CovFragLenWindowMetricsStats();
-		BasicConfigurator.configure();
+		//BasicConfigurator.configure();
 		cfms.doMain(args);
 	}
 	
