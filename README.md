@@ -73,6 +73,7 @@ See [PLAN.md](PLAN.md) for full details on all optimizations.
 
 ### Input
 - coordinate-sorted and indexed bam file
+- or bgzipped/tabix-indexed fragment BED/TSV file with at least `chr`, `start`, `end`, and `strand`
 
 ### Start analysis
 
@@ -100,6 +101,26 @@ java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
 ```
 
 `edu.northwestern.epifluidlab.finaleme.utils.CpgMultiMetricsStats` is still available as a deprecated alias for backward-compatible scripts.
+
+Alternative Step 1 input mode (tabix fragment BED/TSV):
+```
+java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
+  edu.northwestern.epifluidlab.finaleme.utils.CpgFeatureMatrixBuilder \
+  hg19.2bit \
+  CG_motif.hg19.common_chr.pos_only.bedgraph \
+  CG_motif.hg19.common_chr.pos_only.bedgraph \
+  fragments.bed.gz \
+  CpgFeatureMatrixBuilder.hg19.details.bed.gz \
+  -fragmentInputTabix \
+  -fragStrandColumn 4 \
+  -valueWigs methyPrior:0:wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
+  -inferMethyFromValueWig
+```
+
+Notes for tabix fragment mode:
+- If methylation state is already present in the fragment file, provide `-fragMethyColumn` (1-based column index, values `m/u`).
+- If methylation state is absent, the builder can infer it from the first `-valueWigs` track (commonly methylation prior).
+- If neither is available, `-defaultMethyStat` is used (`u` by default).
 
 Feature extraction is now parallelized by 5Mb genomic bins and processed with a per-bin streaming BAM read window, automatically using all available CPU cores.
 Runtime progress is logged as CpGs processed out of total with percent completion.
