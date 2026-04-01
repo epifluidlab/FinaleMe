@@ -29,7 +29,7 @@ Sorted by CpG index. Identical (chr, startIndex, pattern) records merged with co
 
 ### Step 1: Add CLI options and validation
 
-**File**: [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) ~line 144 (after `-t` option)
+**File**: [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) ~line 144 (after `-t` option)
 
 Add two new options:
 ```java
@@ -49,7 +49,7 @@ if (patOutput && cpgIndexFile == null) {
 
 ### Step 2: Add CpgIndex inner class and loader
 
-**File**: [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) (after MatrixObj inner class, ~line 1207)
+**File**: [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) (after MatrixObj inner class, ~line 1207)
 
 Add `CpgIndex` static inner class with:
 - `LinkedHashMap<String, int[]> chrPositions` — chr → sorted CpG start positions (preserves chromosome order from file)
@@ -67,7 +67,7 @@ Add `private CpgIndex loadCpgIndex(String cpgIndexFile)` method:
 
 ### Step 3: Modify decodeHmm() to collect per-fragment patterns
 
-**File**: [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) `decodeHmm()` (lines 713-861)
+**File**: [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) `decodeHmm()` (lines 713-861)
 
 Changes:
 1. Add `CpgIndex cpgIndex` parameter to method signature (line 713)
@@ -87,7 +87,7 @@ Changes:
 
 ### Step 4: Write `.pat.gz` output
 
-**File**: [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) (after existing output writing, ~line 849)
+**File**: [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) (after existing output writing, ~line 849)
 
 When `patOutput` is true:
 1. Derive output filename: replace `.bed.gz` with `.pat.gz` in `outputFile`, or append `.pat.gz`
@@ -103,7 +103,7 @@ When `patOutput` is true:
 
 ### Step 5: Write `.beta` output
 
-**File**: [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) (immediately after `.pat.gz` writing)
+**File**: [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) (immediately after `.pat.gz` writing)
 
 When `patOutput` is true:
 1. Derive output filename: replace `.pat.gz` with `.beta`
@@ -130,7 +130,7 @@ import java.util.LinkedHashMap;
 
 | File | Changes |
 |------|---------|
-| [FinaleMe.java](src/main/java/org/cchmc/epifluidlab/finaleme/hmm/FinaleMe.java) | CLI options, CpgIndex class, loadCpgIndex(), modify decodeHmm() signature + pattern collection, pat.gz + beta writers |
+| [FinaleMe.java](src/main/java/edu/northwestern/epifluidlab/finaleme/hmm/FinaleMe.java) | CLI options, CpgIndex class, loadCpgIndex(), modify decodeHmm() signature + pattern collection, pat.gz + beta writers |
 
 All changes are in a single file, following the existing pattern (MatrixObj is already an inner class).
 
@@ -143,7 +143,7 @@ All changes are in a single file, following the existing pattern (MatrixObj is a
 3. Run decode with new flags on test data:
    ```
    java -cp "target/FinaleMe-0.60-jar-with-dependencies.jar:lib/jahmm-0.6.2.jar" \
-     org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
+     edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
      test.model input_matrix.bed.gz prediction.bed.gz \
      -decodeModeOnly -patOutput -cpgIndexFile CG_motif.bedgraph
    ```

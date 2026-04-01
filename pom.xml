@@ -9,7 +9,7 @@
         <finalName>${project.artifactId}-${project.version}</finalName>
         <archive>
           <manifest>
-            <mainClass>org.cchmc.epifluidlab.finaleme.hmm.FinaleMe</mainClass>
+            <mainClass>edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe</mainClass>
           </manifest>
         </archive>
         <descriptorRefs>
@@ -43,7 +43,7 @@
   </plugins>
 </build>
 	
-	<groupId>org.cchmc.epifluidlab</groupId>
+	<groupId>edu.northwestern.epifluidlab</groupId>
   <artifactId>FinaleMe</artifactId>
   <modelVersion>4.0.0</modelVersion>
   <name>FinaleMe</name>

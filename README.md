@@ -61,7 +61,7 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 - **Replaced log4j** with SLF4J + Logback (fixes CVE-2021-4104)
 - **Removed GATK dependency** (replaced with inline utilities)
 - **Upgraded htsjdk** from 1.141 to 2.24.1
-- **Consolidated CpgMultiMetricsStats variants** using a shared abstract base and common interval-loading utilities
+- **Consolidated Cpg feature-matrix builders** using a shared abstract base and common interval-loading utilities
 - **Clean packaging model**: normal Maven dependencies (no `systemPath`) + single self-contained runtime jar for Steps 1-3
 - **Added unit tests** for HMM core (13 tests)
 
@@ -87,17 +87,19 @@ The analysis consists of several steps:
 #### Step 1: extract features from bam files for the training and decoding
 ```
 java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
-  org.cchmc.epifluidlab.finaleme.utils.CpgMultiMetricsStats \
+  edu.northwestern.epifluidlab.finaleme.utils.CpgFeatureMatrixBuilder \
   hg19.2bit \
   CG_motif.hg19.common_chr.pos_only.bedgraph \
   CG_motif.hg19.common_chr.pos_only.bedgraph \
   input.bam \
-  CpgMultiMetricsStats.hg19.details.bed.gz \
+  CpgFeatureMatrixBuilder.hg19.details.bed.gz \
   -stringentPaired \
   -excludeRegions wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed \
   -valueWigs methyPrior:0:wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
   -wgsMode
 ```
+
+`edu.northwestern.epifluidlab.finaleme.utils.CpgMultiMetricsStats` is still available as a deprecated alias for backward-compatible scripts.
 
 Feature extraction is now parallelized by 5Mb genomic bins and processed with a per-bin streaming BAM read window, automatically using all available CPU cores.
 Runtime progress is logged as CpGs processed out of total with percent completion.
@@ -109,9 +111,9 @@ You can set thread count explicitly with `-t` (for example, `-t 8`).
 #### Step 2: train the model 
 ```
 java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
-  org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
+  edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
-  CpgMultiMetricsStats.hg19.details.bed.gz \
+  CpgFeatureMatrixBuilder.hg19.details.bed.gz \
   test.FinaleMe.mincg7.prediction.bed.gz \
   -miniDataPoints 7 -gmm -covOutlier 3
 ```
@@ -122,9 +124,9 @@ Set FinaleMe thread count with `-t` (for example, `-t 8`).
 #### Step 3: decode and make the prediction of CpG methylation level
 ```
 java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
-  org.cchmc.epifluidlab.finaleme.hmm.FinaleMe \
+  edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
-  CpgMultiMetricsStats.hg19.details.bed.gz \
+  CpgFeatureMatrixBuilder.hg19.details.bed.gz \
   test.FinaleMe.mincg7.prediction.bed.gz \
   -decodeModeOnly
 ```
