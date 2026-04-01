@@ -1,8 +1,7 @@
 package org.cchmc.epifluidlab.finaleme.hmm;
 
-//import java.math.BigDecimal;
-//import java.math.RoundingMode;
 import java.util.*;
+import java.util.concurrent.*;
 
 import org.apache.commons.math3.util.Pair;
 
@@ -19,7 +18,6 @@ import be.ac.ulg.montefiore.run.jahmm.learn.BaumWelchScaledLearner;
  * <i>Juang</i>'s <i>Fundamentals of speech recognition</i> (Prentice Hall,
  * 1993).
  */
-//for those of cpg distance without enough instance to estimate, i will use average Aij
 public class BaumWelchBayesianNhmmV5ScaledLearner
 extends BaumWelchScaledLearner
 {	
@@ -59,8 +57,7 @@ extends BaumWelchScaledLearner
 		/* gamma and xi arrays are those defined by Rabiner and Juang */
 		/* allGamma[n] = gamma array associated to observation sequence n */
 		double allGamma[][][] = new double[sequences.size()][][];
-	//	double allGammaWithMethy[][][] = new double[sequences.size()][][];
-		
+
 		/* a[i][j] = aijNum[i][j] / aijDen[i]
 		 * aijDen[i] = expected number of transitions from state i
 		 * aijNum[i][j] = expected number of transitions from state i to j
@@ -68,76 +65,57 @@ extends BaumWelchScaledLearner
 		double aijNum[][] = new double[hmm.nbStates()][hmm.nbStates()];
 		double aijDen[] = new double[hmm.nbStates()];
 		HashMap<Integer,Pair<double[][], double[]>> arij = new HashMap<Integer,Pair<double[][], double[]>>();
-		
+
 			Arrays.fill(aijDen, 0.);
-	
+
 			for (int j = 0; j < hmm.nbStates(); j++)
 				Arrays.fill(aijNum[j], 0.);
-		
-			
-			
-		//System.err.println("estimate xi and gamma");
-		int g = 0;
-		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair : sequences) {	    
-			ForwardBackwardBayesianNhmmV5ScaledCalculator fbc = 
-				generateForwardBackwardCalculator(obsSeqPair, hmm);
-			
-			double xi[][][] = estimateXi(obsSeqPair, fbc, hmm);
-		//	double xiWithMethy[][][] = estimateXiWithMethy(obsSeqPair, fbc, hmm);
-			//System.err.println(hmm.nbCpgDistStates() + "\t" + xi.length + "\t" + xi[0].length + "\t" + xi[0][0].length + "\t" + xi[0][0][0].length);
-			
-			//double gamma[][] = allGamma[g++] = estimateGamma(xi, fbc, obsSeqPair, hmm);
-			double gamma[][] = allGamma[g] = estimateGamma(xi, fbc);
-			//allGammaWithMethy[g] = estimateGamma(xiWithMethy, fbc);
-			g++;
-			//System.err.println(hmm.nbCpgDistStates() + "\t" + allGamma.length + "\t" + allGamma[0].length + "\t" + allGamma[0][0].length + "\t" + allGamma[0][0][0].length);
-			
-			//double gamma[][][] = allGamma[g];
-			//System.err.println(gamma.length + "\t" + gamma[0].length + "\t" + gamma[0][0].length);
 
-			
+		// Phase 1: Parallel forward-backward, xi, and gamma computation
+		int nThreads = Runtime.getRuntime().availableProcessors();
+		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
+
+		// Each task computes: [xi, gamma, sequenceIndex]
+		List<Future<Object[]>> futures = new ArrayList<Future<Object[]>>(sequences.size());
+		for (int idx = 0; idx < sequences.size(); idx++) {
+			final int seqIdx = idx;
+			final Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair = sequences.get(seqIdx);
+			futures.add(executor.submit(new Callable<Object[]>() {
+				@Override
+				public Object[] call() {
+					ForwardBackwardBayesianNhmmV5ScaledCalculator fbc =
+						generateForwardBackwardCalculator(obsSeqPair, hmm);
+					double[][][] xi = estimateXi(obsSeqPair, fbc, hmm);
+					double[][] gamma = estimateGamma(xi, fbc);
+					return new Object[]{xi, gamma, seqIdx};
+				}
+			}));
+		}
+
+		// Phase 2: Sequential accumulation of parallel results
+		double[][][][] allXi = new double[sequences.size()][][][];
+		try {
+			for (Future<Object[]> future : futures) {
+				Object[] result = future.get();
+				double[][][] xi = (double[][][]) result[0];
+				double[][] gamma = (double[][]) result[1];
+				int seqIdx = (Integer) result[2];
+				allGamma[seqIdx] = gamma;
+				allXi[seqIdx] = xi;
+			}
+		} catch (Exception e) {
+			throw new RuntimeException("Error in parallel forward-backward computation", e);
+		}
+		executor.shutdown();
+
+		// Sequential accumulation into aijNum, aijDen, arij
+		for (int g = 0; g < sequences.size(); g++) {
+			double[][][] xi = allXi[g];
+			double[][] gamma = allGamma[g];
+			Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair = sequences.get(g);
 			List<? extends O> obsSeq = obsSeqPair.getSecond();
 			HashMap<Integer, Pair<Integer, Double>> cpgDistState = obsSeqPair.getFirst();
-			/*
-			for (int i = 0; i < hmm.nbStates(); i++)
-				for (int t = 0; t < obsSeq.size() - 1; t++) {
-					double unmethy = xi[t][i][0]/(xi[t][i][0]+xi[t][i][1]);
-					double methy = xi[t][i][1]/(xi[t][i][0]+xi[t][i][1]);
-						unmethy = unmethy * (1-cpgDistState.get(t).getSecond());
-						methy = methy * (cpgDistState.get(t).getSecond());
-						if(arij.containsKey(cpgDistState.get(t+1).getFirst())){
-							Pair<double[][], double[]> tmp = arij.get(cpgDistState.get(t+1).getFirst());
-							double[] denTmp = tmp.getSecond();
-							double[][] numTmp = tmp.getFirst();
-							
-							for (int j = 0; j < hmm.nbStates(); j++){
-								denTmp[i] += (j % 2 == 0 ? unmethy : methy);
-								numTmp[i][j] += (j % 2 == 0 ? unmethy : methy);
-							}
-								
-							arij.put(cpgDistState.get(t+1).getFirst(), new Pair<double[][], double[]>(numTmp, denTmp));
-							
-						}else{
-							double numTmp[][] = new double[hmm.nbStates()][hmm.nbStates()];
-							double denTmp[] = new double[hmm.nbStates()];
-							Arrays.fill(denTmp, 0.);
-							for (int j = 0; j < hmm.nbStates(); j++)
-								Arrays.fill(numTmp[j], 0.);
-							for (int j = 0; j < hmm.nbStates(); j++){
-								denTmp[i] += (j % 2 == 0 ? unmethy : methy);
-								numTmp[i][j] += (j % 2 == 0 ? unmethy : methy);
-							}
-							arij.put(cpgDistState.get(t+1).getFirst(), new Pair<double[][], double[]>(numTmp, denTmp));
-						}
-						for (int j = 0; j < hmm.nbStates(); j++){
-							aijDen[i] += (j % 2 == 0 ? unmethy : methy);
-							aijNum[i][j] += (j % 2 == 0 ? unmethy : methy);
-						}
-							
-					
-				}
-			*/
-			
+
 			for (int i = 0; i < hmm.nbStates(); i++)
 				for (int t = 0; t < obsSeq.size() - 1; t++) {
 						aijDen[i] += gamma[t][i];
@@ -149,7 +127,7 @@ extends BaumWelchScaledLearner
 							for (int j = 0; j < hmm.nbStates(); j++)
 								numTmp[i][j] += xi[t][i][j];
 							arij.put(cpgDistState.get(t+1).getFirst(), new Pair<double[][], double[]>(numTmp, denTmp));
-							
+
 						}else{
 							double numTmp[][] = new double[hmm.nbStates()][hmm.nbStates()];
 							double denTmp[] = new double[hmm.nbStates()];
@@ -163,14 +141,11 @@ extends BaumWelchScaledLearner
 						}
 						for (int j = 0; j < hmm.nbStates(); j++)
 							aijNum[i][j] += xi[t][i][j];
-					
+
 				}
-				
 		}
-		
-		
-		
-		//System.err.println("estimate Arij");
+		allXi = null; // allow GC
+
 		for (int r = 0; r <= hmm.nbCpgDistState(); r++) {
 			if(arij.containsKey(r)){
 				Pair<double[][], double[]> tmp = arij.get(r);
@@ -201,41 +176,22 @@ extends BaumWelchScaledLearner
 		}
 		
 		
-		//System.err.println("estimate Pri");
 		/* pi computation */
 		for (int r = 1; r < hmm.nbCpgDistState(); r++) {
 			for (int i = 0; i < hmm.nbStates(); i++)
 				nhmm.setPri(r, i, 0.);
 		}
-			
-		
-		
+
 		for (int o = 0; o < sequences.size(); o++){
 			Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair = sequences.get(o);
 			Integer r = obsSeqPair.getFirst().get(0).getFirst();
 				for (int i = 0; i < hmm.nbStates(); i++){
-					//System.err.println(o + "\t" + r + "\t" + i + "\t" + allGamma.length + "\t" + allGamma[0].length + "\t" + allGamma[0][0].length + "\t" + allGamma[o][0][i]);
-					
-				//	if(Double.isNaN(allGamma[o][0][i])){
-					//	nhmm.setPri(r, i,
-						//		nhmm.getPri(r, i) );
-				//	}else{
-						nhmm.setPri(r, i,
+					nhmm.setPri(r, i,
 								nhmm.getPri(r, i) + allGamma[o][0][i] / sequences.size());
-				//	}
-						//System.err.println("PRi: " + nhmm.getPri(r,i) + "\t" + r + "\t" + i);
 				}
-
-			
-				
 		}
-		
-		
-		
-		
-		//System.err.println(nhmm.getPri(0,0) + "\t" + nhmm.getPri(0,1));
-		//System.err.println(nhmm.getPri(50,0) + "\t" + nhmm.getPri(50,1));
-		//rescale pi
+
+		/* rescale pi */
 		HashMap<Integer, Double> sumPi = new HashMap<Integer, Double>();
 		
 		for (int r = 0; r <= hmm.nbCpgDistState(); r++) {
@@ -259,15 +215,9 @@ extends BaumWelchScaledLearner
 				
 			}
 		}
-		//System.err.println(nhmm.getPri(1,0) + "\t" + nhmm.getPri(1,1));
-		//System.err.println(nhmm.getPri(50,0) + "\t" + nhmm.getPri(50,1));
-		//System.err.println(sumPi);
-			
-		//System.err.println("estimate pdfs");
 		/* pdfs computation */
-		
+		List<O> observations = CcInferenceUtils.flatPair(sequences);
 		for (int i = 0; i < hmm.nbStates(); i++) {
-			List<O> observations = CcInferenceUtils.flatPair(sequences);
 			double[] weights = new double[observations.size()];
 			double sum = 0.;
 			
@@ -305,58 +255,9 @@ extends BaumWelchScaledLearner
 			
 		}
 		
-		/*
-		for (int i = 0; i < hmm.nbStates(); i++) {
-			List<O> observations = CcInferenceUtils.flatPair(sequences);
-			double[] weights = new double[observations.size()];
-			double sum = 0.;
-			BigDecimal[] weightsBg = new BigDecimal[observations.size()];
-			BigDecimal sumBg = BigDecimal.ZERO;
-			for (int t = 0; t < observations.size(); t++){
-				weightsBg[t] = BigDecimal.ZERO;
-			}
-			int j = 0;
-			
-			int o = 0;
-			for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair : sequences) {
-				List<? extends O> obsSeq = obsSeqPair.getSecond();
-				for (int t = 0; t < obsSeq.size(); t++, j++){
-
-						sumBg = sumBg.add(new BigDecimal(allGamma[o][t][i]));
-						weightsBg[j] = weightsBg[j].add(new BigDecimal(allGamma[o][t][i]));
-						
-				}
-					
-				o++;
-			}
-			
-			for (j--; j >= 0; j--){
-				weights[j]=weightsBg[j].divide(sumBg, 20, RoundingMode.HALF_UP).doubleValue();
-				
-			}
-			
-			
-			
-			
-			Opdf<O> opdf = nhmm.getOpdf(i);
-			opdf.fit(observations, weights);
-			
-		}
-		*/
-//System.err.println(hmm);
-//System.err.println(nhmm.getPri(1,0) + "\t" + nhmm.getPri(1,1));
-//System.err.println(nhmm.getPri(50,0) + "\t" + nhmm.getPri(50,1));
-//System.err.println(nhmm.getArij(1,0,0) + "\t" + nhmm.getArij(1,0,1) + "\t" + nhmm.getArij(1,1,0) + "\t" + nhmm.getArij(1,1,1));
-//System.err.println(nhmm.getArij(50,0,0) + "\t" + nhmm.getArij(50,0,1) + "\t" + nhmm.getArij(50,1,0) + "\t" + nhmm.getArij(50,1,1));
-//System.err.println(nhmm);
-		
 		return nhmm;
 	}
-	
-	
 
-	
-	
 	/**
 	 * Does a fixed number of iterations (see {@link #getNbIterations}) of the
 	 * Baum-Welch algorithm.
@@ -423,70 +324,12 @@ extends BaumWelchScaledLearner
 						for (int j = 0; j < hmm.nbStates(); j++){
 							
 							xi[t][i][j] = fbc.alphaElement(t, i) *
-									hmm.getArij(cpgDistState.get(t+1).getFirst(), i, j) * 
-									//hmm.getOpdf(j).probability(observation) *
-									//hmm.getOpdfBayesianProb(j, cpgDistState.get(t+1),observation, sequence.size()) *
+									hmm.getArij(cpgDistState.get(t+1).getFirst(), i, j) *
 									hmm.getOpdfProb(j,observation) *
 									fbc.betaElement(t + 1, j);
-							//if(Double.isNaN(xi[t][i][j]) || Double.compare(xi[t][i][j], 0.0) == 0){
 							if(Double.isNaN(xi[t][i][j])){
 								System.err.println(t + "\t" + i + "\t" + j + "\t" + cpgDistState.get(t) + "\t" + observation + "\t" +  hmm.getArij(cpgDistState.get(t).getFirst(), i, j));
 								System.err.println(fbc.alphaElement(t, i) + "\t" + hmm.getArij(cpgDistState.get(t).getFirst(), i, j) + "\t" + hmm.getOpdf(j).probability(observation) + "\t" + fbc.betaElement(t + 1, j));
-								//xi[t][i][j] = 0.;
-							}
-						}
-							
-					}
-						
-				}else{
-					for (int i = 0; i < hmm.nbStates(); i++)
-						for (int j = 0; j < hmm.nbStates(); j++)
-							xi[t][i][j] = 0.5;
-				}
-				
-		}
-		
-		return xi;
-	}
-	
-	protected <O extends Observation> double[][][]
-	estimateXiWithMethy(Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair, ForwardBackwardBayesianNhmmV5Calculator fbc,
-			BayesianNhmmV5<O> hmm)
-	{	
-		List<? extends O> sequence = obsSeqPair.getSecond();
-		HashMap<Integer, Pair<Integer, Double>> cpgDistState = obsSeqPair.getFirst();
-		
-		if (sequence.size() <= 1)
-			throw new IllegalArgumentException("Observation sequence too " + 
-			"short");
-		
-		double xi[][][] = 
-			new double[sequence.size() - 1][hmm.nbStates()][hmm.nbStates()];
-		
-		Iterator<? extends O> seqIterator = sequence.iterator();
-		seqIterator.next();
-		
-		for (int t = 0; t < sequence.size() - 1; t++) {
-			O observation = seqIterator.next();
-			
-			
-				
-				if(cpgDistState.containsKey(t)){
-					
-					for (int i = 0; i < hmm.nbStates(); i++){
-						for (int j = 0; j < hmm.nbStates(); j++){
-							
-							xi[t][i][j] = fbc.alphaElement(t, i) *
-									hmm.getArij(cpgDistState.get(t+1).getFirst(), i, j) * 
-									//hmm.getOpdf(j).probability(observation) *
-									//hmm.getOpdfBayesianProb(j, cpgDistState.get(t+1),observation, sequence.size()) *
-									hmm.getOpdfProb(j,observation) *
-									fbc.betaElement(t + 1, j);
-							//if(Double.isNaN(xi[t][i][j]) || Double.compare(xi[t][i][j], 0.0) == 0){
-							if(Double.isNaN(xi[t][i][j])){
-								System.err.println(t + "\t" + i + "\t" + j + "\t" + cpgDistState.get(t) + "\t" + observation + "\t" +  hmm.getArij(cpgDistState.get(t).getFirst(), i, j));
-								System.err.println(fbc.alphaElement(t, i) + "\t" + hmm.getArij(cpgDistState.get(t).getFirst(), i, j) + "\t" + hmm.getOpdf(j).probability(observation) + "\t" + fbc.betaElement(t + 1, j));
-								//xi[t][i][j] = 0.;
 							}
 						}
 							
@@ -529,55 +372,5 @@ extends BaumWelchScaledLearner
 		return gamma;
 	}
 	
-	protected <O extends Observation> double[][]
-	estimateGamma(double[][][] xi, ForwardBackwardBayesianNhmmV5Calculator fbc, Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> obsSeqPair, BayesianNhmmV5<O> hmm)
-	{
-		HashMap<Integer, Pair<Integer, Double>> cpgDistState = obsSeqPair.getFirst();
-		
-		double[][] gamma = new double[xi.length + 1][xi[0].length];
-		
-		for (int t = 0; t < xi.length + 1; t++)
-				Arrays.fill(gamma[t], 0.);
-		
-		for (int t = 0; t < xi.length; t++){
-			for (int i = 0; i < xi[0][0].length; i++)
-				for (int j = 0; j < xi[0][0].length; j++){
-					double unmethy = xi[t][i][0]/(xi[t][i][0]+xi[t][i][1]);
-					double methy = xi[t][i][1]/(xi[t][i][0]+xi[t][i][1]);
-						unmethy = unmethy * (1-cpgDistState.get(t).getSecond());
-						methy = methy * (cpgDistState.get(t).getSecond());
-						
-					gamma[t][i] +=  (j % 2 == 0 ? unmethy : methy);
-					if(Double.isNaN(gamma[t][i])){
-						System.err.println(t + "\t" + i + "\t" + j + "\t" + cpgDistState.get(t) + "\t" + xi[t][i][0] + "\t" +  xi[t][i][1]);
-						System.err.println(unmethy + "\t" + methy);
-						//xi[t][i][j] = 0.;
-					}
-					//gamma[t][i] += xi[t][i][j];
-				}
-			
-		}
-				
-						
-		
-		
-			for (int j = 0; j < xi[0][0].length; j++)
-				for (int i = 0; i < xi[0][0].length; i++){
-					double unmethy = xi[xi.length-1][i][0]/(xi[xi.length-1][i][0]+xi[xi.length-1][i][1]);
-					double methy = xi[xi.length-1][i][1]/(xi[xi.length-1][i][0]+xi[xi.length-1][i][1]);
-						unmethy = unmethy * (1-cpgDistState.get(xi.length-1).getSecond());
-						methy = methy * (cpgDistState.get(xi.length-1).getSecond());
-					gamma[xi.length][j] += (j % 2 == 0 ? unmethy : methy);
-					if(Double.isNaN(gamma[xi.length][j])){
-						System.err.println( i + "\t" + j + "\t" + cpgDistState.get(xi.length-1) + "\t" + xi[xi.length-1][i][0] + "\t" +  xi[xi.length-1][i][1]);
-						System.err.println(unmethy + "\t" + methy);
-						//xi[t][i][j] = 0.;
-					}
-					//gamma[xi.length][j] += xi[xi.length - 1][i][j];
-				}
-					
-		
-		return gamma;
-	}
 }
 

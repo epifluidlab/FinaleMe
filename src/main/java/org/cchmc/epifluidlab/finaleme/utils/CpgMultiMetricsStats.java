@@ -533,22 +533,44 @@ public class CpgMultiMetricsStats {
 						log.info("Get total reads number used for scaling from input option -totalReadsInBam ... ");
 						readsNumTotal = totalReadsInBam;
 					}else{
-						log.info("Get total reads number used for scaling from bam file... ");
-						SAMRecordIterator wgsIt = wgsReader.iterator();
-						
-						while(wgsIt.hasNext()){
-							SAMRecord r = wgsIt.next();
-							if(failFlagFilter(r)){
-								continue;
-							}else{
-								if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
-									continue;
+						// Use BAM index statistics for fast approximate read count
+						log.info("Get total reads number used for scaling from bam index... ");
+						boolean usedIndex = false;
+						if(wgsReader.indexing() != null && wgsReader.indexing().hasBrowseableIndex()){
+							try {
+								htsjdk.samtools.BAMIndexMetaData[] indexStats = null;
+								htsjdk.samtools.BAMIndex bamIndex = wgsReader.indexing().getIndex();
+								int nRefs = wgsReader.getFileHeader().getSequenceDictionary().getSequences().size();
+								for(int refIdx = 0; refIdx < nRefs; refIdx++){
+									htsjdk.samtools.BAMIndexMetaData meta = bamIndex.getMetaData(refIdx);
+									if(meta != null){
+										readsNumTotal += meta.getAlignedRecordCount();
+									}
 								}
-							
+								usedIndex = true;
+								log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index (fast path)");
+							} catch(Exception e){
+								log.info("Failed to get counts from BAM index, falling back to full scan...");
+								usedIndex = false;
+								readsNumTotal = 0;
 							}
-							readsNumTotal++;
 						}
-						wgsIt.close();
+						if(!usedIndex){
+							log.info("Get total reads number used for scaling from bam file (full scan)... ");
+							SAMRecordIterator wgsIt = wgsReader.iterator();
+							while(wgsIt.hasNext()){
+								SAMRecord r = wgsIt.next();
+								if(failFlagFilter(r)){
+									continue;
+								}else{
+									if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+										continue;
+									}
+								}
+								readsNumTotal++;
+							}
+							wgsIt.close();
+						}
 					}
 					
 					log.info((long)readsNumTotal + " reads in total ...");

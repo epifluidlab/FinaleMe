@@ -6,8 +6,10 @@
  */
 package org.cchmc.epifluidlab.finaleme.hmm;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.*;
 
 import org.apache.commons.math3.random.MersenneTwister;
 import org.apache.commons.math3.util.Pair;
@@ -96,27 +98,51 @@ public class KullbackLeiblerDistanceBayesianNhmmV5Calculator<O extends Observati
 		return distance / nbSequences;
 	}
 
-	public double 
+	public double
 	distance(BayesianNhmmV5<O> hmm1, BayesianNhmmV5<O> hmm2, boolean allSites)
-	{			
-		double distance = 0.;
-		long num = 0;
+	{
+		// Filter sequences that meet minimum length requirement
+		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>>> validSeqs =
+			new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>>>();
 		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> oseqPair : matrix) {
-			//Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> oseqPair = new BayesianNhmmV5MarkovGenerator<O>(hmm1, cpgDistFreq).
-			//observationSequence(sequencesLength);
-			if(oseqPair.getSecond().size()<sequencesLength){
-				continue;
+			if (oseqPair.getSecond().size() >= sequencesLength) {
+				validSeqs.add(oseqPair);
 			}
-			
-			double prob1 = new ForwardBackwardBayesianNhmmV5ScaledCalculator(oseqPair, hmm1).
-					lnProbability();
-			double prob2 = new ForwardBackwardBayesianNhmmV5ScaledCalculator(oseqPair, hmm2).
-					lnProbability();
-			distance +=  (prob1 - prob2) / oseqPair.getSecond().size();
-			num++;
 		}
-		
-		return distance / num;
+
+		if (validSeqs.isEmpty()) {
+			return 0.;
+		}
+
+		// Parallel forward-backward computation across all valid sequences
+		int nThreads = Runtime.getRuntime().availableProcessors();
+		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
+		List<Future<Double>> futures = new ArrayList<Future<Double>>(validSeqs.size());
+
+		for (final Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>> oseqPair : validSeqs) {
+			futures.add(executor.submit(new Callable<Double>() {
+				@Override
+				public Double call() {
+					double prob1 = new ForwardBackwardBayesianNhmmV5ScaledCalculator(oseqPair, hmm1).
+							lnProbability();
+					double prob2 = new ForwardBackwardBayesianNhmmV5ScaledCalculator(oseqPair, hmm2).
+							lnProbability();
+					return (prob1 - prob2) / oseqPair.getSecond().size();
+				}
+			}));
+		}
+
+		double distance = 0.;
+		try {
+			for (Future<Double> future : futures) {
+				distance += future.get();
+			}
+		} catch (Exception e) {
+			throw new RuntimeException("Error in parallel KL-divergence computation", e);
+		}
+		executor.shutdown();
+
+		return distance / validSeqs.size();
 	}
 	
 	
