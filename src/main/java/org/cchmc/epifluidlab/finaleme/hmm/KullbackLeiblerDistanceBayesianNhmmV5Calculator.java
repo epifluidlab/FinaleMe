@@ -24,6 +24,7 @@ public class KullbackLeiblerDistanceBayesianNhmmV5Calculator<O extends Observati
 
 	private int sequencesLength = 10;
 	private int nbSequences = 10000;
+	private int threadCount = -1;
 	//private ArrayList<Pair<Integer, Double>> cpgDistFreq; //maybe just fit cpg distance distribution with gaussian/poisson mixture model for the simplicity first?
 	private List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>>> matrix;
 	private MersenneTwister randomEngine;
@@ -35,6 +36,22 @@ public class KullbackLeiblerDistanceBayesianNhmmV5Calculator<O extends Observati
 	
 	public KullbackLeiblerDistanceBayesianNhmmV5Calculator(List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>>> matrix){ //cpg distance is a poisson distribution
 		this.matrix = matrix;
+	}
+
+	public KullbackLeiblerDistanceBayesianNhmmV5Calculator(List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<O>>> matrix, int threadCount){ //cpg distance is a poisson distribution
+		this.matrix = matrix;
+		this.threadCount = threadCount;
+	}
+
+	public void setThreadCount(int threadCount)
+	{
+		this.threadCount = threadCount;
+	}
+
+	private int resolveThreadCount()
+	{
+		int resolved = threadCount > 0 ? threadCount : Runtime.getRuntime().availableProcessors();
+		return Math.max(1, resolved);
 	}
 	
 	/**
@@ -115,7 +132,7 @@ public class KullbackLeiblerDistanceBayesianNhmmV5Calculator<O extends Observati
 		}
 
 		// Parallel forward-backward computation across all valid sequences
-		int nThreads = Runtime.getRuntime().availableProcessors();
+		int nThreads = resolveThreadCount();
 		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 		List<Future<Double>> futures = new ArrayList<Future<Double>>(validSeqs.size());
 

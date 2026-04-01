@@ -25,12 +25,29 @@ extends BaumWelchScaledLearner
 	 * Number of iterations performed by the {@link #learn} method.
 	 */
 	private int nbIterations = 9;
+	private int threadCount = -1;
 	
 	/**
 	 * Initializes a Baum-Welch algorithm implementation.
 	 */
 	public BaumWelchBayesianNhmmV5ScaledLearner()
 	{
+	}
+
+	public BaumWelchBayesianNhmmV5ScaledLearner(int threadCount)
+	{
+		this.threadCount = threadCount;
+	}
+
+	public void setThreadCount(int threadCount)
+	{
+		this.threadCount = threadCount;
+	}
+
+	private int resolveThreadCount()
+	{
+		int resolved = threadCount > 0 ? threadCount : Runtime.getRuntime().availableProcessors();
+		return Math.max(1, resolved);
 	}
 	
 	/**
@@ -68,7 +85,7 @@ extends BaumWelchScaledLearner
 				Arrays.fill(aijNum[j], 0.);
 
 		// Phase 1: Parallel forward-backward and xi computation
-		int nThreads = Runtime.getRuntime().availableProcessors();
+		int nThreads = resolveThreadCount();
 		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 
 		// Each task computes xi (gamma is derived from xi on-the-fly during accumulation)
@@ -374,4 +391,3 @@ extends BaumWelchScaledLearner
 	}
 	
 }
-

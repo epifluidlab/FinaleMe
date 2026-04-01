@@ -117,6 +117,7 @@ java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
 ```
 
 Training uses parallelized Baum-Welch (forward-backward computed across sequences in parallel) and parallelized KL-divergence convergence checking.
+Set FinaleMe thread count with `-t` (for example, `-t 8`).
 
 #### Step 3: decode and make the prediction of CpG methylation level
 ```
@@ -129,6 +130,7 @@ java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
 ```
 
 Viterbi decoding is parallelized across fragments.
+Set FinaleMe thread count with `-t` (for example, `-t 8`).
 
 #### Step 4: convert predicted result to .bw file for the visualization in genome browser
 ```

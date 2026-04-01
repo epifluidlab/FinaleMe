@@ -140,6 +140,9 @@ public class FinaleMe {
 	@Option(name="-exclude",usage="exclude data points within these regions. need to be bed format. default: null")
 	public String exclude = null;
 
+	@Option(name="-t",usage="number of threads for parallel training/decode. Use >0 to set explicitly; default uses all available cores.")
+	public int threads = -1;
+
 	
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -156,6 +159,12 @@ public class FinaleMe {
 	private static long points = 0;
 	private MersenneTwister randomEngine;
 	private double maxCpgNum = Double.NEGATIVE_INFINITY;
+
+	private int resolveThreadCount()
+	{
+		int resolved = threads > 0 ? threads : Runtime.getRuntime().availableProcessors();
+		return Math.max(1, resolved);
+	}
 
 
 
@@ -192,6 +201,7 @@ public class FinaleMe {
 					String modelFile = arguments.get(0);
 					String inputFile = arguments.get(1);
 					String outputFile = arguments.get(2);
+					log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
 					initiate();
 
 					MatrixObj matrixObj = processMatrixFile(inputFile);
@@ -648,7 +658,8 @@ public class FinaleMe {
 		hmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgNum : cpgNumClip);
 		hmm.setMinCpgNum(1);
 		
-		BaumWelchBayesianNhmmV5ScaledLearner bwl = new BaumWelchBayesianNhmmV5ScaledLearner();
+		int nThreads = resolveThreadCount();
+		BaumWelchBayesianNhmmV5ScaledLearner bwl = new BaumWelchBayesianNhmmV5ScaledLearner(nThreads);
 
 		BayesianNhmmV5<ObservationVector> prevHmm = null;
 		try {
@@ -659,7 +670,7 @@ public class FinaleMe {
 		
 		// This object measures the distance between two HMMs
 		KullbackLeiblerDistanceBayesianNhmmV5Calculator klc = 
-			new KullbackLeiblerDistanceBayesianNhmmV5Calculator(matrix);
+			new KullbackLeiblerDistanceBayesianNhmmV5Calculator(matrix, nThreads);
 		
 		double distance = Double.MAX_VALUE;
 		double distancePre = 0.01;
@@ -731,7 +742,7 @@ public class FinaleMe {
 		double likelihoodWithMethy = 0;
 
 		// Parallelize Viterbi decoding across fragments
-		int nThreads = Runtime.getRuntime().availableProcessors();
+		int nThreads = resolveThreadCount();
 		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 
 		// Each task returns: [hiddenState, lnProb, lnProbWithMethy, fragmentIndex]
