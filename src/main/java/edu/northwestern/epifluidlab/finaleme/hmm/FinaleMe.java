@@ -474,6 +474,8 @@ public class FinaleMe {
 					} else {
 						// Original path: training + decode, aucMode
 						MatrixObj matrixObj = processMatrixFile(inputFile);
+						// cpgDistFreq is never read after construction; free it immediately
+						matrixObj.cpgDistFreq = null;
 						CpgIndex cpgIndex = null;
 						if (patOutput) {
 							cpgIndex = loadCpgIndex(cpgIndexFile);
@@ -490,12 +492,19 @@ public class FinaleMe {
 								if(miniDataPoints < 2){
 									miniDataPoints = 2;
 									MatrixObj matrixObj2 = processMatrixFile(inputFile);
+									matrixObj2.cpgDistFreq = null;
 									trainHmm(matrixObj2, modelFile);
+									matrixObj2 = null; // allow GC of second copy
 								}else{
 									trainHmm(matrixObj, modelFile);
 								}
 								miniDataPoints = miniDataPointsPre;
 							}
+							// Free training-only fields not needed for decode
+							matrixObj.matrixU = null;
+							matrixObj.matrixM = null;
+							matrixObj.pi = null;
+							matrixObj.a = null;
 							decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
 						}
 					}
@@ -892,10 +901,12 @@ public class FinaleMe {
 					
 				}
 			}
+			matrixProcess.clear();
+			matrixProcess = null; // allow GC of the large per-read HashMap
 			TreeMap<Integer, double[]> piScale = new TreeMap<Integer, double[]>();
 			for(Integer cpgDist : pi.keySet()){
 				Long[] piTmp = pi.get(cpgDist);
-				double[] piScaleTmp = new double[]{(double)piTmp[0]/(double)(piTmp[0] + piTmp[1]), 
+				double[] piScaleTmp = new double[]{(double)piTmp[0]/(double)(piTmp[0] + piTmp[1]),
 						(double)piTmp[1]/(double)(piTmp[0] + piTmp[1])};
 				piScale.put(cpgDist, piScaleTmp);
 				
