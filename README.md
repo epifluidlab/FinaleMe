@@ -18,6 +18,8 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 ```bash
 git clone https://github.com/epifluidlab/FinaleMe.git
 cd FinaleMe
+./scripts/sync-vendored-repo.sh
+mvn clean package
 ```
 
 ## Quick setup
