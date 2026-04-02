@@ -33,10 +33,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.nio.charset.StandardCharsets;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -240,9 +243,187 @@ public class FinaleMe {
 
 
 
+	private HashMap<String, IntervalTree<Integer>> loadIntervalFile(String path) throws IOException {
+		if (path == null) return null;
+		log.info("Loading interval regions from " + path + " ...");
+		HashMap<String, IntervalTree<Integer>> intervals = new HashMap<String, IntervalTree<Integer>>();
+		GZIPInputStream gzipInputStream = null;
+		BufferedReader br;
+		if (path.endsWith(".gz")) {
+			gzipInputStream = new GZIPInputStream(new FileInputStream(path));
+			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+		} else {
+			br = new BufferedReader(new FileReader(path));
+		}
+		String line;
+		while ((line = br.readLine()) != null) {
+			if (line.startsWith("#")) continue;
+			String[] splitLines = line.split("\t");
+			if (splitLines.length < 3) continue;
+			String chr = splitLines[0];
+			int start = Integer.parseInt(splitLines[1]);
+			int end = Integer.parseInt(splitLines[2]);
+			IntervalTree<Integer> tree;
+			if (intervals.containsKey(chr)) {
+				tree = intervals.get(chr);
+			} else {
+				tree = new IntervalTree<Integer>();
+			}
+			tree.put(start, end, 1);
+			intervals.put(chr, tree);
+		}
+		if (path.endsWith(".gz")) {
+			gzipInputStream.close();
+		}
+		br.close();
+		return intervals;
+	}
+
+	private ParsedRow parseLine(String line,
+								HashMap<String, IntervalTree<Integer>> overlapLoc,
+								HashMap<String, IntervalTree<Integer>> excludeLoc) {
+		if (line.startsWith("#")) return null;
+		String[] splitLines = line.split("\t");
+		if (splitLines.length < (features + 4) || splitLines[1].equalsIgnoreCase("start")
+				|| Integer.parseInt(splitLines[4]) >= maxFragLen
+				|| Integer.parseInt(splitLines[4]) <= minFragLen
+				|| Double.parseDouble(splitLines[8]) <= 5) {
+			return null;
+		}
+		String chr = splitLines[0];
+		int start = Integer.parseInt(splitLines[1]);
+		int end = Integer.parseInt(splitLines[2]);
+
+		if (overlapLoc != null) {
+			if (overlapLoc.containsKey(chr)) {
+				if (overlapLoc.get(chr).minOverlapper(start, end) == null) {
+					return null;
+				}
+			} else {
+				return null;
+			}
+		}
+
+		if (excludeLoc != null) {
+			if (excludeLoc.containsKey(chr)) {
+				if (excludeLoc.get(chr).minOverlapper(start, end) != null) {
+					return null;
+				}
+			}
+		}
+
+		int offset = Integer.parseInt(splitLines[9]);
+		if (offset < 0) return null;
+
+		double methyPrior = Double.parseDouble(splitLines[11]);
+		if (Double.isNaN(methyPrior)) return null;
+
+		double fragLen = Double.parseDouble(splitLines[4]);
+		double coverage = Double.parseDouble(splitLines[7]);
+		double distToCenter = fragLen / 2 - Double.parseDouble(splitLines[10]) + 0.5;
+
+		if (Double.compare(methyPrior, 100.0) == 0) {
+			methyPrior -= 0.01;
+		} else if (Double.compare(methyPrior, 0.0) == 0) {
+			methyPrior += 0.01;
+		}
+		methyPrior /= 100;
+		if (Double.isNaN(methyPrior)) return null;
+
+		String loc = chr + ":" + start + ":" + end;
+		String readName = splitLines[3];
+		return new ParsedRow(readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, distToCenter);
+	}
+
+	private AssembledFragment assembleFragment(
+			TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat) {
+		ArrayList<ObservationVector> matrixRow = new ArrayList<ObservationVector>();
+		HashMap<Integer, Pair<Integer, Double>> cpgDistRow = new HashMap<Integer, Pair<Integer, Double>>();
+		ArrayList<String> locRow = new ArrayList<String>();
+		Integer[] offsets = readStat.keySet().toArray(new Integer[readStat.keySet().size()]);
+		boolean omitRead = false;
+
+		for (int i = 0; i < offsets.length; i++) {
+			if (i == 0) {
+				if (offsets[i] < 0) {
+					omitRead = true;
+					continue;
+				}
+				if (offsets[i] > maxCpgDist) {
+					omitRead = true;
+					break;
+				}
+				cpgDistRow.put(i, new Pair<Integer, Double>((int)(offsets[i] / bin), readStat.get(offsets[i]).getRight().getSecond()));
+			} else {
+				int cpgDist = (int)((offsets[i] - offsets[i - 1]) / bin);
+				if (cpgDist < 0) {
+					omitRead = true;
+					break;
+				}
+				if (cpgDist * bin > maxCpgDist) {
+					omitRead = true;
+					break;
+				}
+				cpgDistRow.put(i, new Pair<Integer, Double>(cpgDist, readStat.get(offsets[i]).getRight().getSecond()));
+			}
+			matrixRow.add(readStat.get(offsets[i]).getMiddle());
+			locRow.add(readStat.get(offsets[i]).getRight().getFirst());
+		}
+
+		if (omitRead) return null;
+		if (matrixRow.size() < miniDataPoints || matrixRow.size() > maxCpgs) return null;
+
+		ArrayList<Integer> observedRow = new ArrayList<Integer>();
+		for (int i = 0; i < offsets.length; i++) {
+			if (i == 0 && offsets[0] < 0) continue;
+			if (i > 0 && (int)((offsets[i] - offsets[i - 1])) < 0) continue;
+			if (readStat.get(offsets[i]).getLeft().equalsIgnoreCase("u")) {
+				observedRow.add(0);
+			} else if (readStat.get(offsets[i]).getLeft().equalsIgnoreCase("m")) {
+				observedRow.add(1);
+			}
+		}
+
+		return new AssembledFragment(cpgDistRow, matrixRow, locRow, observedRow);
+	}
+
+	private SummaryStatistics[] collectStats(String matrixFile,
+											 HashMap<String, IntervalTree<Integer>> overlapLoc,
+											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
+		SummaryStatistics[] stats = new SummaryStatistics[3];
+		for (int i = 0; i < 3; i++) {
+			stats[i] = new SummaryStatistics();
+		}
+
+		GZIPInputStream gzipInputStream = null;
+		BufferedReader br;
+		if (matrixFile.endsWith(".gz")) {
+			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile));
+			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+		} else {
+			br = new BufferedReader(new FileReader(matrixFile));
+		}
+
+		String line;
+		while ((line = br.readLine()) != null) {
+			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
+			if (row == null) continue;
+			stats[0].addValue(row.fragLen);
+			stats[1].addValue(row.coverage);
+			stats[2].addValue(row.distToCenter);
+		}
+
+		if (matrixFile.endsWith(".gz")) {
+			gzipInputStream.close();
+		}
+		br.close();
+
+		return stats;
+	}
+
 	/**
 	 * @param args
-	 * @throws Exception 
+	 * @throws Exception
 	 */
 	public static void main(String[] args) throws Exception {
 		FinaleMe cnh = new FinaleMe();
@@ -279,36 +460,46 @@ public class FinaleMe {
 						log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
 					initiate();
 
-					MatrixObj matrixObj = processMatrixFile(inputFile);
-					CpgIndex cpgIndex = null;
-					if (patOutput) {
-						cpgIndex = loadCpgIndex(cpgIndexFile);
-					}
-					LinkedHashMap<String, Integer> chromOrder = null;
-					if (bwOutput) {
-						chromOrder = loadChromOrder(chromSizeFile);
-					}
-					if(aucMode){
-						
-						aucMode(matrixObj, modelFile, outputFile);
-					}else{
-						
-						if(!decodeModeOnly){
-							int miniDataPointsPre = miniDataPoints;
-							
-							if(miniDataPoints < 2){
-								miniDataPoints = 2;
-								MatrixObj matrixObj2 = processMatrixFile(inputFile);
-								trainHmm(matrixObj2, modelFile);
-							}else{
-								trainHmm(matrixObj, modelFile);
-							}
-							miniDataPoints = miniDataPointsPre;
+					if (decodeModeOnly && !aucMode) {
+						// Streaming decode path: bounded memory
+						CpgIndex cpgIndex = null;
+						if (patOutput) {
+							cpgIndex = loadCpgIndex(cpgIndexFile);
 						}
-						decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
+						LinkedHashMap<String, Integer> chromOrder = null;
+						if (bwOutput) {
+							chromOrder = loadChromOrder(chromSizeFile);
+						}
+						decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
+					} else {
+						// Original path: training + decode, aucMode
+						MatrixObj matrixObj = processMatrixFile(inputFile);
+						CpgIndex cpgIndex = null;
+						if (patOutput) {
+							cpgIndex = loadCpgIndex(cpgIndexFile);
+						}
+						LinkedHashMap<String, Integer> chromOrder = null;
+						if (bwOutput) {
+							chromOrder = loadChromOrder(chromSizeFile);
+						}
+						if(aucMode){
+							aucMode(matrixObj, modelFile, outputFile);
+						}else{
+							if(!decodeModeOnly){
+								int miniDataPointsPre = miniDataPoints;
+								if(miniDataPoints < 2){
+									miniDataPoints = 2;
+									MatrixObj matrixObj2 = processMatrixFile(inputFile);
+									trainHmm(matrixObj2, modelFile);
+								}else{
+									trainHmm(matrixObj, modelFile);
+								}
+								miniDataPoints = miniDataPointsPre;
+							}
+							decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
+						}
 					}
-					
-					
+
 					finish();
 					
 
@@ -1000,6 +1191,386 @@ public class FinaleMe {
 		System.out.println("methyState " + methylatedState + "\tLikelihoodWithMethy is:" + likelihoodWithMethy);	
 		return likelihood;
 
+	}
+
+	/**
+	 * Streaming decode-only path: reads the input file twice (once for stats, once for
+	 * streaming decode) so that memory stays bounded regardless of coverage depth.
+	 */
+	private void decodeOnlyStreaming(String inputFile, String modelFile, String outputFile,
+									CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception {
+		System.out.println("\nStreaming decode-only mode ...\n");
+
+		// Load region/exclude intervals
+		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
+		HashMap<String, IntervalTree<Integer>> excludeLoc = loadIntervalFile(exclude);
+
+		// Phase 1: Collect stats for z-score normalization
+		log.info("Phase 1: Collecting feature statistics ...");
+		SummaryStatistics[] stats = collectStats(inputFile, overlapLoc, excludeLoc);
+		for (int i = 0; i < 3; i++) {
+			log.info("Feature " + i + ": " + stats[i]);
+		}
+
+		// Load HMM model
+		BayesianNhmmV5<ObservationVector> hmm = loadHmmModel(modelFile);
+		hmm.setBayesianFactor(bayesianFactor);
+		hmm.setMethyState(this.methylatedState);
+		// When cpgNumClip < 0 in decode-only mode, use maxCpgs as safe upper bound
+		hmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
+		hmm.setMinCpgNum(1);
+
+		// Phase 2: Streaming decode
+		log.info("Phase 2: Streaming decode ...");
+
+		// Accumulators (persist across batches)
+		HashMap<String, Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>> methySummary =
+			new HashMap<String, Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>>();
+		HashMap<String, Integer> patRecords = null;
+		long skippedFragments = 0;
+		if (patOutput && cpgIndex != null) {
+			patRecords = new HashMap<String, Integer>();
+		}
+
+		long count = 0;
+		long countCorrect = 0;
+		long countMethy = 0;
+		long countMethyCorrect = 0;
+		long countUnmethy = 0;
+		long countUnmethyCorrect = 0;
+		double likelihood = 0;
+		double likelihoodWithMethy = 0;
+
+		// Thread pool with bounded queue for backpressure
+		int nThreads = resolveThreadCount();
+		ExecutorService executor = new ThreadPoolExecutor(
+			nThreads, nThreads, 0L, TimeUnit.MILLISECONDS,
+			new ArrayBlockingQueue<Runnable>(nThreads * 2),
+			new ThreadPoolExecutor.CallerRunsPolicy());
+
+		// Batch processing state
+		final int BATCH_SIZE = 500000;
+		HashMap<String, TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>> currentBatch =
+			new HashMap<String, TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>>();
+		int batchReadCount = 0;
+		String lastReadName = null;
+
+		// Open input for second pass
+		GZIPInputStream gzipInputStream = null;
+		BufferedReader br;
+		if (inputFile.endsWith(".gz")) {
+			gzipInputStream = new GZIPInputStream(new FileInputStream(inputFile));
+			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+		} else {
+			br = new BufferedReader(new FileReader(inputFile));
+		}
+
+		String line;
+		while ((line = br.readLine()) != null) {
+			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
+			if (row == null) continue;
+
+			// Apply covOutlier filter
+			if (covOutlier > 0 && ((row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation() > covOutlier ||
+					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation() > covOutlier ||
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation() > covOutlier)) {
+				continue;
+			}
+
+			// Z-score normalize
+			double[] value;
+			if (lowCoverage) {
+				value = new double[]{
+					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
+				};
+			} else {
+				value = new double[]{
+					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
+					(row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation(),
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
+				};
+			}
+			ObservationVector vector = new ObservationVector(value);
+			points++;
+
+			// Track new read names for batch counting
+			if (!row.readName.equals(lastReadName) && lastReadName != null) {
+				batchReadCount++;
+			}
+			lastReadName = row.readName;
+
+			// Group by read name
+			TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat = currentBatch.get(row.readName);
+			if (readStat == null) {
+				readStat = new TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>();
+				currentBatch.put(row.readName, readStat);
+			}
+			if (!readStat.containsKey(row.offset)) {
+				readStat.put(row.offset, Triple.of(row.methyStat, vector, new Pair<String, Double>(row.loc, row.methyPrior)));
+			}
+
+			// Flush batch when threshold reached
+			if (batchReadCount >= BATCH_SIZE) {
+				// Keep the last read (may have more lines coming)
+				TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> lastReadStat = currentBatch.remove(lastReadName);
+
+				// Process and decode all complete reads in this batch
+				long[] batchCounters = decodeBatch(currentBatch, hmm, executor, cpgIndex, methySummary, patRecords);
+				count += batchCounters[0];
+				countCorrect += batchCounters[1];
+				countMethy += batchCounters[2];
+				countMethyCorrect += batchCounters[3];
+				countUnmethy += batchCounters[4];
+				countUnmethyCorrect += batchCounters[5];
+				likelihood += Double.longBitsToDouble(batchCounters[6]);
+				likelihoodWithMethy += Double.longBitsToDouble(batchCounters[7]);
+				skippedFragments += batchCounters[8];
+
+				currentBatch.clear();
+				if (lastReadStat != null) {
+					currentBatch.put(lastReadName, lastReadStat);
+				}
+				batchReadCount = 0;
+			}
+		}
+
+		// Process final batch
+		if (!currentBatch.isEmpty()) {
+			long[] batchCounters = decodeBatch(currentBatch, hmm, executor, cpgIndex, methySummary, patRecords);
+			count += batchCounters[0];
+			countCorrect += batchCounters[1];
+			countMethy += batchCounters[2];
+			countMethyCorrect += batchCounters[3];
+			countUnmethy += batchCounters[4];
+			countUnmethyCorrect += batchCounters[5];
+			likelihood += Double.longBitsToDouble(batchCounters[6]);
+			likelihoodWithMethy += Double.longBitsToDouble(batchCounters[7]);
+			skippedFragments += batchCounters[8];
+		}
+
+		if (inputFile.endsWith(".gz")) {
+			gzipInputStream.close();
+		}
+		br.close();
+
+		executor.shutdown();
+		executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+
+		log.info("Number of point in total is loaded : " + points);
+
+		// Phase 3: Write outputs
+		FileOutputStream output = new FileOutputStream(outputFile);
+		OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
+
+		writer.write("#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n");
+
+		double[][] predData = new double[methySummary.size()][2];
+		int idx = 0;
+		for (String loc : methySummary.keySet()) {
+			int methyPred = methySummary.get(loc).getFirst().getFirst();
+			int totalPred = methySummary.get(loc).getFirst().getSecond();
+			int methyObs = methySummary.get(loc).getSecond().getFirst();
+			int totalObs = methySummary.get(loc).getSecond().getSecond();
+			String[] locTmp = loc.split(":");
+			String chr = locTmp[0];
+			int start = Integer.parseInt(locTmp[1]);
+			int end = Integer.parseInt(locTmp[2]);
+			double pred = 100 * (double) methyPred / (double) totalPred;
+			double obs = 100 * (double) methyObs / (double) totalObs;
+			writer.write(chr + "\t" + start + "\t" + end + "\t" + pred + "\t" + methyPred + "\t" + totalPred +
+					"\t" + obs + "\t" + methyObs + "\t" + totalObs + "\n");
+			predData[idx][0] = pred;
+			predData[idx][1] = obs;
+			idx++;
+		}
+		writer.close();
+		output.close();
+
+		if (patRecords != null) {
+			String patFile = derivePatFile(outputFile);
+			ArrayList<PatRecord> sortedPatRecords = toSortedPatRecords(patRecords);
+			writePatOutput(patFile, sortedPatRecords);
+			writeBetaOutput(deriveBetaFile(patFile), cpgIndex, sortedPatRecords);
+			if (skippedFragments > 0) {
+				log.info("Skipped " + skippedFragments + " fragments for .pat/.beta output due to missing/non-consecutive CpG index mapping.");
+			}
+		}
+		if (bwOutput && chromOrder != null) {
+			writeDecodeBigWigOutputs(methySummary, outputFile, chromOrder);
+		}
+
+		PearsonsCorrelation pearson = new PearsonsCorrelation(predData);
+		System.out.println(pearson.getCorrelationMatrix());
+		System.out.println(pearson.getCorrelationPValues());
+		System.out.println("counted point in total: " + count + "\tCorrect predicted:" + countCorrect + "\tPerc:" + 100 * (double) countCorrect / (double) count + "%");
+		System.out.println("counted point in methy: " + countMethy + "\tCorrect predicted:" + countMethyCorrect + "\tPerc:" + 100 * (double) countMethyCorrect / (double) countMethy + "%");
+		System.out.println("counted point in unmethy: " + countUnmethy + "\tCorrect predicted:" + countUnmethyCorrect + "\tPerc:" + 100 * (double) countUnmethyCorrect / (double) countUnmethy + "%");
+		System.out.println("methyState " + methylatedState + "\tLikelihood is:" + likelihood);
+		System.out.println("methyState " + methylatedState + "\tLikelihoodWithMethy is:" + likelihoodWithMethy);
+	}
+
+	/**
+	 * Decode one batch of reads: assemble fragments, run Viterbi in parallel,
+	 * accumulate results into methySummary and patRecords.
+	 * Returns counters: [count, countCorrect, countMethy, countMethyCorrect,
+	 *                    countUnmethy, countUnmethyCorrect,
+	 *                    likelihoodBits, likelihoodWithMethyBits, skippedFragments]
+	 */
+	private long[] decodeBatch(
+			HashMap<String, TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>> batch,
+			BayesianNhmmV5<ObservationVector> hmm,
+			ExecutorService executor,
+			CpgIndex cpgIndex,
+			HashMap<String, Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>> methySummary,
+			HashMap<String, Integer> patRecords) throws Exception {
+
+		// Assemble fragments
+		ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> fragments =
+			new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
+		ArrayList<ArrayList<String>> fragmentLocs = new ArrayList<ArrayList<String>>();
+		ArrayList<ArrayList<Integer>> fragmentObserved = new ArrayList<ArrayList<Integer>>();
+
+		for (TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat : batch.values()) {
+			AssembledFragment frag = assembleFragment(readStat);
+			if (frag == null) continue;
+			fragments.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(
+				frag.cpgDistRow, (List<ObservationVector>) (List<?>) frag.matrixRow));
+			fragmentLocs.add(frag.locRow);
+			fragmentObserved.add(frag.observedRow);
+		}
+
+		// Submit Viterbi tasks
+		List<Future<Object[]>> futures = new ArrayList<Future<Object[]>>(fragments.size());
+		for (int j = 0; j < fragments.size(); j++) {
+			final int idx = j;
+			final Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> seq = fragments.get(j);
+			futures.add(executor.submit(new Callable<Object[]>() {
+				@Override
+				public Object[] call() {
+					ViterbiBayesianNhmmV5Calculator vb = new ViterbiBayesianNhmmV5Calculator(seq, hmm, methylatedState, decodeP);
+					int[] hiddenState = vb.stateSequence();
+					double prob = vb.lnProbability();
+					double probWithMethy = vb.lnProbability(true);
+					return new Object[]{hiddenState, prob, probWithMethy, idx};
+				}
+			}));
+		}
+
+		// Aggregate results
+		long batchCount = 0, batchCorrect = 0, batchMethy = 0, batchMethyCorrect = 0;
+		long batchUnmethy = 0, batchUnmethyCorrect = 0, batchSkipped = 0;
+		double batchLikelihood = 0, batchLikelihoodWithMethy = 0;
+
+		for (Future<Object[]> future : futures) {
+			Object[] result = future.get();
+			int[] hiddenState = (int[]) result[0];
+			double prob = (Double) result[1];
+			double probWithMethy = (Double) result[2];
+			int j = (Integer) result[3];
+
+			if (!Double.isNaN(prob) && !Double.isInfinite(prob)) {
+				batchLikelihood += prob / hiddenState.length;
+			}
+			if (!Double.isNaN(probWithMethy) && !Double.isInfinite(probWithMethy)) {
+				batchLikelihoodWithMethy += probWithMethy / hiddenState.length;
+			}
+
+			Integer[] observedState = fragmentObserved.get(j).toArray(new Integer[fragmentObserved.get(j).size()]);
+			ArrayList<String> locRow = fragmentLocs.get(j);
+
+			if (hiddenState.length != observedState.length) {
+				throw new IllegalArgumentException("HiddenState Length does not match with observed state length");
+			}
+			for (int i = 0; i < hiddenState.length; i++) {
+				String loc = locRow.get(i);
+
+				int methyPredict = 0;
+				int unmethyPredict = 0;
+				if (hiddenState[i] == methylatedState) {
+					methyPredict++;
+				} else if (hiddenState[i] == (1 - methylatedState)) {
+					unmethyPredict++;
+				}
+
+				if (methySummary.containsKey(loc)) {
+					Pair<Pair<Integer,Integer>, Pair<Integer,Integer>> tmp = methySummary.get(loc);
+					tmp = new Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>(
+						new Pair<Integer,Integer>(tmp.getFirst().getFirst() + methyPredict, tmp.getFirst().getSecond() + (methyPredict + unmethyPredict)),
+						new Pair<Integer,Integer>(tmp.getSecond().getFirst() + observedState[i], tmp.getSecond().getSecond() + 1));
+					methySummary.put(loc, tmp);
+				} else {
+					methySummary.put(loc, new Pair<Pair<Integer,Integer>, Pair<Integer,Integer>>(
+						new Pair<Integer,Integer>(methyPredict, (methyPredict + unmethyPredict)),
+						new Pair<Integer,Integer>(observedState[i], 1)));
+				}
+
+				if (observedState[i] == 0) {
+					batchUnmethy++;
+					if (hiddenState[i] == (1 - methylatedState)) {
+						batchCorrect++;
+						batchUnmethyCorrect++;
+					}
+				} else {
+					batchMethy++;
+					if (hiddenState[i] == methylatedState) {
+						batchCorrect++;
+						batchMethyCorrect++;
+					}
+				}
+				batchCount++;
+			}
+
+			if (patRecords != null) {
+				if (locRow.size() != hiddenState.length) {
+					batchSkipped++;
+					continue;
+				}
+				String fragmentChr = null;
+				int startCpgIndex = -1;
+				int previousCpgIndex = -1;
+				boolean contiguous = true;
+				StringBuilder pattern = new StringBuilder(hiddenState.length);
+				for (int i = 0; i < hiddenState.length; i++) {
+					LocTuple locTuple = parseLoc(locRow.get(i));
+					if (locTuple == null) {
+						contiguous = false;
+						break;
+					}
+					int globalIndex = cpgIndex.getGlobalIndex(locTuple.chr, locTuple.start);
+					if (globalIndex < 0) {
+						contiguous = false;
+						break;
+					}
+					if (i == 0) {
+						fragmentChr = locTuple.chr;
+						startCpgIndex = globalIndex;
+					} else {
+						if (!fragmentChr.equals(locTuple.chr) || globalIndex != previousCpgIndex + 1) {
+							contiguous = false;
+							break;
+						}
+					}
+					pattern.append(hiddenState[i] == methylatedState ? 'C' : 'T');
+					previousCpgIndex = globalIndex;
+				}
+				if (contiguous && pattern.length() > 0) {
+					String key = fragmentChr + "\t" + startCpgIndex + "\t" + pattern.toString();
+					Integer countKey = patRecords.get(key);
+					patRecords.put(key, countKey == null ? 1 : countKey + 1);
+				} else {
+					batchSkipped++;
+				}
+			}
+		}
+
+		return new long[]{
+			batchCount, batchCorrect, batchMethy, batchMethyCorrect,
+			batchUnmethy, batchUnmethyCorrect,
+			Double.doubleToLongBits(batchLikelihood),
+			Double.doubleToLongBits(batchLikelihoodWithMethy),
+			batchSkipped
+		};
 	}
 
 	private CpgIndex loadCpgIndex(String cpgIndexFile) throws IOException {
@@ -1810,6 +2381,46 @@ public class FinaleMe {
 				return -1;
 			}
 			return offset + localIndex + 1;
+		}
+	}
+
+	private static class ParsedRow {
+		final String readName;
+		final String methyStat;
+		final String loc;
+		final int offset;
+		final double methyPrior;
+		final double fragLen;
+		final double coverage;
+		final double distToCenter;
+
+		ParsedRow(String readName, String methyStat, String loc, int offset,
+				  double methyPrior, double fragLen, double coverage, double distToCenter) {
+			this.readName = readName;
+			this.methyStat = methyStat;
+			this.loc = loc;
+			this.offset = offset;
+			this.methyPrior = methyPrior;
+			this.fragLen = fragLen;
+			this.coverage = coverage;
+			this.distToCenter = distToCenter;
+		}
+	}
+
+	private static class AssembledFragment {
+		final HashMap<Integer, Pair<Integer, Double>> cpgDistRow;
+		final ArrayList<ObservationVector> matrixRow;
+		final ArrayList<String> locRow;
+		final ArrayList<Integer> observedRow;
+
+		AssembledFragment(HashMap<Integer, Pair<Integer, Double>> cpgDistRow,
+						  ArrayList<ObservationVector> matrixRow,
+						  ArrayList<String> locRow,
+						  ArrayList<Integer> observedRow) {
+			this.cpgDistRow = cpgDistRow;
+			this.matrixRow = matrixRow;
+			this.locRow = locRow;
+			this.observedRow = observedRow;
 		}
 	}
 
