@@ -2,3 +2,5 @@
 .DS_Store
 target
 .mvn/repository
+.claude
+data/

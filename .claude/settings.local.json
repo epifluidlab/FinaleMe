@@ -22,7 +22,14 @@
       "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools --version)",
       "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools init:*)",
       "Bash(/Users/yaping/Documents/workspace/code/wgbs_tools/wgbstools genome:*)",
-      "Bash(JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home mvn -f /Users/yaping/Documents/workspace/code/FinaleMe/pom.xml test -q)"
+      "Bash(JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home mvn -f /Users/yaping/Documents/workspace/code/FinaleMe/pom.xml test -q)",
+      "Bash(zcat /Users/yaping/Dropbox/Freenome/public_data/CG_motif.hg19.split.chr22.bed.gz)",
+      "Bash(git -C /Users/yaping/Documents/workspace/code/FinaleMe diff --stat)",
+      "Bash(git -C /Users/yaping/Documents/workspace/code/FinaleMe log --oneline -3)",
+      "Bash(git -C /Users/yaping/Documents/workspace/code/FinaleMe diff -- src/)",
+      "Bash(git -C /Users/yaping/Documents/workspace/code/FinaleMe diff -- README.md)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)"
     ]
   }
 }

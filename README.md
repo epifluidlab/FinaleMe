@@ -13,7 +13,7 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 
 ### System requirements:
 
-- Java 21 or later (tested with Oracle JDK 21 on Mac OSX and OpenJDK 21 on Linux)
+- Java 21 or later — download Oracle JDK 21 from https://www.oracle.com/java/technologies/downloads/#java21 (select your platform: macOS arm64/x64, Linux x64/aarch64). On HPC clusters without root access, use the tarball and set `JAVA_HOME` and `PATH`.
 - Apache Maven 3.8+ (only if you need to compile the source code from scratch)
 - Perl (tested in v5.26.3), bedGraphToBigWig from UCSC tools (tested in v4), bedtools (tested in v2.29.2). (only if you need to convert predicted methylation level to big wig files)
 - R (tested in v4.2.1) and quadprog package. (only if you need to perform tissues-of-origin analysis)
@@ -29,6 +29,47 @@ This produces `target/FinaleMe-0.60-jar-with-dependencies.jar`, which is self-co
 
 Or use the precompiled `target/FinaleMe-0.60-jar-with-dependencies.jar` (from Releases/build) directly for FinaleMe Steps 1-3.
 
+### Quick setup of reference data
+
+Use the setup helper to build FinaleMe and download all required reference files for both hg19 and hg38:
+
+```bash
+./scripts/setup_references.sh
+```
+
+By default files are written to `data/` under this repo. To use a different location:
+
+```bash
+export FINALEME_DATA_DIR=/path/to/finaleme_data
+./scripts/setup_references.sh
+```
+
+Run individual setup stages:
+
+```bash
+./scripts/setup_references.sh deps
+./scripts/setup_references.sh build
+./scripts/setup_references.sh genomes
+./scripts/setup_references.sh chromsizes
+./scripts/setup_references.sh cpg
+./scripts/setup_references.sh darkregions
+./scripts/setup_references.sh methylation
+./scripts/setup_references.sh summary
+```
+
+Reference files downloaded by the setup script:
+
+| File | Purpose | Used in |
+|------|---------|---------|
+| `hg19.2bit`, `hg38.2bit` | Reference genome in UCSC 2bit format | Step 1 |
+| `hg19.chrom.sizes`, `hg38.chrom.sizes` | Chromosome size files for bigWig conversion | Step 3 (`-bwOutput`) |
+| `CG_motif.hg19.common_chr.pos_only.bedgraph.gz`, `CG_motif_seqkit.pos_only.hg38.bedgraph.gz` | CpG motif coordinates | Step 1 |
+| `CpG_index.hg19.bed.gz`, `CpG_index.hg38.bed.gz` (+ `.csi`) | CpG index for pat/beta outputs | Step 3 (`-patOutput`) |
+| `wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed`, `hg38-blacklist.v2.bed` | Dark/blacklist regions | Step 1 filtering |
+| `wgbs_buffyCoat_jensen2015GB.methy.hg19.bw`, `wgbs_buffyCoat_jensen2015GB.methy.hg38.bw` | Methylation prior tracks | Step 1 (`-valueWigs`) |
+
+Java recommendation: Oracle JDK 21 from https://www.oracle.com/java/technologies/downloads/#java21. Choose the matching platform package. On clusters without root access, download the tarball and set `JAVA_HOME` and `PATH`.
+
 ### Running tests:
 
     mvn test
@@ -37,10 +78,12 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 
 ### Other required data:
 
-- methylation prior file in standard big wig format (can use wgbs_buffyCoat_jensen2015GB.methy.hg19.bw file directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7779198.svg)](https://doi.org/10.5281/zenodo.7779198)). Or you can generate your own by using WGBS data in buffycoat from healthy individuals (our data is from Jensen et al. 2015 Genome Biology paper)
-- bed files to mask the Dark regions in the genome (can use wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed files directly from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7779198.svg)](https://doi.org/10.5281/zenodo.7779198)). Or you can download these dark region files for other reference genome.
+> **Tip:** Run `./scripts/setup_references.sh` to download all files below automatically for both hg19 and hg38. See [Quick setup](#quick-setup-of-reference-data).
+
+- methylation prior file in standard big wig format (use `wgbs_buffyCoat_jensen2015GB.methy.hg19.bw` and `wgbs_buffyCoat_jensen2015GB.methy.hg38.bw` from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19392525.svg)](https://doi.org/10.5281/zenodo.19392525)). Or generate your own from WGBS data in healthy buffy coat (our data source: Jensen et al. 2015 Genome Biology).
+- bed files to mask dark regions in the genome (use `wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed` and `hg38-blacklist.v2.bed` from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19392525.svg)](https://doi.org/10.5281/zenodo.19392525)). Or provide your own dark region files for other references.
 - Chromosome sizes: can be obtained from the FASTA file of the reference genome: `samtools faidx input.fa`. See this [example](https://github.com/epifluidlab/cragr/blob/3d419a49/inst/extdata/human_g1k_v37.chrom.sizes).
-- CG_motif.bedgraph: bedgraph file with CpG coordinates in the reference genome (**forward strand only**, one entry per CpG dinucleotide). Each CpG dinucleotide (5'-CG-3') is listed once at the position of the C on the forward strand. For hg19, this yields ~28M positions. Both forward- and reverse-strand reads are captured at the same CpG position during feature extraction, so no fragments are lost.
+- CG_motif.bedgraph: bedgraph file with CpG coordinates in the reference genome (**forward strand only**, one entry per CpG dinucleotide). Each CpG dinucleotide (5'-CG-3') is listed once at the position of the C on the forward strand. For hg19, this yields ~28M positions. Both forward- and reverse-strand reads are captured at the same CpG position during feature extraction, so no fragments are lost. Use `CG_motif.hg19.common_chr.pos_only.bedgraph.gz` (hg19) and `CG_motif_seqkit.pos_only.hg38.bedgraph.gz` (hg38) from Zenodo.
 
   To generate this file from a reference FASTA:
   ```
@@ -55,9 +98,9 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
               print(f'{chrom}\t{i}\t{i+1}\t1')
   " > CG_motif.hg19.bedgraph
   ```
-  Or download the pre-built file from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719).
+  Or download pre-built files from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19392525.svg)](https://doi.org/10.5281/zenodo.19392525).
 
-- hg19.2bit: binary version of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fasta files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
+- hg19.2bit / hg38.2bit: binary version of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/) or converted from .fasta files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 ### Small test input data
 - bam files from chr22 in healthy individuals can be downloaded here [https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1](https://zenodo.org/records/6914806/files/BH01.chr22.bam?download=1)
@@ -83,7 +126,7 @@ This runs 13 JUnit 5 unit tests covering the HMM core: model properties, forward
 
 See [PLAN.md](PLAN.md) for full details on all optimizations.
 
-> **Note:** Models trained with v0.58 or earlier are not compatible with v0.60 due to the internal data structure change from `TreeMap<Integer, Double[]>` to primitive arrays. You will need to retrain models with v0.60.
+> **Note:** Models trained with v0.59 or earlier are not compatible with v0.60 due to the internal data structure change from `TreeMap<Integer, Double[]>` to primitive arrays. You will need to retrain models with v0.60.
 
 ## Getting started
 
@@ -142,12 +185,12 @@ Feature extraction is now parallelized by 5Mb genomic bins and processed with a 
 Runtime progress is logged as CpGs processed out of total with percent completion.
 You can set thread count explicitly with `-t` (for example, `-t 8`).
 
-* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with forward-strand CpG coordinates (see "Other required data" above for how to generate it). It can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
-* hg19.bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fastq files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
+* CG_motif.hg19.common_chr.pos_only.bedgraph is the bedgraph file with forward-strand CpG coordinates (see "Other required data" above for how to generate it). It can be downloaded here [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19392525.svg)](https://doi.org/10.5281/zenodo.19392525)
+* hg19.2bit is the binary input of reference genome, which can be downloaded from [UCSC genome browser](http://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/) or converted from .fasta files by [faToTwoBit](https://github.com/ENCODE-DCC/kentUtils)
 
 #### Step 2: train the model 
 ```
-java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
+java -Xmx40G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
   CpgFeatureMatrixBuilder.hg19.details.bed.gz \
@@ -160,7 +203,7 @@ Set FinaleMe thread count with `-t` (for example, `-t 8`).
 
 #### Step 3: decode and make the prediction of CpG methylation level
 ```
-java -Xmx100G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
+java -Xmx20G -cp "target/FinaleMe-0.60-jar-with-dependencies.jar" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   test.FinaleMe.mincg7.model \
   CpgFeatureMatrixBuilder.hg19.details.bed.gz \
@@ -190,15 +233,15 @@ If chromosome naming differs between decode output and your chrom size file, use
 To emit UXM-compatible per-fragment outputs for deconvolution (`.pat.gz` + `.beta`), add:
 ```
   -patOutput \
-  -cpgIndexFile /path/to/wgbs_tools/references/hg19/CpG.bed.gz
+  -cpgIndexFile data/CpG_index.hg19.bed.gz
 ```
-**Important**: Use wgbstools' `CpG.bed.gz` as the CpG index file (not `CG_motif.bedgraph`) to ensure CpG indices match the UXM/wgbstools indexing system. The file can be found at `wgbs_tools/references/hg19/CpG.bed.gz` after running `wgbstools init_genome --name hg19`.
+For hg38, use `-cpgIndexFile data/CpG_index.hg38.bed.gz`.
+These pre-built CpG index files are downloaded by `./scripts/setup_references.sh cpg` and are equivalent to the `wgbs_tools/references/*/CpG.bed.gz` files generated by `wgbstools init_genome`.
 
 This writes:
 - `*.pat.gz`: bgzip-compressed, tab-separated `chr`, `global_cpg_index`, `C/T pattern`, `count` — compatible with [UXM_deconv](https://github.com/nloyfer/UXM_deconv) and [wgbstools](https://github.com/nloyfer/wgbs_tools)
 - `*.beta`: binary uint8 pairs `(methylated_count, total_count)` for each CpG index row
 
-**Note on CpG strand handling**: The CG_motif bedgraph used in Step 1 lists each CpG dinucleotide once at the forward-strand C position (~28M sites for hg19). During feature extraction, reads from **both** forward and reverse strands are captured at the same CpG position — the reverse-strand read's G position (X+1) maps to the same CpG dinucleotide as the forward-strand C position (X). Therefore, the pat.gz output's ~28M CpG index space covers all fragment observations without losing any data. This matches the wgbstools/UXM CpG indexing convention, which also uses one index per CpG dinucleotide.
 
 Then run UXM deconvolution directly:
 ```
@@ -227,7 +270,6 @@ This approach uses the per-fragment methylation patterns from the `.pat.gz` file
    git clone https://github.com/nloyfer/wgbs_tools.git
    cd wgbs_tools
    python setup.py
-   wgbstools init_genome --name hg19
    ```
 
 2. Install [UXM_deconv](https://github.com/nloyfer/UXM_deconv):
@@ -236,6 +278,7 @@ This approach uses the per-fragment methylation patterns from the `.pat.gz` file
    cd UXM_deconv
    pip install -r requirements.txt
    ```
+
 
 **Run deconvolution:**
 ```
@@ -260,7 +303,7 @@ perl -e '$cmd=`cat cfdna.methy_summary.cmd.txt`;chomp($cmd); `java -Xmx10G -cp "
 ```
 
 * R script is available within src/R/TissueOfOriginExampleScript.R
-* The reference methylomes used in the paper can be downloaded here: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14013719.svg)](https://doi.org/10.5281/zenodo.14013719)
+* The reference methylomes used in the paper can be downloaded here: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19392525.svg)](https://doi.org/10.5281/zenodo.19392525)
 
 ## License
 
