@@ -953,7 +953,9 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											int fragLen = Math.abs(r.getInferredInsertSize());
 											if(fragLen > maxFragLen) continue;
 											int cpgOffset = CcInferenceUtils.getFragOffsetFromReadsOffset(r, offSet);
+											if(cpgOffset < 0 || cpgOffset >= fragLen) continue;
 											int distToFragEnd = CcInferenceUtils.getDistFragEndFromReadsOffset(r, offSet);
+											if(distToFragEnd < 0) continue;
 											if(distToFragEnd > maxDistToFragEnd) continue;
 
 											char fragStrand = negStrand ? '-' : '+';

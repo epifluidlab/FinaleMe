@@ -421,6 +421,28 @@ public class FinaleMe {
 		return stats;
 	}
 
+	private void logFeatureStats(SummaryStatistics[] stats) {
+		final String[] featureNames = new String[]{"FragLen", "Norm_Frag_cov", "DistToCenter"};
+		for (int i = 0; i < stats.length; i++) {
+			String featureName = i < featureNames.length ? featureNames[i] : ("Feature" + i);
+			logFeatureStat(i, featureName, stats[i]);
+		}
+	}
+
+	private void logFeatureStat(int index, String featureName, SummaryStatistics stat) {
+		long n = stat.getN();
+		if (n == 0) {
+			log.info("Feature " + index + " (" + featureName + "): n=0 (no usable points after filtering)");
+			return;
+		}
+		String sd = n > 1 ? Double.toString(stat.getStandardDeviation()) : "NaN";
+		log.info("Feature " + index + " (" + featureName + "): n=" + n
+				+ ", min=" + stat.getMin()
+				+ ", max=" + stat.getMax()
+				+ ", mean=" + stat.getMean()
+				+ ", sd=" + sd);
+	}
+
 	/**
 	 * @param args
 	 * @throws Exception
@@ -684,9 +706,7 @@ public class FinaleMe {
 			}
 			br.close();
 
-		for(int i = 0; i < 3; i++){
-			log.info("Feature " + i + ": " + stats[i]);
-		}
+		logFeatureStats(stats);
 
 		// Second phase: iterate in-memory raw rows, apply z-score normalization
 		for(Object[] row : rawRows){
@@ -743,6 +763,7 @@ public class FinaleMe {
 			TreeMap<Integer, Long[]> pi = new TreeMap<Integer, Long[]>();
 			TreeMap<Integer, Long[]> aij = new TreeMap<Integer, Long[]>();
 			
+			double observedMaxCpgNum = 0.0;
 			for(String key : matrixProcess.keySet()){
 				TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat = matrixProcess.get(key);
 				
@@ -893,12 +914,12 @@ public class FinaleMe {
 					}
 					matrixObserved.add(matrixRowObserved);
 				}
-				if(cpgNumClip < 0){
-					double cpgDense = (double)matrixRow.size();
-					if(cpgDense>this.maxCpgNum){
-						this.maxCpgNum = cpgDense;
-					}
-					
+				double cpgDense = (double)matrixRow.size();
+				if(cpgDense > observedMaxCpgNum){
+					observedMaxCpgNum = cpgDense;
+				}
+				if(cpgNumClip < 0 && cpgDense > this.maxCpgNum){
+					this.maxCpgNum = cpgDense;
 				}
 			}
 			matrixProcess.clear();
@@ -923,7 +944,7 @@ public class FinaleMe {
 				aijScale.put(cpgDist, aiScaleTmp);
 				
 			}
-			log.info("maximum number of cpg in fragment is: " + this.maxCpgNum);
+			log.info("maximum number of cpg in fragment is: " + observedMaxCpgNum);
 		log.info("The number of fragments used for training: " + matrix.size());
 		return new MatrixObj(matrix, matrixU, matrixM, piScale, aijScale, matrixObserved, cpgDistFreq);
 	}
@@ -1219,9 +1240,7 @@ public class FinaleMe {
 		// Phase 1: Collect stats for z-score normalization
 		log.info("Phase 1: Collecting feature statistics ...");
 		SummaryStatistics[] stats = collectStats(inputFile, overlapLoc, excludeLoc);
-		for (int i = 0; i < 3; i++) {
-			log.info("Feature " + i + ": " + stats[i]);
-		}
+		logFeatureStats(stats);
 
 		// Load HMM model
 		BayesianNhmmV5<ObservationVector> hmm = loadHmmModel(modelFile);

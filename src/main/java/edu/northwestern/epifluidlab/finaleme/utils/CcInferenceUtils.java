@@ -1204,20 +1204,15 @@ public class CcInferenceUtils implements Serializable{
 	}
 	
 	public static int getDistFragEndFromReadsOffset(SAMRecord r, int readOffset){
-		int rStartPos = r.getAlignmentStart();
-		int mateStartPos = r.getMateAlignmentStart();
-
-		boolean leftEndInFragment = false;
-		if(rStartPos < mateStartPos){
-			leftEndInFragment = true;
+		int fragLen = Math.abs(r.getInferredInsertSize());
+		if(fragLen <= 0){
+			return -1;
 		}
-
-		if(leftEndInFragment){
-			return readOffset;
-		}else{
-			//System.err.println(leftEndInFragment + "\t" + (r.getReadLength()-readOffset));
-			return r.getReadLength()-readOffset;
+		int fragOffset = getFragOffsetFromReadsOffset(r, readOffset);
+		if(fragOffset < 0 || fragOffset >= fragLen){
+			return -1;
 		}
+		return Math.min(fragOffset, (fragLen - 1) - fragOffset);
 		
 	}
 	

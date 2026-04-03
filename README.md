@@ -30,9 +30,9 @@ Run one command to build FinaleMe and download required hg19/hg38 reference file
 ./scripts/setup_references.sh
 ```
 
-## Small test dataset
+## Test dataset
 
-Download a chr22 BAM test file:
+Download a chr22 BAM test file (a ~100X cfDNA WGS data from Snyder et al. 2016 Cell paper):
 
 ```bash
 mkdir -p test results
@@ -67,6 +67,7 @@ java -Xmx20G -cp "$JAR" \
 ```
 
 Output: `results/BH01.cpg_features.hg19.bed.gz`
+It will cost ~25 min for the test dataset.
 
 ### Step 2: Train HMM model
 
@@ -91,7 +92,7 @@ java -Xmx20G -cp "$JAR" \
   results/BH01.decode.prediction.bed.gz \
   -decodeModeOnly \
   -t 4 \
-  -bwOutput \s
+  -bwOutput \
   -chromSizeFile data/hg19.chrom.sizes \
   -patOutput \
   -cpgIndexFile data/CpG_index.hg19.bed.gz
