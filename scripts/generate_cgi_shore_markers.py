@@ -482,9 +482,34 @@ def stage3_find_markers(args, blocks_path):
     eprint(f'  Expected cell types: {len(expected_groups)}')
     eprint(f'  Groups file samples: {len(groups_df)}')
 
+    # CRITICAL FIX: wgbstools find_markers expects the groups file 'name'
+    # column to contain sample prefixes WITHOUT file extensions. It appends
+    # '.beta' itself when matching (via match_prefix_to_bin). If the groups
+    # file has names like "sample.pat.gz", it will look for "sample.pat.gz.beta"
+    # which never matches, causing a silent failure with 0 markers.
+    name_col = 'name' if 'name' in groups_df.columns else groups_df.columns[0]
+    needs_fix = False
+    for ext in ['.pat.gz', '.beta', '.pat']:
+        if groups_df[name_col].str.endswith(ext).any():
+            needs_fix = True
+            eprint(f'  WARNING: Groups file names contain "{ext}" extension.')
+            eprint(f'    wgbstools find_markers expects names WITHOUT extensions.')
+            break
+
+    if needs_fix:
+        eprint(f'  Auto-fixing: stripping extensions from groups file names...')
+        fixed_groups_path = op.join(args.out_dir, 'groups_fixed.csv')
+        fixed_df = groups_df.copy()
+        # Strip common extensions: .pat.gz, .beta, .pat
+        fixed_df[name_col] = fixed_df[name_col].str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
+        fixed_df.to_csv(fixed_groups_path, index=False)
+        args.groups = fixed_groups_path
+        eprint(f'  Fixed groups file written: {fixed_groups_path}')
+        eprint(f'  Sample names now: {fixed_df[name_col].iloc[0]}')
+        groups_df = fixed_df
+
     # Verify group names match beta file names
-    group_names = set(groups_df['name'] if 'name' in groups_df.columns
-                      else groups_df.iloc[:, 0])
+    group_names = set(groups_df[name_col])
     beta_basenames = {op.splitext(op.splitext(op.basename(b))[0])[0]
                       for b in args.betas}
     matched = group_names & beta_basenames
@@ -495,6 +520,14 @@ def stage3_find_markers(args, blocks_path):
             eprint(f'    {name}')
         if len(unmatched) > 5:
             eprint(f'    ... and {len(unmatched) - 5} more')
+    if not matched:
+        eprint(f'  ERROR: No group names match any beta file!')
+        eprint(f'    Group names (first 3): {sorted(list(group_names))[:3]}')
+        eprint(f'    Beta basenames (first 3): {sorted(list(beta_basenames))[:3]}')
+        raise RuntimeError('Groups file names do not match beta file names. '
+                           'The "name" column should contain sample names '
+                           'WITHOUT file extensions (e.g., "Sample1" not '
+                           '"Sample1.pat.gz" or "Sample1.beta").')
     eprint(f'  Matched samples: {len(matched)}/{len(group_names)}')
 
     # Adaptive threshold relaxation
@@ -543,6 +576,11 @@ def stage3_find_markers(args, blocks_path):
         try:
             run_cmd(cmd, verbose=args.verbose)
         except RuntimeError as e:
+            err_msg = str(e)
+            if 'mismatch' in err_msg.lower() or 'not found' in err_msg.lower():
+                eprint(f'  ERROR: find_markers failed - likely a groups/beta file name mismatch!')
+                eprint(f'  {e}')
+                raise
             eprint(f'  WARNING: find_markers failed for pass {i}: {e}')
             continue
 
