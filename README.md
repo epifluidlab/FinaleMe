@@ -67,7 +67,8 @@ java -Xmx20G -cp "$JAR" \
   -t 4
 ```
 
-Output: `results/BH01.cpg_features.hg19.bed.gz`
+Output: `results/BH01.cpg_features.hg19.bed.gz`. 
+
 It will cost ~25 min for the test dataset.
 
 ### Step 2: Train HMM model
@@ -81,7 +82,9 @@ java -Xmx20G -cp "$JAR" \
   -miniDataPoints 7 -gmm -covOutlier 3 -t 4
 ```
 
-Outputs: model `results/BH01.FinaleMe.model` and training prediction file.
+Outputs: model `results/BH01.FinaleMe.model` and training prediction file.  
+
+It will cost < 1 min for the test dataset.
 
 ### Step 3: Decode CpG methylation
 
@@ -105,7 +108,9 @@ Outputs:
 - `results/BH01.decode.prediction.cov.bw`
 - `results/BH01.decode.prediction.methy_count.bw`
 - `results/BH01.decode.prediction.pat.gz`
-- `results/BH01.decode.prediction.beta`
+- `results/BH01.decode.prediction.beta`. 
+
+It will cost < 1 min for the test dataset.
 
 ### Step 4: Tissues-of-origin analysis
 

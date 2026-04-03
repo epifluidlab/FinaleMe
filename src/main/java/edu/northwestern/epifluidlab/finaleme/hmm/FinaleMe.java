@@ -13,6 +13,7 @@ import htsjdk.samtools.util.BlockCompressedOutputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -25,6 +26,7 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.ObjectStreamClass;
 import java.io.OutputStreamWriter;
+import java.io.SequenceInputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -2024,12 +2026,19 @@ public class FinaleMe {
 
 	private void runBedGraphToBigWigWithJetBrainsBig(File bedGraphFile, File bigWigFile, Iterable<kotlin.Pair<String, Integer>> chromSizesForJavaWriter) throws Exception {
 		log.info("Converting " + bedGraphFile.getPath() + " -> " + bigWigFile.getPath() + " using built-in Java writer ...");
-		try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(bedGraphFile), StandardCharsets.UTF_8));
+		byte[] bedGraphTrackHeader = "track type=bedGraph\n".getBytes(StandardCharsets.UTF_8);
+		try (SequenceInputStream combinedInput = new SequenceInputStream(
+				new ByteArrayInputStream(bedGraphTrackHeader),
+				new FileInputStream(bedGraphFile));
+				BufferedReader reader = new BufferedReader(new InputStreamReader(combinedInput, StandardCharsets.UTF_8));
 				BedGraphParser parser = new BedGraphParser(reader)) {
 			BigWigFile.write((Iterable<? extends WigSection>) parser, chromSizesForJavaWriter, bigWigFile.toPath());
 		} catch (NoClassDefFoundError | ExceptionInInitializerError e) {
 			throw new IOException("JetBrains BigWig writer classes are unavailable. Ensure dependency org.jetbrains.bio:big is on classpath, "
 					+ "or provide -bedGraphToBigWig executable.", e);
+		} catch (IllegalStateException e) {
+			throw new IOException("Built-in Java BigWig writer could not parse temporary bedGraph file " + bedGraphFile.getPath()
+					+ ". Ensure decode output is sorted and valid.", e);
 		}
 	}
 
