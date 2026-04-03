@@ -419,12 +419,25 @@ def run_find_markers(wgbstools, blocks_path, groups_file, betas, out_dir,
     run_cmd(cmd, verbose=verbose)
 
 
+def read_marker_file(fpath):
+    """Read a wgbstools find_markers output file, skipping #>/#< comment lines
+    but preserving the #chr header."""
+    header_lines = 0
+    with open(fpath) as fh:
+        for line in fh:
+            if line.startswith('#>') or line.startswith('#<'):
+                header_lines += 1
+            else:
+                break
+    return pd.read_csv(fpath, sep='\t', skiprows=header_lines)
+
+
 def count_markers_per_group(markers_dir):
     """Count markers in each per-cell-type marker file."""
     counts = {}
     for f in glob.glob(op.join(markers_dir, 'Markers.*.bed')):
         group = op.basename(f).replace('Markers.', '').replace('.bed', '')
-        df = pd.read_csv(f, sep='\t', comment='#')
+        df = read_marker_file(f)
         counts[group] = len(df)
     return counts
 
@@ -433,7 +446,7 @@ def merge_marker_files(markers_dir, out_path):
     """Merge per-cell-type marker files into a single TSV."""
     all_dfs = []
     for f in sorted(glob.glob(op.join(markers_dir, 'Markers.*.bed'))):
-        df = pd.read_csv(f, sep='\t', comment='#')
+        df = read_marker_file(f)
         if not df.empty:
             all_dfs.append(df)
 
@@ -442,7 +455,9 @@ def merge_marker_files(markers_dir, out_path):
         return pd.DataFrame()
 
     merged = pd.concat(all_dfs, ignore_index=True)
-    merged.sort_values(by=['#chr', 'start'], inplace=True)
+    # wgbstools find_markers uses '#chr' as column name
+    chr_col = '#chr' if '#chr' in merged.columns else 'chr'
+    merged.sort_values(by=[chr_col, 'start'], inplace=True)
     merged.to_csv(out_path, sep='\t', index=False)
     eprint(f'  Merged {len(merged)} markers -> {out_path}')
     return merged
