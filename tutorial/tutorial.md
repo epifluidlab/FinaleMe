@@ -12,7 +12,7 @@ FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/
 2. Train HMM model (`FinaleMe`)
 3. Decode methylation (`FinaleMe`)
 4. Optional legacy conversion to bigWig (Perl helper)
-5. Tissues-of-origin deconvolution (UXM or original methylation-density workflow)
+5. Tissues-of-origin deconvolution (UXM or original methylation-density in 1kb bin in CpG rich region workflow)
 
 ## 2. Installation and reference setup
 
@@ -114,6 +114,7 @@ java -Xmx20G -cp "$JAR" \
   -stringentPaired \
   -excludeRegions data/wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed \
   -valueWigs methyPrior:0:data/wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
+  -useNoChrPrefixBam \
   -wgsMode \
   -t 4
 ```
@@ -215,7 +216,7 @@ Key fields:
 ## 5.1 Training command
 
 ```bash
-java -Xmx40G -cp "$JAR" \
+java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   results/BH01.FinaleMe.model \
   results/BH01.cpg_features.hg19.bed.gz \
@@ -414,9 +415,9 @@ Use setup-provided files:
 - hg19: `data/CpG_index.hg19.bed.gz`
 - hg38: `data/CpG_index.hg38.bed.gz`
 
-## 9.4 High memory usage in decode
+## 9.4 Memory usage in high coverage WGS data
 
-Use `-decodeModeOnly` streaming mode with moderate `-Xmx` and appropriate `-t`.
+Try different `-Xmx` and appropriate `-t`. We tested with `-Xmx20G` and `-t 5` for HD_46 dataset (~16X depth), but may need `-Xmx80G` and `-t 5` for 14230_1 dataset (~39X depth) in the paper.
 
 ## 9.5 Chromosome naming mismatch in bigWig
 

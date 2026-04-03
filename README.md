@@ -11,7 +11,7 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 - Java 21 or later (Oracle JDK 21 recommended): https://www.oracle.com/java/technologies/downloads/#java21
 - For source build only: Apache Maven 3.8+
 - Optional for bigWig conversion: `bedGraphToBigWig` (UCSC tools)
-- Optional for Step 5 tissues-of-origin: `wgbstools` and `UXM_deconv`
+- Optional for Step 4 tissues-of-origin: `wgbstools` and `UXM_deconv`
 
 ## Quick install
 
@@ -27,13 +27,6 @@ mvn clean package
 Run one command to build FinaleMe and download required hg19/hg38 reference files into `data/`:
 
 ```bash
-./scripts/setup_references.sh
-```
-
-If you want a different reference directory:
-
-```bash
-export FINALEME_DATA_DIR=/path/to/finaleme_data
 ./scripts/setup_references.sh
 ```
 
@@ -68,6 +61,7 @@ java -Xmx20G -cp "$JAR" \
   -stringentPaired \
   -excludeRegions data/wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed \
   -valueWigs methyPrior:0:data/wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
+  -useNoChrPrefixBam \
   -wgsMode \
   -t 4
 ```
@@ -77,7 +71,7 @@ Output: `results/BH01.cpg_features.hg19.bed.gz`
 ### Step 2: Train HMM model
 
 ```bash
-java -Xmx40G -cp "$JAR" \
+java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
   results/BH01.FinaleMe.model \
   results/BH01.cpg_features.hg19.bed.gz \
@@ -97,7 +91,7 @@ java -Xmx20G -cp "$JAR" \
   results/BH01.decode.prediction.bed.gz \
   -decodeModeOnly \
   -t 4 \
-  -bwOutput \
+  -bwOutput \s
   -chromSizeFile data/hg19.chrom.sizes \
   -patOutput \
   -cpgIndexFile data/CpG_index.hg19.bed.gz
@@ -111,15 +105,7 @@ Outputs:
 - `results/BH01.decode.prediction.pat.gz`
 - `results/BH01.decode.prediction.beta`
 
-### Step 4: Optional legacy bigWig conversion script
-
-If you prefer the older Perl-based conversion workflow:
-
-```bash
-perl src/perl/bedpredict2bw.b37.pl results/BH01 results/BH01.decode.prediction.bed.gz
-```
-
-### Step 5: Tissues-of-origin analysis
+### Step 4: Tissues-of-origin analysis
 
 Using UXM deconvolution:
 
@@ -131,7 +117,7 @@ uxm deconv results/BH01.decode.prediction.pat.gz \
 
 ## Full tutorial
 
-For full option-by-option documentation, file format details, advanced workflows (including tabix fragment input), and troubleshooting, see:
+For full option-by-option documentation, file format details, advanced workflows (including tabix fragment input files from FinaleDB), and troubleshooting, see:
 
 - [tutorial/tutorial.md](tutorial/tutorial.md)
 
