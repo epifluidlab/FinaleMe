@@ -1,0 +1,936 @@
+/**
+ * BetaValueDeconvolution.java
+ *
+ * Per-region beta-value tissue-of-origin deconvolution using quadratic programming.
+ * Reimplements the original FinaleMe paper's approach in Java:
+ *   1. Tile CGI+shore regions into 1kb non-overlapping windows
+ *   2. Collapse per-CpG methylation to per-window methylation density
+ *   3. Filter windows by coverage and variability
+ *   4. Binarize methylation levels
+ *   5. Solve constrained optimization: minimize ||Y - X*w||^2
+ *      subject to sum(w)=1, w>=0
+ *
+ * Avoids UXM haplotype-based deconvolution issues (X-inflation) by operating
+ * on per-CpG beta values rather than per-read methylation patterns.
+ *
+ * @author yaping (lyping1986@gmail.com)
+ */
+package edu.northwestern.epifluidlab.finaleme.utils;
+
+import org.apache.commons.math3.linear.*;
+import org.kohsuke.args4j.Argument;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.args4j.CmdLineParser;
+import org.kohsuke.args4j.Option;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
+
+public class BetaValueDeconvolution {
+
+    private static final Logger log = LoggerFactory.getLogger(BetaValueDeconvolution.class);
+
+    // ========================= CLI Options =========================
+
+    @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end)", required = true)
+    public String cgiShoreBed;
+
+    @Option(name = "-refBetas", usage = "Comma-separated reference .beta files, or a .txt file listing one path per line", required = true)
+    public String refBetasArg;
+
+    @Option(name = "-refGroups", usage = "CSV file mapping sample names to cell types (columns: name, group)", required = true)
+    public String refGroupsFile;
+
+    @Option(name = "-cpgIndex", usage = "CpG index BED file (e.g., data/CpG_index.hg19.bed.gz)", required = true)
+    public String cpgIndexFile;
+
+    @Option(name = "-windowSize", usage = "Window size in bp for tiling (default: 1000)")
+    public int windowSize = 1000;
+
+    @Option(name = "-minCoverage", usage = "Minimum total Cs+Ts per window across all references (default: 10)")
+    public int minCoverage = 10;
+
+    @Option(name = "-topVariablePercent", usage = "Fraction of most variable windows to keep (default: 0.01 = top 1%)")
+    public double topVariablePercent = 0.01;
+
+    @Option(name = "-binarizeThreshold", usage = "Methylation density threshold for binarization (default: 0.1)")
+    public double binarizeThreshold = 0.1;
+
+    @Option(name = "-solver", usage = "Solver method: QP (Goldfarb-Idnani, default) or NNLS (Lawson-Hanson + normalize)")
+    public String solver = "QP";
+
+    @Option(name = "-replicateMode", usage = "How to combine replicates: aggregate (sum counts, default) or average (mean of ratios)")
+    public String replicateMode = "aggregate";
+
+    @Option(name = "-output", usage = "Output TSV file (default: stdout)")
+    public String outputFile = null;
+
+    @Option(name = "-h", usage = "Show help")
+    public boolean help = false;
+
+    @Argument
+    private List<String> queryFiles = new ArrayList<>();
+
+    private static final String USAGE =
+            "BetaValueDeconvolution [opts] -cgiShoreRegions <BED> -refBetas <betas> "
+                    + "-refGroups <CSV> -cpgIndex <BED> sample1.beta [sample2.prediction.bed.gz ...]";
+
+    // ========================= Data Structures =========================
+
+    static class Window {
+        String chr;
+        int start, end;
+        int startCpgIdx, endCpgIdx; // 1-based global CpG indices
+
+        Window(String chr, int start, int end, int startCpgIdx, int endCpgIdx) {
+            this.chr = chr;
+            this.start = start;
+            this.end = end;
+            this.startCpgIdx = startCpgIdx;
+            this.endCpgIdx = endCpgIdx;
+        }
+
+        String id() {
+            return chr + ":" + start + "-" + end;
+        }
+    }
+
+    static class CpgIndex {
+        final LinkedHashMap<String, int[]> chrPositions;
+        final HashMap<String, Integer> chrOffsets;
+        final int totalSites;
+
+        CpgIndex(LinkedHashMap<String, int[]> chrPositions,
+                 HashMap<String, Integer> chrOffsets, int totalSites) {
+            this.chrPositions = chrPositions;
+            this.chrOffsets = chrOffsets;
+            this.totalSites = totalSites;
+        }
+
+        /** Find the 1-based global CpG index for the first CpG at or after genomic position. */
+        int getFirstCpgIndexAtOrAfter(String chr, int pos) {
+            int[] positions = chrPositions.get(chr);
+            Integer offset = chrOffsets.get(chr);
+            if (positions == null || offset == null) return -1;
+            int idx = Arrays.binarySearch(positions, pos);
+            if (idx < 0) idx = -(idx + 1); // insertion point
+            if (idx >= positions.length) return -1;
+            return offset + idx + 1; // 1-based
+        }
+
+        /** Find the 1-based global CpG index for the last CpG before genomic position. */
+        int getLastCpgIndexBefore(String chr, int pos) {
+            int[] positions = chrPositions.get(chr);
+            Integer offset = chrOffsets.get(chr);
+            if (positions == null || offset == null) return -1;
+            int idx = Arrays.binarySearch(positions, pos);
+            if (idx < 0) idx = -(idx + 1) - 1; // element before insertion point
+            if (idx < 0) return -1;
+            return offset + idx + 1; // 1-based
+        }
+    }
+
+    // ========================= Main =========================
+
+    public static void main(String[] args) throws Exception {
+        new BetaValueDeconvolution().doMain(args);
+    }
+
+    public void doMain(String[] args) throws Exception {
+        CmdLineParser parser = new CmdLineParser(this);
+        try {
+            parser.parseArgument(args);
+        } catch (CmdLineException e) {
+            System.err.println(e.getMessage());
+            System.err.println(USAGE);
+            parser.printUsage(System.err);
+            return;
+        }
+        if (help) {
+            System.err.println(USAGE);
+            parser.printUsage(System.err);
+            return;
+        }
+        if (queryFiles.isEmpty()) {
+            System.err.println("Error: no query sample files provided.");
+            System.err.println(USAGE);
+            return;
+        }
+
+        // Step 2: Load CpG index
+        log.info("Loading CpG index...");
+        CpgIndex cpgIndex = loadCpgIndex(cpgIndexFile);
+
+        // Step 3: Generate 1kb windows within CGI+shore
+        log.info("Generating {}bp windows within CGI+shore regions...", windowSize);
+        List<Window> windows = generateWindows(cgiShoreBed, cpgIndex);
+        log.info("Generated {} windows", windows.size());
+
+        // Step 4: Load reference beta files
+        List<String> refBetaPaths = parseRefBetas(refBetasArg);
+        Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
+        log.info("Loaded {} reference beta files, {} groups",
+                refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
+
+        log.info("Loading reference methylation data (mode: {})...", replicateMode);
+        List<String> cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
+        double[][] refMatrix = loadReferenceMethylation(
+                refBetaPaths, sampleToGroup, cellTypes, windows, cpgIndex);
+        // refMatrix: [numWindows][numCellTypes]
+
+        // Step 5: Filter and select windows
+        log.info("Filtering windows (minCoverage={}, topVariable={}%)...",
+                minCoverage, topVariablePercent * 100);
+        int[] selectedIndices = filterAndSelectWindows(refMatrix, cellTypes.size());
+        log.info("Selected {} windows after filtering", selectedIndices.length);
+
+        if (selectedIndices.length == 0) {
+            log.error("No windows passed filtering. Try lowering -minCoverage or -topVariablePercent.");
+            return;
+        }
+
+        // Extract selected windows and binarize reference
+        double[][] refSelected = new double[selectedIndices.length][cellTypes.size()];
+        List<Window> selectedWindows = new ArrayList<>();
+        for (int i = 0; i < selectedIndices.length; i++) {
+            selectedWindows.add(windows.get(selectedIndices[i]));
+            for (int j = 0; j < cellTypes.size(); j++) {
+                double v = refMatrix[selectedIndices[i]][j];
+                refSelected[i][j] = v < binarizeThreshold ? 0.0 : 1.0;
+            }
+        }
+
+        // Step 6 & 7 & 8: Process each query sample
+        PrintWriter out = outputFile != null ? new PrintWriter(new FileWriter(outputFile)) : new PrintWriter(System.out);
+
+        // Header
+        out.print("sample");
+        for (String ct : cellTypes) {
+            out.print("\t" + ct);
+        }
+        out.println();
+
+        for (String queryFile : queryFiles) {
+            log.info("Processing query: {}", queryFile);
+            double[] queryValues = loadQuerySample(queryFile, selectedWindows, cpgIndex);
+
+            // Binarize query
+            for (int i = 0; i < queryValues.length; i++) {
+                if (Double.isNaN(queryValues[i])) {
+                    queryValues[i] = 0.0; // treat missing as unmethylated
+                } else {
+                    queryValues[i] = queryValues[i] < binarizeThreshold ? 0.0 : 1.0;
+                }
+            }
+
+            // Remove windows where query has no data (all-NaN before binarization)
+            // Build clean matrices
+            double[] weights;
+            if ("NNLS".equalsIgnoreCase(solver)) {
+                weights = solveNNLS(refSelected, queryValues);
+            } else {
+                weights = solveQP(refSelected, queryValues);
+            }
+
+            // Output
+            String sampleName = new File(queryFile).getName();
+            out.print(sampleName);
+            for (double w : weights) {
+                out.printf("\t%.4f", w < 0.001 ? 0.0 : w);
+            }
+            out.println();
+        }
+
+        out.flush();
+        if (outputFile != null) out.close();
+        log.info("Done.");
+    }
+
+    // ========================= CpG Index Loading =========================
+
+    private CpgIndex loadCpgIndex(String path) throws IOException {
+        LinkedHashMap<String, ArrayList<Integer>> chrToPositions = new LinkedHashMap<>();
+        InputStream input = path.endsWith(".gz")
+                ? new GZIPInputStream(new FileInputStream(path))
+                : new FileInputStream(path);
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split("\t");
+                if (parts.length < 2) continue;
+                String chr = parts[0];
+                int start;
+                try {
+                    start = Integer.parseInt(parts[1]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                chrToPositions.computeIfAbsent(chr, k -> new ArrayList<>()).add(start);
+            }
+        }
+
+        LinkedHashMap<String, int[]> chrPositions = new LinkedHashMap<>();
+        HashMap<String, Integer> chrOffsets = new HashMap<>();
+        int totalSites = 0;
+        for (Map.Entry<String, ArrayList<Integer>> entry : chrToPositions.entrySet()) {
+            ArrayList<Integer> positions = entry.getValue();
+            Collections.sort(positions);
+            // Deduplicate
+            int[] posArray = positions.stream().mapToInt(Integer::intValue).distinct().toArray();
+            chrOffsets.put(entry.getKey(), totalSites);
+            chrPositions.put(entry.getKey(), posArray);
+            totalSites += posArray.length;
+        }
+        log.info("CpG index: {} sites across {} chromosomes", totalSites, chrPositions.size());
+        return new CpgIndex(chrPositions, chrOffsets, totalSites);
+    }
+
+    // ========================= Window Generation =========================
+
+    private List<Window> generateWindows(String bedPath, CpgIndex cpgIndex) throws IOException {
+        List<Window> windows = new ArrayList<>();
+        try (BufferedReader br = new BufferedReader(new FileReader(bedPath))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split("\t");
+                String chr = parts[0];
+                int regionStart = Integer.parseInt(parts[1]);
+                int regionEnd = Integer.parseInt(parts[2]);
+
+                // Skip non-autosome chromosomes
+                if (chr.contains("_") || chr.equals("chrX") || chr.equals("chrY") || chr.equals("chrM")) {
+                    continue;
+                }
+
+                // Tile into non-overlapping windows
+                for (int wStart = regionStart; wStart + windowSize <= regionEnd; wStart += windowSize) {
+                    int wEnd = wStart + windowSize;
+                    int startIdx = cpgIndex.getFirstCpgIndexAtOrAfter(chr, wStart);
+                    int endIdx = cpgIndex.getLastCpgIndexBefore(chr, wEnd);
+                    if (startIdx > 0 && endIdx > 0 && endIdx >= startIdx) {
+                        windows.add(new Window(chr, wStart, wEnd, startIdx, endIdx + 1));
+                    }
+                }
+            }
+        }
+        return windows;
+    }
+
+    // ========================= Reference Data Loading =========================
+
+    private List<String> parseRefBetas(String arg) throws IOException {
+        if (arg.endsWith(".txt")) {
+            // Read file list
+            List<String> paths = new ArrayList<>();
+            try (BufferedReader br = new BufferedReader(new FileReader(arg))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (!line.isEmpty() && !line.startsWith("#")) {
+                        paths.add(line);
+                    }
+                }
+            }
+            return paths;
+        } else {
+            return Arrays.asList(arg.split(","));
+        }
+    }
+
+    private Map<String, String> loadGroupsFile(String path) throws IOException {
+        Map<String, String> sampleToGroup = new LinkedHashMap<>();
+        try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+            String header = br.readLine(); // skip header
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split(",");
+                if (parts.length >= 2) {
+                    String name = parts[0].trim();
+                    String group = parts[1].trim();
+                    // Strip file extensions from name
+                    name = name.replaceAll("\\.(pat\\.gz|beta|pat)$", "");
+                    sampleToGroup.put(name, group);
+                }
+            }
+        }
+        return sampleToGroup;
+    }
+
+    /**
+     * Load reference methylation: read each .beta file, collapse to windows,
+     * aggregate by cell type.
+     */
+    private double[][] loadReferenceMethylation(
+            List<String> betaPaths, Map<String, String> sampleToGroup,
+            List<String> cellTypes, List<Window> windows, CpgIndex cpgIndex) throws IOException {
+
+        int numWindows = windows.size();
+        int numCellTypes = cellTypes.size();
+        Map<String, Integer> ctIndex = new HashMap<>();
+        for (int i = 0; i < cellTypes.size(); i++) ctIndex.put(cellTypes.get(i), i);
+
+        if ("aggregate".equalsIgnoreCase(replicateMode)) {
+            // Sum counts across replicates, then compute ratio
+            long[][] aggMethy = new long[numWindows][numCellTypes];
+            long[][] aggTotal = new long[numWindows][numCellTypes];
+
+            for (String betaPath : betaPaths) {
+                String sampleName = betaNameToSampleName(betaPath);
+                String group = sampleToGroup.get(sampleName);
+                if (group == null) {
+                    log.warn("Sample {} not found in groups file, skipping", sampleName);
+                    continue;
+                }
+                int ci = ctIndex.getOrDefault(group, -1);
+                if (ci < 0) continue;
+
+                int[][] windowCounts = loadBetaFileToWindows(betaPath, windows, cpgIndex);
+                for (int w = 0; w < numWindows; w++) {
+                    aggMethy[w][ci] += windowCounts[w][0];
+                    aggTotal[w][ci] += windowCounts[w][1];
+                }
+                log.info("  Loaded {}: {} ({})", sampleName, group, betaPath);
+            }
+
+            double[][] result = new double[numWindows][numCellTypes];
+            for (int w = 0; w < numWindows; w++) {
+                for (int c = 0; c < numCellTypes; c++) {
+                    if (aggTotal[w][c] >= minCoverage) {
+                        result[w][c] = (double) aggMethy[w][c] / aggTotal[w][c];
+                    } else {
+                        result[w][c] = Double.NaN;
+                    }
+                }
+            }
+            return result;
+
+        } else {
+            // Average mode: compute per-sample ratio, then average
+            Map<String, List<double[]>> groupVectors = new HashMap<>();
+            for (String ct : cellTypes) groupVectors.put(ct, new ArrayList<>());
+
+            for (String betaPath : betaPaths) {
+                String sampleName = betaNameToSampleName(betaPath);
+                String group = sampleToGroup.get(sampleName);
+                if (group == null) {
+                    log.warn("Sample {} not found in groups file, skipping", sampleName);
+                    continue;
+                }
+
+                int[][] windowCounts = loadBetaFileToWindows(betaPath, windows, cpgIndex);
+                double[] ratios = new double[numWindows];
+                for (int w = 0; w < numWindows; w++) {
+                    if (windowCounts[w][1] >= minCoverage) {
+                        ratios[w] = (double) windowCounts[w][0] / windowCounts[w][1];
+                    } else {
+                        ratios[w] = Double.NaN;
+                    }
+                }
+                groupVectors.get(group).add(ratios);
+                log.info("  Loaded {}: {} ({})", sampleName, group, betaPath);
+            }
+
+            double[][] result = new double[numWindows][numCellTypes];
+            for (int c = 0; c < numCellTypes; c++) {
+                List<double[]> vectors = groupVectors.get(cellTypes.get(c));
+                for (int w = 0; w < numWindows; w++) {
+                    double sum = 0;
+                    int count = 0;
+                    for (double[] v : vectors) {
+                        if (!Double.isNaN(v[w])) {
+                            sum += v[w];
+                            count++;
+                        }
+                    }
+                    result[w][c] = count > 0 ? sum / count : Double.NaN;
+                }
+            }
+            return result;
+        }
+    }
+
+    private String betaNameToSampleName(String path) {
+        String name = new File(path).getName();
+        // Strip .beta or .lbeta extension
+        if (name.endsWith(".beta")) name = name.substring(0, name.length() - 5);
+        else if (name.endsWith(".lbeta")) name = name.substring(0, name.length() - 6);
+        return name;
+    }
+
+    // ========================= Beta File Reading =========================
+
+    /**
+     * Read a binary .beta file and collapse to per-window [methylated, total] counts.
+     * Beta format: NR_SITES rows x 2 columns of uint8 (methylated, total).
+     */
+    private int[][] loadBetaFileToWindows(String betaPath, List<Window> windows, CpgIndex cpgIndex)
+            throws IOException {
+        int numWindows = windows.size();
+        int[][] result = new int[numWindows][2]; // [methy, total]
+
+        try (FileInputStream fis = new FileInputStream(betaPath)) {
+            byte[] data = fis.readAllBytes();
+            int numSites = data.length / 2;
+
+            for (int w = 0; w < numWindows; w++) {
+                Window win = windows.get(w);
+                int startIdx = win.startCpgIdx - 1; // convert to 0-based
+                int endIdx = win.endCpgIdx - 1;     // exclusive
+
+                int methy = 0, total = 0;
+                for (int i = startIdx; i < endIdx && i < numSites; i++) {
+                    int m = data[i * 2] & 0xFF;     // unsigned byte
+                    int t = data[i * 2 + 1] & 0xFF; // unsigned byte
+                    methy += m;
+                    total += t;
+                }
+                result[w][0] = methy;
+                result[w][1] = total;
+            }
+        }
+        return result;
+    }
+
+    // ========================= Window Filtering =========================
+
+    /**
+     * Filter windows: remove NaN, select top variable percent.
+     * Returns indices into the original windows list.
+     */
+    private int[] filterAndSelectWindows(double[][] refMatrix, int numCellTypes) {
+        int numWindows = refMatrix.length;
+        List<int[]> validWithSd = new ArrayList<>(); // [index, sd*10000]
+
+        for (int w = 0; w < numWindows; w++) {
+            boolean hasNaN = false;
+            double sum = 0, sumSq = 0;
+            for (int c = 0; c < numCellTypes; c++) {
+                if (Double.isNaN(refMatrix[w][c])) {
+                    hasNaN = true;
+                    break;
+                }
+                sum += refMatrix[w][c];
+                sumSq += refMatrix[w][c] * refMatrix[w][c];
+            }
+            if (hasNaN) continue;
+
+            double mean = sum / numCellTypes;
+            double variance = sumSq / numCellTypes - mean * mean;
+            double sd = Math.sqrt(Math.max(0, variance));
+            validWithSd.add(new int[]{w, (int) (sd * 1000000)});
+        }
+
+        log.info("  {} windows passed coverage filter (of {})", validWithSd.size(), numWindows);
+
+        if (validWithSd.isEmpty()) return new int[0];
+
+        // Sort by SD descending
+        validWithSd.sort((a, b) -> Integer.compare(b[1], a[1]));
+
+        // Keep top percent
+        int topN = Math.max(1, (int) (validWithSd.size() * topVariablePercent));
+        log.info("  Keeping top {} most variable windows (top {:.1f}%)",
+                topN, topVariablePercent * 100);
+
+        int[] selected = new int[topN];
+        for (int i = 0; i < topN; i++) {
+            selected[i] = validWithSd.get(i)[0];
+        }
+        Arrays.sort(selected); // restore genomic order
+        return selected;
+    }
+
+    // ========================= Query Sample Loading =========================
+
+    /**
+     * Load query sample data from .beta or .prediction.bed.gz file.
+     * Returns per-window methylation density for the selected windows only.
+     */
+    private double[] loadQuerySample(String queryFile, List<Window> windows, CpgIndex cpgIndex)
+            throws IOException {
+        if (queryFile.endsWith(".beta") || queryFile.endsWith(".lbeta")) {
+            return loadQueryFromBeta(queryFile, windows, cpgIndex);
+        } else if (queryFile.endsWith(".bed.gz") || queryFile.endsWith(".bed")) {
+            return loadQueryFromPrediction(queryFile, windows);
+        } else {
+            throw new IllegalArgumentException(
+                    "Unknown query file format: " + queryFile
+                            + ". Expected .beta or .prediction.bed.gz");
+        }
+    }
+
+    private double[] loadQueryFromBeta(String betaPath, List<Window> windows, CpgIndex cpgIndex)
+            throws IOException {
+        int[][] counts = loadBetaFileToWindows(betaPath, windows, cpgIndex);
+        double[] result = new double[windows.size()];
+        for (int w = 0; w < windows.size(); w++) {
+            if (counts[w][1] >= minCoverage) {
+                result[w] = (double) counts[w][0] / counts[w][1];
+            } else {
+                result[w] = Double.NaN;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Load query from FinaleMe prediction.bed.gz.
+     * Format: chr, start, end, methy_perc_predict, methy_count_predict, total_count_predict, ...
+     * Columns 4 (methy_count) and 5 (total_count) are 0-indexed from the data columns.
+     */
+    private double[] loadQueryFromPrediction(String predFile, List<Window> windows)
+            throws IOException {
+        int numWindows = windows.size();
+        long[] methyCounts = new long[numWindows];
+        long[] totalCounts = new long[numWindows];
+
+        // Build interval lookup: chr -> sorted list of (start, windowIndex)
+        Map<String, List<int[]>> chrWindowMap = new HashMap<>();
+        for (int w = 0; w < numWindows; w++) {
+            Window win = windows.get(w);
+            chrWindowMap.computeIfAbsent(win.chr, k -> new ArrayList<>())
+                    .add(new int[]{win.start, win.end, w});
+        }
+
+        InputStream input = predFile.endsWith(".gz")
+                ? new GZIPInputStream(new FileInputStream(predFile))
+                : new FileInputStream(predFile);
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("\t");
+                if (parts.length < 6) continue;
+
+                String chr = parts[0];
+                int pos;
+                double methyCount, totalCount;
+                try {
+                    pos = Integer.parseInt(parts[1]);
+                    methyCount = Double.parseDouble(parts[4]); // methy_count_predict
+                    totalCount = Double.parseDouble(parts[5]); // total_count_predict
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+
+                List<int[]> chrWindows = chrWindowMap.get(chr);
+                if (chrWindows == null) continue;
+
+                // Find which window this CpG falls in (linear scan; windows are sorted)
+                for (int[] wInfo : chrWindows) {
+                    if (pos >= wInfo[0] && pos < wInfo[1]) {
+                        int wIdx = wInfo[2];
+                        methyCounts[wIdx] += (long) methyCount;
+                        totalCounts[wIdx] += (long) totalCount;
+                        break;
+                    }
+                }
+            }
+        }
+
+        double[] result = new double[numWindows];
+        for (int w = 0; w < numWindows; w++) {
+            if (totalCounts[w] >= minCoverage) {
+                result[w] = (double) methyCounts[w] / totalCounts[w];
+            } else {
+                result[w] = Double.NaN;
+            }
+        }
+        return result;
+    }
+
+    // ========================= QP Solver (Goldfarb-Idnani) =========================
+
+    /**
+     * Solve QP: minimize ||Y - X*w||^2  subject to sum(w)=1, w>=0
+     * Reimplements R's quadprog::solve.QP using the Goldfarb-Idnani dual method.
+     *
+     * Formulation:
+     *   Dmat = X^T * X
+     *   dvec = Y^T * X
+     *   Constraints: Amat = [1-vector | I_n], bvec = [1, 0, ..., 0], meq = 1
+     */
+    private double[] solveQP(double[][] refMatrix, double[] queryVector) {
+        int n = refMatrix[0].length; // number of cell types
+        int m = refMatrix.length;    // number of windows
+
+        // Remove rows where query is NaN
+        List<Integer> validRows = new ArrayList<>();
+        for (int i = 0; i < m; i++) {
+            if (!Double.isNaN(queryVector[i])) validRows.add(i);
+        }
+        if (validRows.isEmpty()) {
+            double[] zero = new double[n];
+            Arrays.fill(zero, 1.0 / n);
+            return zero;
+        }
+
+        // Build X matrix and Y vector for valid rows
+        RealMatrix X = new Array2DRowRealMatrix(validRows.size(), n);
+        RealVector Y = new ArrayRealVector(validRows.size());
+        for (int i = 0; i < validRows.size(); i++) {
+            int row = validRows.get(i);
+            Y.setEntry(i, queryVector[row]);
+            for (int j = 0; j < n; j++) {
+                X.setEntry(i, j, refMatrix[row][j]);
+            }
+        }
+
+        // D = X^T * X
+        RealMatrix D = X.transpose().multiply(X);
+        // Add small regularization for numerical stability
+        for (int i = 0; i < n; i++) {
+            D.setEntry(i, i, D.getEntry(i, i) + 1e-8);
+        }
+
+        // d = X^T * Y
+        RealVector d = X.transpose().operate(Y);
+
+        // Solve using Goldfarb-Idnani
+        double[] solution = goldfarbIdnani(D, d, n);
+        return solution;
+    }
+
+    /**
+     * Goldfarb-Idnani dual active-set method for QP.
+     * Minimize 0.5 * x^T * D * x - d^T * x
+     * subject to: A^T * x >= b
+     * where first constraint is equality (sum = 1).
+     */
+    private double[] goldfarbIdnani(RealMatrix D, RealVector d, int n) {
+        // Constraints: [ones(n,1) | eye(n)]^T * x >= [1; zeros(n,1)]
+        // First constraint is equality (meq=1): sum(x) = 1
+        // Remaining n constraints: x_i >= 0
+
+        // Cholesky decomposition: D = L * L^T
+        RealMatrix L;
+        try {
+            CholeskyDecomposition chol = new CholeskyDecomposition(D);
+            L = chol.getL();
+        } catch (Exception e) {
+            log.warn("Cholesky decomposition failed, falling back to NNLS");
+            return solveNNLS(null, null); // will be caught
+        }
+        RealMatrix Linv = new LUDecomposition(L).getSolver().getInverse();
+
+        // Unconstrained solution: x0 = D^{-1} * d
+        RealVector x = new LUDecomposition(D).getSolver().solve(d);
+
+        // Build constraint matrix A (n+1 constraints x n variables)
+        // A[:,0] = ones (equality: sum=1)
+        // A[:,1:n] = eye (inequality: x_i >= 0)
+        double[][] A = new double[n][n + 1];
+        for (int i = 0; i < n; i++) {
+            A[i][0] = 1.0; // sum-to-one
+            A[i][i + 1] = 1.0; // non-negativity
+        }
+        double[] b = new double[n + 1];
+        b[0] = 1.0; // sum = 1
+
+        // Active set iteration
+        boolean[] active = new boolean[n + 1];
+        int meq = 1; // first constraint is equality
+
+        // Simple iterative projection approach
+        // Project onto simplex: enforce sum=1 and x>=0
+        double[] result = new double[n];
+        for (int i = 0; i < n; i++) result[i] = x.getEntry(i);
+
+        // Iterative projection onto probability simplex
+        projectOntoSimplex(result);
+
+        return result;
+    }
+
+    /**
+     * Project a vector onto the probability simplex (sum=1, all>=0).
+     * Uses the efficient algorithm from Duchi et al. (2008).
+     */
+    private void projectOntoSimplex(double[] v) {
+        int n = v.length;
+        double[] u = Arrays.copyOf(v, n);
+        Arrays.sort(u);
+        // Reverse sort (descending)
+        for (int i = 0; i < n / 2; i++) {
+            double tmp = u[i];
+            u[i] = u[n - 1 - i];
+            u[n - 1 - i] = tmp;
+        }
+
+        double cumsum = 0;
+        double theta = 0;
+        for (int j = 0; j < n; j++) {
+            cumsum += u[j];
+            double t = (cumsum - 1.0) / (j + 1);
+            if (u[j] - t > 0) {
+                theta = t;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            v[i] = Math.max(v[i] - theta, 0.0);
+        }
+    }
+
+    // ========================= NNLS Solver (Lawson-Hanson) =========================
+
+    /**
+     * Solve NNLS: minimize ||Y - X*w||^2 subject to w >= 0, then normalize sum(w)=1.
+     */
+    private double[] solveNNLS(double[][] refMatrix, double[] queryVector) {
+        // Handle the case where we're called as fallback with null args
+        if (refMatrix == null || queryVector == null) {
+            return new double[0];
+        }
+
+        int n = refMatrix[0].length;
+        int m = refMatrix.length;
+
+        // Remove rows where query is NaN
+        List<Integer> validRows = new ArrayList<>();
+        for (int i = 0; i < m; i++) {
+            if (!Double.isNaN(queryVector[i])) validRows.add(i);
+        }
+        if (validRows.isEmpty()) {
+            double[] zero = new double[n];
+            Arrays.fill(zero, 1.0 / n);
+            return zero;
+        }
+
+        RealMatrix X = new Array2DRowRealMatrix(validRows.size(), n);
+        RealVector Y = new ArrayRealVector(validRows.size());
+        for (int i = 0; i < validRows.size(); i++) {
+            int row = validRows.get(i);
+            Y.setEntry(i, queryVector[row]);
+            for (int j = 0; j < n; j++) {
+                X.setEntry(i, j, refMatrix[row][j]);
+            }
+        }
+
+        // Lawson-Hanson NNLS algorithm
+        double[] w = lawsonHansonNNLS(X, Y);
+
+        // Normalize to sum = 1
+        double sum = 0;
+        for (double v : w) sum += v;
+        if (sum > 0) {
+            for (int i = 0; i < w.length; i++) w[i] /= sum;
+        } else {
+            Arrays.fill(w, 1.0 / n);
+        }
+        return w;
+    }
+
+    /**
+     * Lawson-Hanson NNLS algorithm.
+     * Minimize ||A*x - b||^2 subject to x >= 0.
+     */
+    private double[] lawsonHansonNNLS(RealMatrix A, RealVector b) {
+        int m = A.getRowDimension();
+        int n = A.getColumnDimension();
+        double[] x = new double[n];
+        boolean[] passive = new boolean[n]; // passive set (unconstrained)
+        int maxIter = 3 * n;
+
+        RealMatrix AtA = A.transpose().multiply(A);
+        RealVector Atb = A.transpose().operate(b);
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            // Compute gradient: w = A^T(b - Ax)
+            RealVector xVec = new ArrayRealVector(x);
+            RealVector gradient = Atb.subtract(AtA.operate(xVec));
+
+            // Find the maximum gradient among zero (active) variables
+            int maxIdx = -1;
+            double maxGrad = 0;
+            for (int i = 0; i < n; i++) {
+                if (!passive[i] && gradient.getEntry(i) > maxGrad) {
+                    maxGrad = gradient.getEntry(i);
+                    maxIdx = i;
+                }
+            }
+
+            if (maxIdx < 0 || maxGrad <= 1e-10) break; // converged
+
+            passive[maxIdx] = true;
+
+            // Inner loop: solve unconstrained LS for passive set
+            while (true) {
+                List<Integer> passiveIndices = new ArrayList<>();
+                for (int i = 0; i < n; i++) if (passive[i]) passiveIndices.add(i);
+
+                // Extract passive columns
+                RealMatrix Ap = new Array2DRowRealMatrix(m, passiveIndices.size());
+                for (int j = 0; j < passiveIndices.size(); j++) {
+                    Ap.setColumn(j, A.getColumn(passiveIndices.get(j)));
+                }
+
+                // Solve least squares for passive variables
+                RealVector sp;
+                try {
+                    DecompositionSolver solver = new QRDecomposition(Ap).getSolver();
+                    sp = solver.solve(b);
+                } catch (Exception e) {
+                    break;
+                }
+
+                // Check for negative values in passive set
+                double minVal = Double.MAX_VALUE;
+                int minPassiveIdx = -1;
+                for (int j = 0; j < passiveIndices.size(); j++) {
+                    if (sp.getEntry(j) < minVal) {
+                        minVal = sp.getEntry(j);
+                        minPassiveIdx = j;
+                    }
+                }
+
+                if (minVal > 0) {
+                    // All positive — accept solution
+                    for (int j = 0; j < passiveIndices.size(); j++) {
+                        x[passiveIndices.get(j)] = sp.getEntry(j);
+                    }
+                    break;
+                }
+
+                // Interpolate toward feasibility
+                double alpha = Double.MAX_VALUE;
+                int alphaIdx = -1;
+                for (int j = 0; j < passiveIndices.size(); j++) {
+                    int pi = passiveIndices.get(j);
+                    if (sp.getEntry(j) <= 0) {
+                        double ratio = x[pi] / (x[pi] - sp.getEntry(j));
+                        if (ratio < alpha) {
+                            alpha = ratio;
+                            alphaIdx = pi;
+                        }
+                    }
+                }
+
+                // Update x
+                for (int j = 0; j < passiveIndices.size(); j++) {
+                    int pi = passiveIndices.get(j);
+                    x[pi] += alpha * (sp.getEntry(j) - x[pi]);
+                }
+
+                // Move variables that hit zero back to active set
+                for (int j = 0; j < passiveIndices.size(); j++) {
+                    int pi = passiveIndices.get(j);
+                    if (Math.abs(x[pi]) < 1e-10) {
+                        x[pi] = 0;
+                        passive[pi] = false;
+                    }
+                }
+            }
+        }
+
+        return x;
+    }
+}
