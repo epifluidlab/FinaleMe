@@ -77,7 +77,7 @@ brew install bedtools
 conda install -c bioconda bedtools
 
 # 4. Python packages
-pip install pandas numpy scipy
+pip install pandas==1.5.3 numpy==1.21.6 matplotlib==3.4.3 scipy==1.9.0
 ```
 
 ### 2.2 Initialize the genome reference
