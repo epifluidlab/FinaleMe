@@ -132,17 +132,22 @@
 		<artifactId>sis-jhdf5-batteries_included</artifactId>
 		<version>1.0</version>
 	</dependency>
-	<dependency>
-		<groupId>jdistlib</groupId>
-		<artifactId>jdistlib</artifactId>
-		<version>0.4.5</version>
-	</dependency>
-	<dependency>
-		<groupId>org.junit.jupiter</groupId>
-		<artifactId>junit-jupiter</artifactId>
-		<version>5.10.1</version>
-		<scope>test</scope>
-	</dependency>
+		<dependency>
+			<groupId>jdistlib</groupId>
+			<artifactId>jdistlib</artifactId>
+			<version>0.4.5</version>
+		</dependency>
+		<dependency>
+			<groupId>org.jetbrains.bio</groupId>
+			<artifactId>big</artifactId>
+			<version>0.9.1</version>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<version>5.10.1</version>
+			<scope>test</scope>
+		</dependency>
 
   </dependencies>
 </project>

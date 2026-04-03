@@ -287,8 +287,8 @@ java -Xmx20G -cp "$JAR" \
 | `-patOutput` | Write UXM-compatible `.pat.gz` and `.beta` outputs. |
 | `-cpgIndexFile` | Required CpG index for `-patOutput` (use `data/CpG_index.*.bed.gz`). |
 | `-bwOutput` | Write decode summary bigWig outputs. |
-| `-chromSizeFile` | Required with `-bwOutput`. |
-| `-bedGraphToBigWig` | Path to UCSC converter executable. |
+| `-chromSizeFile` | Required with `-bwOutput` (used by both UCSC converter and Java fallback writer). |
+| `-bedGraphToBigWig` | Path to UCSC converter executable; if missing, FinaleMe auto-falls back to Java BigWig writer. |
 | `-bwStripChrPrefix` | Remove `chr` prefix in bigWig conversion. |
 | `-bwConvertChrMToMT` | Convert chrM/M naming to MT. |
 | `-t` | Parallel decoding thread count. |
@@ -406,7 +406,8 @@ If you decode an old model trained before package migration, use the current v0.
 
 ## 9.2 No `bedGraphToBigWig` in PATH
 
-Install UCSC binary matching your platform, or pass explicit path with `-bedGraphToBigWig`.
+FinaleMe now auto-falls back to Java BigWig writing when this executable is missing.  
+Install UCSC `bedGraphToBigWig` if you still prefer/require the UCSC binary path.
 
 ## 9.3 Missing CpG index for `-patOutput`
 

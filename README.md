@@ -9,9 +9,10 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 ## System requirements
 
 - Java 21 or later (Oracle JDK 21 recommended): https://www.oracle.com/java/technologies/downloads/#java21
-- For source build only: Apache Maven 3.8+
-- Optional for bigWig conversion: `bedGraphToBigWig` (UCSC tools)
-- Optional for Step 4 tissues-of-origin: `wgbstools` and `UXM_deconv`
+- Apache Maven 3.8+: 
+https://maven.apache.org/install.html (or use the build .jar file from release)
+- Optional for bigWig conversion speed/compatibility: `bedGraphToBigWig` (UCSC tools from here: https://hgdownload.soe.ucsc.edu/admin/exe/ and modify $PATH to allow the direct usage). If missing, FinaleMe falls back to built-in Java BigWig writing.
+- Optional for Step 4 tissues-of-origin: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv) 
 
 ## Quick install
 

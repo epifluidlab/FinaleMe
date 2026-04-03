@@ -31,6 +31,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -51,6 +52,9 @@ import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
 import org.apache.commons.math3.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.jetbrains.bio.big.BedGraphParser;
+import org.jetbrains.bio.big.BigWigFile;
+import org.jetbrains.bio.big.WigSection;
 import edu.northwestern.epifluidlab.finaleme.utils.ObservationVector;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -165,10 +169,10 @@ public class FinaleMe {
 	@Option(name="-bwOutput", usage="output decode summary as bigWig files (.methy.bw/.cov.bw/.methy_count.bw). Requires -chromSizeFile. default: false")
 	public boolean bwOutput = false;
 
-	@Option(name="-chromSizeFile", usage="chromosome sizes file required by bedGraphToBigWig when -bwOutput is enabled.")
+	@Option(name="-chromSizeFile", usage="chromosome sizes file required for bigWig output when -bwOutput is enabled.")
 	public String chromSizeFile = null;
 
-	@Option(name="-bedGraphToBigWig", usage="path to bedGraphToBigWig executable. default: bedGraphToBigWig")
+	@Option(name="-bedGraphToBigWig", usage="path to UCSC bedGraphToBigWig executable. If unavailable, FinaleMe falls back to built-in Java bigWig writer when dependency is present. default: bedGraphToBigWig")
 	public String bedGraphToBigWig = "bedGraphToBigWig";
 
 	@Option(name="-bwStripChrPrefix", usage="strip leading 'chr' from chromosome names before bigWig conversion. default: false")
@@ -1777,19 +1781,27 @@ public class FinaleMe {
 			}
 			br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
 			String line;
-			while ((line = br.readLine()) != null) {
-				if (line.isEmpty() || line.startsWith("#")) {
-					continue;
+				while ((line = br.readLine()) != null) {
+					if (line.isEmpty() || line.startsWith("#")) {
+						continue;
+					}
+					String[] splitLines = line.split("\\s+");
+					if (splitLines.length < 2) {
+						continue;
+					}
+					String chr = splitLines[0];
+					try {
+						int chrSize = Integer.parseInt(splitLines[1]);
+						if (chrSize <= 0) {
+							continue;
+						}
+					} catch (NumberFormatException e) {
+						continue;
+					}
+					if (!chromOrder.containsKey(chr)) {
+						chromOrder.put(chr, index++);
+					}
 				}
-				String[] splitLines = line.split("\t");
-				if (splitLines.length < 2) {
-					continue;
-				}
-				String chr = splitLines[0];
-				if (!chromOrder.containsKey(chr)) {
-					chromOrder.put(chr, index++);
-				}
-			}
 		} finally {
 			if (br != null) {
 				br.close();
@@ -1800,6 +1812,55 @@ public class FinaleMe {
 		}
 		log.info("Loaded " + chromOrder.size() + " chromosome entries for bigWig sort order.");
 		return chromOrder;
+	}
+
+	private ArrayList<kotlin.Pair<String, Integer>> loadChromSizesForJavaBigWigWriter(String chromSizeFile) throws IOException {
+		LinkedHashMap<String, Integer> chromSizeMap = new LinkedHashMap<String, Integer>();
+		InputStream input = null;
+		BufferedReader br = null;
+		try {
+			if (chromSizeFile.endsWith(".gz")) {
+				input = new GZIPInputStream(new FileInputStream(chromSizeFile));
+			} else {
+				input = new FileInputStream(chromSizeFile);
+			}
+			br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.isEmpty() || line.startsWith("#")) {
+					continue;
+				}
+				String[] splitLines = line.split("\\s+");
+				if (splitLines.length < 2) {
+					continue;
+				}
+				String chr = splitLines[0];
+				int chrSize;
+				try {
+					chrSize = Integer.parseInt(splitLines[1]);
+				} catch (NumberFormatException e) {
+					continue;
+				}
+				if (chrSize <= 0) {
+					continue;
+				}
+				if (!chromSizeMap.containsKey(chr)) {
+					chromSizeMap.put(chr, chrSize);
+				}
+			}
+		} finally {
+			if (br != null) {
+				br.close();
+			}
+		}
+		if (chromSizeMap.isEmpty()) {
+			throw new IllegalArgumentException("No chromosome size entries found in -chromSizeFile: " + chromSizeFile);
+		}
+		ArrayList<kotlin.Pair<String, Integer>> chromSizes = new ArrayList<kotlin.Pair<String, Integer>>(chromSizeMap.size());
+		for (Map.Entry<String, Integer> entry : chromSizeMap.entrySet()) {
+			chromSizes.add(new kotlin.Pair<String, Integer>(entry.getKey(), entry.getValue()));
+		}
+		return chromSizes;
 	}
 
 	private void writeDecodeBigWigOutputs(HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary, String outputFile, LinkedHashMap<String, Integer> chromOrder) throws Exception {
@@ -1840,11 +1901,24 @@ public class FinaleMe {
 
 		boolean success = false;
 		try {
-			runBedGraphToBigWig(methyBedGraph, methyBw);
-			runBedGraphToBigWig(covBedGraph, covBw);
-			runBedGraphToBigWig(methyCountBedGraph, methyCountBw);
+			try {
+				runBedGraphToBigWig(methyBedGraph, methyBw);
+				runBedGraphToBigWig(covBedGraph, covBw);
+				runBedGraphToBigWig(methyCountBedGraph, methyCountBw);
+				log.info("Wrote decode bigWig outputs with bedGraphToBigWig: " + methyBw.getPath() + ", " + covBw.getPath() + ", " + methyCountBw.getPath());
+			} catch (IOException externalConvertError) {
+				if (!isBedGraphToBigWigUnavailable(externalConvertError)) {
+					throw externalConvertError;
+				}
+				log.warn("bedGraphToBigWig is unavailable ({}). Falling back to built-in Java BigWig writer (org.jetbrains.bio:big).",
+						externalConvertError.getMessage());
+				ArrayList<kotlin.Pair<String, Integer>> chromSizesForJavaWriter = loadChromSizesForJavaBigWigWriter(chromSizeFile);
+				runBedGraphToBigWigWithJetBrainsBig(methyBedGraph, methyBw, chromSizesForJavaWriter);
+				runBedGraphToBigWigWithJetBrainsBig(covBedGraph, covBw, chromSizesForJavaWriter);
+				runBedGraphToBigWigWithJetBrainsBig(methyCountBedGraph, methyCountBw, chromSizesForJavaWriter);
+				log.info("Wrote decode bigWig outputs with built-in Java writer: " + methyBw.getPath() + ", " + covBw.getPath() + ", " + methyCountBw.getPath());
+			}
 			success = true;
-			log.info("Wrote decode bigWig outputs: " + methyBw.getPath() + ", " + covBw.getPath() + ", " + methyCountBw.getPath());
 		} finally {
 			if (success) {
 				if (!methyBedGraph.delete()) log.warn("Could not delete temporary file: " + methyBedGraph.getPath());
@@ -1946,6 +2020,28 @@ public class FinaleMe {
 		if (exitCode != 0) {
 			throw new IOException("bedGraphToBigWig failed (exit " + exitCode + ") for " + bedGraphFile.getPath() + ":\n" + commandOutput.toString());
 		}
+	}
+
+	private void runBedGraphToBigWigWithJetBrainsBig(File bedGraphFile, File bigWigFile, Iterable<kotlin.Pair<String, Integer>> chromSizesForJavaWriter) throws Exception {
+		log.info("Converting " + bedGraphFile.getPath() + " -> " + bigWigFile.getPath() + " using built-in Java writer ...");
+		try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(bedGraphFile), StandardCharsets.UTF_8));
+				BedGraphParser parser = new BedGraphParser(reader)) {
+			BigWigFile.write((Iterable<? extends WigSection>) parser, chromSizesForJavaWriter, bigWigFile.toPath());
+		} catch (NoClassDefFoundError | ExceptionInInitializerError e) {
+			throw new IOException("JetBrains BigWig writer classes are unavailable. Ensure dependency org.jetbrains.bio:big is on classpath, "
+					+ "or provide -bedGraphToBigWig executable.", e);
+		}
+	}
+
+	private boolean isBedGraphToBigWigUnavailable(IOException e) {
+		if (e == null || e.getMessage() == null) {
+			return false;
+		}
+		String messageLower = e.getMessage().toLowerCase(Locale.ROOT);
+		return messageLower.contains("cannot run program")
+				&& (messageLower.contains("error=2")
+				|| messageLower.contains("no such file")
+				|| messageLower.contains("not found"));
 	}
 
 	private String deriveBigWigBase(String outputFile) {
