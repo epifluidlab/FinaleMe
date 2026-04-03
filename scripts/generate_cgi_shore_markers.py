@@ -313,7 +313,11 @@ def stage2_generate_blocks(args, cgi_shore_bed):
 
     # Add CpG indices if not present
     eprint('  Adding CpG indices...')
-    df = pd.read_csv(intersect_path, sep='\t', header=None)
+    df = pd.read_csv(intersect_path, sep='\t', header=None, comment='#')
+
+    # Drop header rows that bedtools may pass through (e.g., rows where
+    # column 1 is non-numeric like "start" or "chromStart")
+    df = df[pd.to_numeric(df.iloc[:, 1], errors='coerce').notna()].reset_index(drop=True)
 
     if df.shape[1] >= 5:
         # Already has CpG indices (startCpG, endCpG in cols 3,4)
@@ -330,9 +334,17 @@ def stage2_generate_blocks(args, cgi_shore_bed):
         df.columns = ['chr', 'start', 'end', 'startCpG', 'endCpG'] + \
                      [f'col{i}' for i in range(5, df.shape[1])]
 
-    # Convert types
+    eprint(f'  Loaded {len(df)} blocks from intersection')
+
+    # Convert types and ensure integer CpG indices
+    # CRITICAL: pd.to_numeric with errors='coerce' produces float64.
+    # wgbstools load_blocks_file expects integer CpG indices (e.g. "12345"
+    # not "12345.0"). Writing floats causes all methylation lookups to fail.
     for col in ['start', 'end', 'startCpG', 'endCpG']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['start', 'end', 'startCpG', 'endCpG'])
+    for col in ['start', 'end', 'startCpG', 'endCpG']:
+        df[col] = df[col].astype(int)
 
     # Filter by CpG count and bp length
     df['lenCpG'] = df['endCpG'] - df['startCpG']
@@ -342,14 +354,32 @@ def stage2_generate_blocks(args, cgi_shore_bed):
     df = df[(df['lenCpG'] >= args.min_cpg) & (df['lenCpG'] <= args.max_cpg)]
     df = df[(df['lenBp'] >= args.min_bp) & (df['lenBp'] <= args.max_bp)]
     df = df.drop_duplicates(subset=['chr', 'start', 'end'])
-    df = df.sort_values(['chr', 'start']).reset_index(drop=True)
+
+    # CRITICAL: wgbstools find_markers requires blocks sorted by startCpG
+    # (sort -k4,4n). Sorting by chr,start instead causes silent failures
+    # in beta file lookups.
+    df = df.sort_values('startCpG').reset_index(drop=True)
 
     eprint(f'  {orig_count} raw blocks -> {len(df)} filtered blocks '
            f'({args.min_cpg}-{args.max_cpg} CpGs, {args.min_bp}-{args.max_bp} bp)')
 
+    if len(df) == 0:
+        eprint('  ERROR: No blocks remain after filtering! Check your input blocks file.')
+        raise RuntimeError('No candidate blocks found in CGI+shore regions.')
+
     # Write output (5 columns: chr, start, end, startCpG, endCpG)
+    # Use integer format explicitly to avoid "12345.0" float representation
     df[['chr', 'start', 'end', 'startCpG', 'endCpG']].to_csv(
         out_path, sep='\t', header=False, index=False)
+
+    # Diagnostic: print first few lines of output
+    if args.verbose:
+        eprint(f'  First 3 lines of {out_path}:')
+        with open(out_path) as f:
+            for i, line in enumerate(f):
+                if i >= 3:
+                    break
+                eprint(f'    {line.rstrip()}')
 
     eprint(f'  Written: {out_path}')
     return out_path
@@ -434,14 +464,47 @@ def stage3_find_markers(args, blocks_path):
         eprint(f'  Output exists: {merged_path}')
         return merged_path
 
+    # Pre-flight diagnostics
+    eprint(f'  Blocks file: {blocks_path}')
+    blocks_check = pd.read_csv(blocks_path, sep='\t', header=None, nrows=3)
+    eprint(f'  Blocks columns: {blocks_check.shape[1]}, rows (sample): {blocks_check.shape[0]}')
+    eprint(f'  Blocks dtypes: {dict(blocks_check.dtypes)}')
+    eprint(f'  Blocks head:\n{blocks_check.to_string(index=False, header=False)}')
+
+    eprint(f'  Beta files: {len(args.betas)} files')
+    if args.verbose and args.betas:
+        eprint(f'    First: {args.betas[0]}')
+        eprint(f'    Last:  {args.betas[-1]}')
+
     # Load groups to know expected cell types
     groups_df = pd.read_csv(args.groups)
     expected_groups = sorted(groups_df['group'].unique())
     eprint(f'  Expected cell types: {len(expected_groups)}')
+    eprint(f'  Groups file samples: {len(groups_df)}')
+
+    # Verify group names match beta file names
+    group_names = set(groups_df['name'] if 'name' in groups_df.columns
+                      else groups_df.iloc[:, 0])
+    beta_basenames = {op.splitext(op.splitext(op.basename(b))[0])[0]
+                      for b in args.betas}
+    matched = group_names & beta_basenames
+    unmatched = group_names - beta_basenames
+    if unmatched:
+        eprint(f'  WARNING: {len(unmatched)} group names not found in beta files:')
+        for name in sorted(list(unmatched)[:5]):
+            eprint(f'    {name}')
+        if len(unmatched) > 5:
+            eprint(f'    ... and {len(unmatched) - 5} more')
+    eprint(f'  Matched samples: {len(matched)}/{len(group_names)}')
 
     # Adaptive threshold relaxation
     delta_thresholds = [args.delta_means, 0.25, 0.2, 0.15]
     shortfall_groups = set(expected_groups)
+
+    # Use absolute paths for beta files to avoid working directory issues
+    abs_betas = [op.abspath(b) for b in args.betas]
+    abs_groups = op.abspath(args.groups)
+    abs_blocks = op.abspath(blocks_path)
 
     for i, delta in enumerate(delta_thresholds):
         if not shortfall_groups:
@@ -450,16 +513,16 @@ def stage3_find_markers(args, blocks_path):
         pass_label = f'Pass {i + 1}' if i > 0 else 'Initial pass'
         eprint(f'\n  {pass_label}: delta_means={delta}')
 
-        pass_dir = ensure_dir(op.join(markers_dir, f'pass_{i}'))
+        pass_dir = ensure_dir(op.join(args.out_dir, 'markers', f'pass_{i}'))
 
         # Run find_markers for groups that still need more markers
         targets_str = ' '.join(shortfall_groups) if i > 0 else None
         target_flag = f'--targets {targets_str}' if targets_str else ''
 
-        beta_str = ' '.join(args.betas)
+        beta_str = ' '.join(abs_betas)
         cmd = (f'{wgbstools} find_markers '
-               f'--blocks_path {blocks_path} '
-               f'--groups_file {args.groups} '
+               f'--blocks_path {abs_blocks} '
+               f'--groups_file {abs_groups} '
                f'--betas {beta_str} '
                f'--delta_means {delta} '
                f'--min_cpg {args.min_cpg} '
