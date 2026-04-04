@@ -37,13 +37,18 @@ public class BetaValueDeconvolution {
 
     // ========================= CLI Options =========================
 
-    @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end)", required = true)
+    @Option(name = "-atlas", usage = "Pre-built atlas TSV file (from generate_cgi_shore_markers.py or UXM_deconv). "
+            + "When provided, uses atlas marker regions and cell-type columns directly, "
+            + "skipping window generation, reference loading, and variability filtering.")
+    public String atlasFile = null;
+
+    @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end). Required unless -atlas is used.")
     public String cgiShoreBed;
 
-    @Option(name = "-refBetas", usage = "Comma-separated reference .beta files, or a .txt file listing one path per line", required = true)
+    @Option(name = "-refBetas", usage = "Comma-separated reference .beta files, or a .txt file listing one path per line. Required unless -atlas is used.")
     public String refBetasArg;
 
-    @Option(name = "-refGroups", usage = "CSV file mapping sample names to cell types (columns: name, group)", required = true)
+    @Option(name = "-refGroups", usage = "CSV file mapping sample names to cell types (columns: name, group). Required unless -atlas is used.")
     public String refGroupsFile;
 
     @Option(name = "-cpgIndex", usage = "CpG index BED file (e.g., data/CpG_index.hg19.bed.gz)", required = true)
@@ -77,8 +82,8 @@ public class BetaValueDeconvolution {
     private List<String> queryFiles = new ArrayList<>();
 
     private static final String USAGE =
-            "BetaValueDeconvolution [opts] -cgiShoreRegions <BED> -refBetas <betas> "
-                    + "-refGroups <CSV> -cpgIndex <BED> sample1.beta [sample2.prediction.bed.gz ...]";
+            "BetaValueDeconvolution [opts] -cpgIndex <BED> {-atlas <TSV> | -cgiShoreRegions <BED> "
+                    + "-refBetas <betas> -refGroups <CSV>} sample1.beta [sample2.prediction.bed.gz ...]";
 
     // ========================= Data Structures =========================
 
@@ -162,46 +167,73 @@ public class BetaValueDeconvolution {
             return;
         }
 
-        // Step 2: Load CpG index
-        log.info("Loading CpG index...");
-        CpgIndex cpgIndex = loadCpgIndex(cpgIndexFile);
-
-        // Step 3: Generate 1kb windows within CGI+shore
-        log.info("Generating {}bp windows within CGI+shore regions...", windowSize);
-        List<Window> windows = generateWindows(cgiShoreBed, cpgIndex);
-        log.info("Generated {} windows", windows.size());
-
-        // Step 4: Load reference beta files
-        List<String> refBetaPaths = parseRefBetas(refBetasArg);
-        Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
-        log.info("Loaded {} reference beta files, {} groups",
-                refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
-
-        log.info("Loading reference methylation data (mode: {})...", replicateMode);
-        List<String> cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
-        double[][] refMatrix = loadReferenceMethylation(
-                refBetaPaths, sampleToGroup, cellTypes, windows, cpgIndex);
-        // refMatrix: [numWindows][numCellTypes]
-
-        // Step 5: Filter and select windows
-        log.info("Filtering windows (minCoverage={}, topVariable={}%)...",
-                minCoverage, topVariablePercent * 100);
-        int[] selectedIndices = filterAndSelectWindows(refMatrix, cellTypes.size());
-        log.info("Selected {} windows after filtering", selectedIndices.length);
-
-        if (selectedIndices.length == 0) {
-            log.error("No windows passed filtering. Try lowering -minCoverage or -topVariablePercent.");
+        // Validate mode: either -atlas or (-cgiShoreRegions + -refBetas + -refGroups)
+        if (atlasFile == null && (cgiShoreBed == null || refBetasArg == null || refGroupsFile == null)) {
+            System.err.println("Error: provide either -atlas or (-cgiShoreRegions + -refBetas + -refGroups).");
+            System.err.println(USAGE);
             return;
         }
 
-        // Extract selected windows and binarize reference
-        double[][] refSelected = new double[selectedIndices.length][cellTypes.size()];
-        List<Window> selectedWindows = new ArrayList<>();
-        for (int i = 0; i < selectedIndices.length; i++) {
-            selectedWindows.add(windows.get(selectedIndices[i]));
-            for (int j = 0; j < cellTypes.size(); j++) {
-                double v = refMatrix[selectedIndices[i]][j];
-                refSelected[i][j] = v < binarizeThreshold ? 0.0 : 1.0;
+        // Load CpG index
+        log.info("Loading CpG index...");
+        CpgIndex cpgIndex = loadCpgIndex(cpgIndexFile);
+
+        List<String> cellTypes;
+        double[][] refSelected;
+        List<Window> selectedWindows;
+
+        if (atlasFile != null) {
+            // ===== Atlas mode: load pre-built reference directly =====
+            log.info("Atlas mode: loading pre-built atlas from {}", atlasFile);
+            Object[] atlasData = loadAtlas(atlasFile);
+            selectedWindows = (List<Window>) atlasData[0];
+            cellTypes = (List<String>) atlasData[1];
+            double[][] rawRef = (double[][]) atlasData[2];
+            log.info("Loaded atlas: {} markers, {} cell types", selectedWindows.size(), cellTypes.size());
+
+            // Binarize reference atlas values
+            refSelected = new double[rawRef.length][cellTypes.size()];
+            for (int i = 0; i < rawRef.length; i++) {
+                for (int j = 0; j < cellTypes.size(); j++) {
+                    double v = rawRef[i][j];
+                    refSelected[i][j] = Double.isNaN(v) || v < binarizeThreshold ? 0.0 : 1.0;
+                }
+            }
+
+        } else {
+            // ===== Original mode: build reference from scratch =====
+            log.info("Generating {}bp windows within CGI+shore regions...", windowSize);
+            List<Window> windows = generateWindows(cgiShoreBed, cpgIndex);
+            log.info("Generated {} windows", windows.size());
+
+            List<String> refBetaPaths = parseRefBetas(refBetasArg);
+            Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
+            log.info("Loaded {} reference beta files, {} groups",
+                    refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
+
+            log.info("Loading reference methylation data (mode: {})...", replicateMode);
+            cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
+            double[][] refMatrix = loadReferenceMethylation(
+                    refBetaPaths, sampleToGroup, cellTypes, windows, cpgIndex);
+
+            log.info("Filtering windows (minCoverage={}, topVariable={}%)...",
+                    minCoverage, topVariablePercent * 100);
+            int[] selectedIndices = filterAndSelectWindows(refMatrix, cellTypes.size());
+            log.info("Selected {} windows after filtering", selectedIndices.length);
+
+            if (selectedIndices.length == 0) {
+                log.error("No windows passed filtering. Try lowering -minCoverage or -topVariablePercent.");
+                return;
+            }
+
+            refSelected = new double[selectedIndices.length][cellTypes.size()];
+            selectedWindows = new ArrayList<>();
+            for (int i = 0; i < selectedIndices.length; i++) {
+                selectedWindows.add(windows.get(selectedIndices[i]));
+                for (int j = 0; j < cellTypes.size(); j++) {
+                    double v = refMatrix[selectedIndices[i]][j];
+                    refSelected[i][j] = v < binarizeThreshold ? 0.0 : 1.0;
+                }
             }
         }
 
@@ -296,6 +328,81 @@ public class BetaValueDeconvolution {
         }
         log.info("CpG index: {} sites across {} chromosomes", totalSites, chrPositions.size());
         return new CpgIndex(chrPositions, chrOffsets, totalSites);
+    }
+
+    // ========================= Atlas Loading =========================
+
+    /**
+     * Load a pre-built atlas TSV file.
+     * Format: chr start end startCpG endCpG target name direction CellType1 CellType2 ...
+     * Returns: [List<Window>, List<String> cellTypes, double[][] refMatrix]
+     */
+    private Object[] loadAtlas(String atlasPath) throws IOException {
+        List<Window> windows = new ArrayList<>();
+        List<String> cellTypes = new ArrayList<>();
+        List<double[]> rows = new ArrayList<>();
+
+        BufferedReader br;
+        if (atlasPath.endsWith(".gz")) {
+            br = new BufferedReader(new InputStreamReader(
+                    new GZIPInputStream(new FileInputStream(atlasPath)), StandardCharsets.UTF_8));
+        } else {
+            br = new BufferedReader(new FileReader(atlasPath));
+        }
+
+        try {
+            // Parse header to get cell type names (columns 8+)
+            String header = br.readLine();
+            if (header == null) throw new IOException("Empty atlas file: " + atlasPath);
+            String[] headerCols = header.split("\t");
+            if (headerCols.length <= 8) {
+                throw new IOException("Atlas file must have >8 columns (got " + headerCols.length + "): " + atlasPath);
+            }
+            for (int i = 8; i < headerCols.length; i++) {
+                cellTypes.add(headerCols[i]);
+            }
+
+            // Parse data rows
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split("\t");
+                if (parts.length < 8 + cellTypes.size()) continue;
+
+                String chr = parts[0];
+                int start, end, startCpG, endCpG;
+                try {
+                    start = Integer.parseInt(parts[1]);
+                    end = Integer.parseInt(parts[2]);
+                    startCpG = Integer.parseInt(parts[3]);
+                    endCpG = Integer.parseInt(parts[4]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+
+                windows.add(new Window(chr, start, end, startCpG, endCpG));
+
+                double[] values = new double[cellTypes.size()];
+                for (int i = 0; i < cellTypes.size(); i++) {
+                    try {
+                        String val = parts[8 + i];
+                        if (val.equals("NA") || val.equals("nan") || val.isEmpty()) {
+                            values[i] = Double.NaN;
+                        } else {
+                            values[i] = Double.parseDouble(val);
+                        }
+                    } catch (NumberFormatException e) {
+                        values[i] = Double.NaN;
+                    }
+                }
+                rows.add(values);
+            }
+        } finally {
+            br.close();
+        }
+
+        double[][] refMatrix = rows.toArray(new double[0][]);
+        return new Object[]{windows, cellTypes, refMatrix};
     }
 
     // ========================= Window Generation =========================
