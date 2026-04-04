@@ -581,6 +581,10 @@ def stage3_find_markers(args, blocks_path):
                f'--top {args.num_markers} '
                f'--out_dir {pass_dir} '
                f'--pval 0.05')
+        if args.unmeth_mean_thresh is not None:
+            cmd += f' --unmeth_mean_thresh {args.unmeth_mean_thresh}'
+        if args.meth_mean_thresh is not None:
+            cmd += f' --meth_mean_thresh {args.meth_mean_thresh}'
         if target_flag:
             cmd += f' {target_flag}'
         if args.threads:
@@ -853,6 +857,16 @@ def parse_args():
                              '(default: 25, use 250 for high-resolution)')
     parser.add_argument('--delta-means', type=float, default=0.35,
                         help='Initial delta_means threshold (default: 0.35)')
+    parser.add_argument('--unmeth-mean-thresh', type=float, default=None,
+                        help='Max mean methylation for the unmethylated group. '
+                             'For binarized beta deconvolution (threshold 0.1), '
+                             'use 0.1 so U-markers have target mean < 0.1. '
+                             '(default: wgbstools default)')
+    parser.add_argument('--meth-mean-thresh', type=float, default=None,
+                        help='Min mean methylation for the methylated group. '
+                             'For binarized beta deconvolution (threshold 0.1), '
+                             'use 0.3 so background is well above the binarization '
+                             'boundary. (default: wgbstools default)')
     parser.add_argument('--min-cpg', type=int, default=3,
                         help='Minimum CpGs per block (default: 3)')
     parser.add_argument('--max-cpg', type=int, default=50,
