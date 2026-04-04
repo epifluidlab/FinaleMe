@@ -37,18 +37,19 @@ public class BetaValueDeconvolution {
 
     // ========================= CLI Options =========================
 
-    @Option(name = "-atlas", usage = "Pre-built atlas TSV file (from generate_cgi_shore_markers.py or UXM_deconv). "
-            + "When provided, uses atlas marker regions and cell-type columns directly, "
-            + "skipping window generation, reference loading, and variability filtering.")
-    public String atlasFile = null;
+    @Option(name = "-markerRegions", usage = "Pre-defined marker regions file (atlas TSV or BED with startCpG/endCpG). "
+            + "Uses these regions instead of tiling CGI+shore into windows. "
+            + "Skips window generation and variability filtering. "
+            + "Still requires -refBetas and -refGroups to compute actual methylation levels.")
+    public String markerRegionsFile = null;
 
-    @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end). Required unless -atlas is used.")
+    @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end). Required unless -markerRegions is used.")
     public String cgiShoreBed;
 
-    @Option(name = "-refBetas", usage = "Comma-separated reference .beta files, or a .txt file listing one path per line. Required unless -atlas is used.")
+    @Option(name = "-refBetas", usage = "Comma-separated reference .beta files, or a .txt file listing one path per line", required = true)
     public String refBetasArg;
 
-    @Option(name = "-refGroups", usage = "CSV file mapping sample names to cell types (columns: name, group). Required unless -atlas is used.")
+    @Option(name = "-refGroups", usage = "CSV file mapping sample names to cell types (columns: name, group)", required = true)
     public String refGroupsFile;
 
     @Option(name = "-cpgIndex", usage = "CpG index BED file (e.g., data/CpG_index.hg19.bed.gz)", required = true)
@@ -82,8 +83,8 @@ public class BetaValueDeconvolution {
     private List<String> queryFiles = new ArrayList<>();
 
     private static final String USAGE =
-            "BetaValueDeconvolution [opts] -cpgIndex <BED> {-atlas <TSV> | -cgiShoreRegions <BED> "
-                    + "-refBetas <betas> -refGroups <CSV>} sample1.beta [sample2.prediction.bed.gz ...]";
+            "BetaValueDeconvolution [opts] -cpgIndex <BED> -refBetas <betas> -refGroups <CSV> "
+                    + "{-markerRegions <TSV/BED> | -cgiShoreRegions <BED>} sample1.beta [sample2.prediction.bed.gz ...]";
 
     // ========================= Data Structures =========================
 
@@ -167,9 +168,9 @@ public class BetaValueDeconvolution {
             return;
         }
 
-        // Validate mode: either -atlas or (-cgiShoreRegions + -refBetas + -refGroups)
-        if (atlasFile == null && (cgiShoreBed == null || refBetasArg == null || refGroupsFile == null)) {
-            System.err.println("Error: provide either -atlas or (-cgiShoreRegions + -refBetas + -refGroups).");
+        // Validate mode: either -markerRegions or -cgiShoreRegions
+        if (markerRegionsFile == null && cgiShoreBed == null) {
+            System.err.println("Error: provide either -markerRegions or -cgiShoreRegions.");
             System.err.println(USAGE);
             return;
         }
@@ -178,41 +179,43 @@ public class BetaValueDeconvolution {
         log.info("Loading CpG index...");
         CpgIndex cpgIndex = loadCpgIndex(cpgIndexFile);
 
-        List<String> cellTypes;
-        double[][] refSelected;
+        // Load reference beta files and groups (always required)
+        List<String> refBetaPaths = parseRefBetas(refBetasArg);
+        Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
+        log.info("Loaded {} reference beta files, {} groups",
+                refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
+        List<String> cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
+
         List<Window> selectedWindows;
+        double[][] refSelected;
 
-        if (atlasFile != null) {
-            // ===== Atlas mode: load pre-built reference directly =====
-            log.info("Atlas mode: loading pre-built atlas from {}", atlasFile);
-            Object[] atlasData = loadAtlas(atlasFile);
-            selectedWindows = (List<Window>) atlasData[0];
-            cellTypes = (List<String>) atlasData[1];
-            double[][] rawRef = (double[][]) atlasData[2];
-            log.info("Loaded atlas: {} markers, {} cell types", selectedWindows.size(), cellTypes.size());
+        if (markerRegionsFile != null) {
+            // ===== Marker regions mode: use pre-defined regions as markers =====
+            log.info("Marker regions mode: loading regions from {}", markerRegionsFile);
+            selectedWindows = loadMarkerRegions(markerRegionsFile);
+            log.info("Loaded {} marker regions", selectedWindows.size());
 
-            // Binarize reference atlas values
-            refSelected = new double[rawRef.length][cellTypes.size()];
-            for (int i = 0; i < rawRef.length; i++) {
+            // Compute actual methylation from reference .beta files at these regions
+            log.info("Computing reference methylation at marker regions (mode: {})...", replicateMode);
+            double[][] refMatrix = loadReferenceMethylation(
+                    refBetaPaths, sampleToGroup, cellTypes, selectedWindows, cpgIndex);
+
+            // Binarize reference
+            refSelected = new double[selectedWindows.size()][cellTypes.size()];
+            for (int i = 0; i < selectedWindows.size(); i++) {
                 for (int j = 0; j < cellTypes.size(); j++) {
-                    double v = rawRef[i][j];
+                    double v = refMatrix[i][j];
                     refSelected[i][j] = Double.isNaN(v) || v < binarizeThreshold ? 0.0 : 1.0;
                 }
             }
 
         } else {
-            // ===== Original mode: build reference from scratch =====
+            // ===== Original mode: tile CGI+shore, filter by variability =====
             log.info("Generating {}bp windows within CGI+shore regions...", windowSize);
             List<Window> windows = generateWindows(cgiShoreBed, cpgIndex);
             log.info("Generated {} windows", windows.size());
 
-            List<String> refBetaPaths = parseRefBetas(refBetasArg);
-            Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
-            log.info("Loaded {} reference beta files, {} groups",
-                    refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
-
             log.info("Loading reference methylation data (mode: {})...", replicateMode);
-            cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
             double[][] refMatrix = loadReferenceMethylation(
                     refBetaPaths, sampleToGroup, cellTypes, windows, cpgIndex);
 
@@ -330,44 +333,42 @@ public class BetaValueDeconvolution {
         return new CpgIndex(chrPositions, chrOffsets, totalSites);
     }
 
-    // ========================= Atlas Loading =========================
+    // ========================= Marker Regions Loading =========================
 
     /**
-     * Load a pre-built atlas TSV file.
-     * Format: chr start end startCpG endCpG target name direction CellType1 CellType2 ...
-     * Returns: [List<Window>, List<String> cellTypes, double[][] refMatrix]
+     * Load pre-defined marker regions from an atlas TSV or BED file.
+     * Extracts only the genomic coordinates (chr, start, end, startCpG, endCpG).
+     *
+     * Supports two formats:
+     *   - Atlas TSV: chr start end startCpG endCpG target name direction [cell type cols...]
+     *   - BED file:  chr start end startCpG endCpG [optional extra cols]
+     *
+     * Auto-detects format by checking if column 1 is numeric (BED) or has a header.
      */
-    private Object[] loadAtlas(String atlasPath) throws IOException {
+    private List<Window> loadMarkerRegions(String path) throws IOException {
         List<Window> windows = new ArrayList<>();
-        List<String> cellTypes = new ArrayList<>();
-        List<double[]> rows = new ArrayList<>();
 
         BufferedReader br;
-        if (atlasPath.endsWith(".gz")) {
+        if (path.endsWith(".gz")) {
             br = new BufferedReader(new InputStreamReader(
-                    new GZIPInputStream(new FileInputStream(atlasPath)), StandardCharsets.UTF_8));
+                    new GZIPInputStream(new FileInputStream(path)), StandardCharsets.UTF_8));
         } else {
-            br = new BufferedReader(new FileReader(atlasPath));
+            br = new BufferedReader(new FileReader(path));
         }
 
         try {
-            // Parse header to get cell type names (columns 8+)
-            String header = br.readLine();
-            if (header == null) throw new IOException("Empty atlas file: " + atlasPath);
-            String[] headerCols = header.split("\t");
-            if (headerCols.length <= 8) {
-                throw new IOException("Atlas file must have >8 columns (got " + headerCols.length + "): " + atlasPath);
-            }
-            for (int i = 8; i < headerCols.length; i++) {
-                cellTypes.add(headerCols[i]);
-            }
-
-            // Parse data rows
             String line;
             while ((line = br.readLine()) != null) {
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 String[] parts = line.split("\t");
-                if (parts.length < 8 + cellTypes.size()) continue;
+                if (parts.length < 5) continue;
+
+                // Skip header row (if column 1 is not numeric)
+                try {
+                    Integer.parseInt(parts[1]);
+                } catch (NumberFormatException e) {
+                    continue; // header row
+                }
 
                 String chr = parts[0];
                 int start, end, startCpG, endCpG;
@@ -380,29 +381,29 @@ public class BetaValueDeconvolution {
                     continue;
                 }
 
-                windows.add(new Window(chr, start, end, startCpG, endCpG));
-
-                double[] values = new double[cellTypes.size()];
-                for (int i = 0; i < cellTypes.size(); i++) {
-                    try {
-                        String val = parts[8 + i];
-                        if (val.equals("NA") || val.equals("nan") || val.isEmpty()) {
-                            values[i] = Double.NaN;
-                        } else {
-                            values[i] = Double.parseDouble(val);
-                        }
-                    } catch (NumberFormatException e) {
-                        values[i] = Double.NaN;
-                    }
+                // Skip non-autosome
+                if (chr.contains("_") || chr.equals("chrX") || chr.equals("chrY") || chr.equals("chrM")) {
+                    continue;
                 }
-                rows.add(values);
+
+                windows.add(new Window(chr, start, end, startCpG, endCpG));
             }
         } finally {
             br.close();
         }
 
-        double[][] refMatrix = rows.toArray(new double[0][]);
-        return new Object[]{windows, cellTypes, refMatrix};
+        // Deduplicate by coordinates
+        Set<String> seen = new HashSet<>();
+        List<Window> unique = new ArrayList<>();
+        for (Window w : windows) {
+            String key = w.chr + ":" + w.start + "-" + w.end;
+            if (seen.add(key)) {
+                unique.add(w);
+            }
+        }
+
+        log.info("Loaded {} unique marker regions from {}", unique.size(), path);
+        return unique;
     }
 
     // ========================= Window Generation =========================
