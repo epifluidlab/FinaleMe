@@ -205,15 +205,9 @@ public class BetaValueDeconvolution {
             }
         }
 
-        // Step 6 & 7 & 8: Process each query sample
-        PrintWriter out = outputFile != null ? new PrintWriter(new FileWriter(outputFile)) : new PrintWriter(System.out);
-
-        // Header
-        out.print("sample");
-        for (String ct : cellTypes) {
-            out.print("\t" + ct);
-        }
-        out.println();
+        // Step 6 & 7: Process each query sample
+        List<String> sampleNames = new ArrayList<>();
+        List<double[]> allWeights = new ArrayList<>();
 
         for (String queryFile : queryFiles) {
             log.info("Processing query: {}", queryFile);
@@ -228,8 +222,6 @@ public class BetaValueDeconvolution {
                 }
             }
 
-            // Remove windows where query has no data (all-NaN before binarization)
-            // Build clean matrices
             double[] weights;
             if ("NNLS".equalsIgnoreCase(solver)) {
                 weights = solveNNLS(refSelected, queryValues);
@@ -237,10 +229,25 @@ public class BetaValueDeconvolution {
                 weights = solveQP(refSelected, queryValues);
             }
 
-            // Output
-            String sampleName = new File(queryFile).getName();
-            out.print(sampleName);
-            for (double w : weights) {
+            sampleNames.add(new File(queryFile).getName());
+            allWeights.add(weights);
+        }
+
+        // Step 8: Output — rows = cell types, columns = samples
+        PrintWriter out = outputFile != null ? new PrintWriter(new FileWriter(outputFile)) : new PrintWriter(System.out);
+
+        // Header: cell_type \t sample1 \t sample2 \t ...
+        out.print("cell_type");
+        for (String name : sampleNames) {
+            out.print("\t" + name);
+        }
+        out.println();
+
+        // One row per cell type
+        for (int c = 0; c < cellTypes.size(); c++) {
+            out.print(cellTypes.get(c));
+            for (double[] weights : allWeights) {
+                double w = weights[c];
                 out.printf("\t%.4f", w < 0.001 ? 0.0 : w);
             }
             out.println();
