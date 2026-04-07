@@ -198,6 +198,51 @@ def run_cmd(
     click.echo(f"finaleme-too: wrote outputs to {output_dir}")
 
 
+@main.command("train-calibration")
+@click.option("--matched-wgbs", required=True, type=click.Path(exists=True),
+              help="Matched WGBS counts table (TSV). Columns: sample_id, chrom, start, "
+                   "end, methylated_count, total_count.")
+@click.option("--matched-finaleme", required=True, type=click.Path(exists=True),
+              help="Matched FinaleMe counts table (TSV). Same schema as --matched-wgbs.")
+@click.option("--region-annotation", default=None, type=click.Path(),
+              help="Per-marker CpG density annotation TSV (chrom, start, end, cpg_density). "
+                   "If omitted, all markers are placed in bin 0.")
+@click.option("--n-bins-candidates", default="4,6,8,10,12,16",
+              help="Comma-separated list of bin counts to evaluate via CV.")
+@click.option("--output", required=True, type=click.Path(),
+              help="Output JSON path for the trained CalibrationParams.")
+@click.option("--report", required=True, type=click.Path(),
+              help="Output JSON path for the calibration training report.")
+@click.option("--threads", default=1, type=int)
+@click.option("--verbose", is_flag=True, default=False)
+def train_calibration_cmd(
+    matched_wgbs: str,
+    matched_finaleme: str,
+    region_annotation: str | None,
+    n_bins_candidates: str,
+    output: str,
+    report: str,
+    threads: int,
+    verbose: bool,
+) -> None:
+    """Train per-bin FinaleMe calibration parameters."""
+    _setup_logging(verbose)
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    candidates = [int(x.strip()) for x in n_bins_candidates.split(",") if x.strip()]
+    params = train_calibration(
+        matched_wgbs=matched_wgbs,
+        matched_finaleme=matched_finaleme,
+        region_annotation=region_annotation,
+        n_bins_candidates=candidates,
+        out_params=output,
+        out_report=report,
+    )
+    click.echo(
+        f"finaleme-too: trained calibration with B={params.n_bins} → {output} (report: {report})"
+    )
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(

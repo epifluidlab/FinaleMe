@@ -124,3 +124,106 @@ def test_inference_qc_pass_for_normal_sample():
     assert qc["flag"] in ("PASS", "WARN", "FAIL")
     assert 0.0 <= qc["bin_coverage_balance"] <= 1.0
     assert 0.0 <= qc["prediction_range_coverage"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Phase C: training-time fit + tuning
+# ---------------------------------------------------------------------------
+
+
+def test_fit_calibration_recovers_identity():
+    from finaleme_too.preprocessing.calibration_eval import fit_calibration
+
+    rng = np.random.default_rng(0)
+    n = 500
+    truth = rng.beta(2, 5, size=n)
+    fme = truth + rng.normal(0, 0.02, size=n)
+    fme = np.clip(fme, 0.01, 0.99)
+    density = rng.uniform(0, 0.1, size=n)
+    fit = fit_calibration(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        n_bins=4,
+    )
+    # Identity-like → slope ~ 1, intercept ~ 0
+    np.testing.assert_allclose(fit.a, np.ones(4), atol=0.2)
+    np.testing.assert_allclose(fit.c, np.zeros(4), atol=0.2)
+    assert fit.overall["r_squared"] > 0.9
+
+
+def test_tune_n_bins_selects_finite_value():
+    from finaleme_too.preprocessing.calibration_eval import tune_n_bins
+
+    rng = np.random.default_rng(1)
+    n = 600
+    sample_ids = np.array([f"S{i // 100}" for i in range(n)])
+    truth = rng.beta(2, 5, size=n)
+    fme = np.clip(truth + rng.normal(0, 0.05, size=n), 0.01, 0.99)
+    density = rng.uniform(0, 0.1, size=n)
+    out = tune_n_bins(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 8],
+    )
+    assert out["selected_n_bins"] in (2, 4, 8)
+    assert len(out["candidates"]) == 3
+
+
+def test_train_calibration_end_to_end(tmp_path):
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rng = np.random.default_rng(2)
+    n_samples = 4
+    n_markers = 150
+    rows_w = []
+    rows_f = []
+    rows_a = []
+    for s in range(n_samples):
+        sid = f"S{s}"
+        for m in range(n_markers):
+            true_b = float(rng.beta(2, 5))
+            n_w = 30
+            k_w = int(rng.binomial(n_w, true_b))
+            density = float(rng.uniform(0, 0.1))
+            # Miscalibration: a=0.8, c=0.1
+            true_logit = logit(np.clip(true_b, 1e-6, 1 - 1e-6))
+            fme_logit = (true_logit - 0.1) / 0.8 + rng.normal(0, 0.2)
+            fme_b = float(expit(fme_logit))
+            n_f = 30
+            k_f = int(rng.binomial(n_f, fme_b))
+            rows_w.append((sid, "chr1", m * 100, m * 100 + 50, k_w, n_w))
+            rows_f.append((sid, "chr1", m * 100, m * 100 + 50, k_f, n_f))
+            if s == 0:
+                rows_a.append(("chr1", m * 100, m * 100 + 50, density))
+
+    import pandas as pd
+
+    pd.DataFrame(
+        rows_w, columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"]
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f, columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"]
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+    pd.DataFrame(rows_a, columns=["chrom", "start", "end", "cpg_density"]).to_csv(
+        tmp_path / "ann.tsv", sep="\t", index=False
+    )
+
+    params = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=tmp_path / "ann.tsv",
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+    )
+    assert params.n_bins in (2, 4)
+    assert (tmp_path / "cal.json").exists()
+    assert (tmp_path / "report.json").exists()
+    # Round-trip
+    loaded = CalibrationParams.load(tmp_path / "cal.json")
+    np.testing.assert_allclose(loaded.a, params.a)

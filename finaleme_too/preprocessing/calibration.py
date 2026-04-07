@@ -154,9 +154,126 @@ def load_default_calibration() -> CalibrationParams:
     return CalibrationParams.load(shipped_default_calibration_path())
 
 
+# ----------------------------------------------------------------------------
+# Phase C: training pipeline
+# ----------------------------------------------------------------------------
+
+
+def _load_matched_table(path: str | Path) -> pd.DataFrame:
+    """Load a matched WGBS or FinaleMe table for training.
+
+    Expected columns: sample_id, chrom, start, end, methylated_count, total_count
+    Optional: cpg_density (joined from region_annotation if absent).
+    """
+    df = pd.read_csv(path, sep="\t", comment="#")
+    required = {"sample_id", "chrom", "start", "end", "methylated_count", "total_count"}
+    missing = required - set(df.columns)
+    if missing:
+        raise InvalidCalibrationError(f"Matched table missing columns: {sorted(missing)}")
+    return df
+
+
+def train_calibration(
+    matched_wgbs: str | Path,
+    matched_finaleme: str | Path,
+    region_annotation: str | Path | None,
+    n_bins_candidates: list[int],
+    out_params: str | Path,
+    out_report: str | Path,
+) -> CalibrationParams:
+    """Train per-bin calibration parameters from matched WGBS / FinaleMe samples.
+
+    Workflow (math doc §6.4):
+        1. Join WGBS + FinaleMe per-marker observations on (sample_id, chrom, start, end)
+        2. Compute beta = methylated / total for each
+        3. Join CpG density from region_annotation (or fall back to bin index 0)
+        4. tune_n_bins() over the candidate B values via leave-one-sample-out CV
+        5. Fit final calibration on all data with the selected B
+        6. Write JSON params + JSON report
+    """
+    from finaleme_too.preprocessing.calibration_eval import fit_calibration, tune_n_bins
+    from finaleme_too.io.output_writer import write_calibration_report
+
+    wgbs_df = _load_matched_table(matched_wgbs)
+    fme_df = _load_matched_table(matched_finaleme)
+
+    join_keys = ["sample_id", "chrom", "start", "end"]
+    merged = wgbs_df.merge(
+        fme_df, on=join_keys, suffixes=("_wgbs", "_fme")
+    )
+    if merged.empty:
+        raise InvalidCalibrationError(
+            "No overlapping (sample_id, chrom, start, end) between WGBS and FinaleMe tables"
+        )
+
+    # CpG density: join from region_annotation if available
+    if region_annotation is not None:
+        ann = pd.read_csv(region_annotation, sep="\t", comment="#")
+        merged = merged.merge(
+            ann[["chrom", "start", "end", "cpg_density"]],
+            on=["chrom", "start", "end"],
+            how="left",
+        )
+    if "cpg_density" not in merged.columns:
+        merged["cpg_density"] = 0.0
+    merged["cpg_density"] = merged["cpg_density"].fillna(0.0)
+
+    wgbs_beta = (
+        merged["methylated_count_wgbs"] / merged["total_count_wgbs"].clip(lower=1)
+    ).to_numpy(dtype=np.float64)
+    fme_beta = (
+        merged["methylated_count_fme"] / merged["total_count_fme"].clip(lower=1)
+    ).to_numpy(dtype=np.float64)
+    density = merged["cpg_density"].to_numpy(dtype=np.float64)
+    sample_ids = merged["sample_id"].astype(str).to_numpy()
+
+    tune_result = tune_n_bins(
+        finaleme_beta=fme_beta,
+        wgbs_beta=wgbs_beta,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=n_bins_candidates,
+    )
+    best_B = int(tune_result["selected_n_bins"])
+
+    final = fit_calibration(
+        finaleme_beta=fme_beta,
+        wgbs_beta=wgbs_beta,
+        cpg_density=density,
+        n_bins=best_B,
+    )
+
+    params = CalibrationParams(
+        n_bins=final.n_bins,
+        bin_edges=final.bin_edges,
+        a=final.a,
+        c=final.c,
+        log_dispersion=final.log_dispersion,
+        training_metadata={
+            "n_training_samples": int(len(np.unique(sample_ids))),
+            "n_observations": int(len(merged)),
+            "n_bins_candidates": list(n_bins_candidates),
+            "tune_result": tune_result,
+        },
+    )
+    params.save(out_params)
+
+    report = {
+        "calibration_version": "1.0",
+        "n_training_samples": int(len(np.unique(sample_ids))),
+        "n_bins": best_B,
+        "overall_metrics": final.overall,
+        "per_bin_metrics": final.per_bin_metrics,
+        "candidates": tune_result["candidates"],
+    }
+    write_calibration_report(report, out_report)
+    return params
+
+
 __all__ = [
     "CalibrationParams",
     "apply_calibration",
     "load_default_calibration",
     "shipped_default_calibration_path",
+    "train_calibration",
 ]
