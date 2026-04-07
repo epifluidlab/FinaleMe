@@ -1,8 +1,8 @@
-"""Same-group cohort imputation for low-coverage markers (math doc §9.1)."""
+"""Same-group cohort imputation for low-coverage markers (math doc §9.1, §9.2)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -12,7 +12,17 @@ from finaleme_too.io.methylation_loader import MarkerObservations
 
 @dataclass
 class CohortImputer:
-    """Impute missing-coverage markers from same-group cohort samples."""
+    """Impute missing-coverage markers from same-group cohort samples.
+
+    Math doc §9:
+        μ̂_{i,s} = Σ_{s' ∈ G(s)} v_{s'} * μ_{i,s'} / Σ_{s'} v_{s'}
+        v_{s'} = n_{i,s'} * I(n_{i,s'} ≥ threshold)
+
+    Constraints (§9.2):
+        - Never impute across comparison groups.
+        - Require **≥ min_donors eligible donors *per marker*** (not globally).
+          Markers without enough eligible donors are left unchanged.
+    """
 
     coverage_threshold: int = 3
     min_donors: int = 3
@@ -23,16 +33,6 @@ class CohortImputer:
         cohort: list[MarkerObservations],
         sample_groups: dict[str, str | None],
     ) -> MarkerObservations:
-        """Return a new MarkerObservations with imputed counts where needed.
-
-        Per math doc §9.1:
-            μ̂_{i,s} = Σ_{s' ∈ G(s)} v_{s'} * μ_{i,s'} / Σ_{s'} v_{s'}
-        where v_{s'} = n_{i,s'} * I(n_{i,s'} ≥ threshold).
-
-        ``sample_groups`` maps sample_id → group label. Imputation only uses
-        donors in the same group as ``sample``. Raises IllegalImputationError
-        if no group label is set on ``sample``.
-        """
         sample_group = sample_groups.get(sample.sample_id)
         if sample_group is None:
             raise IllegalImputationError(
@@ -45,8 +45,8 @@ class CohortImputer:
             if obs.sample_id != sample.sample_id
             and sample_groups.get(obs.sample_id) == sample_group
         ]
-        if len(donors) < self.min_donors:
-            return sample  # not enough donors — leave as-is
+        if not donors:
+            return sample
 
         n = np.asarray(sample.n, dtype=np.int64)
         k = np.asarray(sample.k, dtype=np.int64)
@@ -60,9 +60,14 @@ class CohortImputer:
         donor_k = np.stack(
             [np.asarray(d.k, dtype=np.float64) for d in donors], axis=0
         )
-        eligible = donor_n >= self.coverage_threshold
-        weights = donor_n * eligible
+        # Per-marker eligibility: only donors with enough coverage at THIS marker
+        eligible = donor_n >= self.coverage_threshold  # (n_donors, n_markers)
+        eligible_count = eligible.sum(axis=0)  # (n_markers,)
+        # Per-marker constraint: >= min_donors eligible donors
+        passes_donor_count = eligible_count >= self.min_donors
 
+        # Weighted mean of donor methylation, but only over eligible donors
+        weights = donor_n * eligible
         weight_sum = weights.sum(axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
             beta_hat = np.where(
@@ -71,19 +76,30 @@ class CohortImputer:
                 np.nan,
             )
 
-        # Median donor coverage gives the synthetic n for imputed markers
-        median_donor_n = np.median(donor_n, axis=0)
+        # Synthetic n: median over **eligible** donors only (not all)
+        # so that medians aren't dragged down by low-coverage donors at
+        # this particular marker.
+        donor_n_masked = np.where(eligible, donor_n, np.nan)
+        with np.errstate(invalid="ignore"):
+            median_eligible_n = np.nanmedian(donor_n_masked, axis=0)
+        # When no eligible donor exists the median is NaN; fall back to 1.
+        median_eligible_n = np.where(
+            np.isfinite(median_eligible_n), median_eligible_n, 1.0
+        )
         synthetic_n = np.where(
-            np.isfinite(beta_hat), np.maximum(median_donor_n, 1).astype(np.int64), n
+            np.isfinite(beta_hat) & passes_donor_count,
+            np.maximum(median_eligible_n, 1).astype(np.int64),
+            n,
         )
         synthetic_k = np.where(
-            np.isfinite(beta_hat),
+            np.isfinite(beta_hat) & passes_donor_count,
             np.round(beta_hat * synthetic_n).astype(np.int64),
             k,
         )
 
-        new_k = np.where(below & np.isfinite(beta_hat), synthetic_k, k).astype(np.int32)
-        new_n = np.where(below & np.isfinite(beta_hat), synthetic_n, n).astype(np.int32)
+        do_impute = below & np.isfinite(beta_hat) & passes_donor_count
+        new_k = np.where(do_impute, synthetic_k, k).astype(np.int32)
+        new_n = np.where(do_impute, synthetic_n, n).astype(np.int32)
         return sample.with_counts(new_k, new_n)
 
 

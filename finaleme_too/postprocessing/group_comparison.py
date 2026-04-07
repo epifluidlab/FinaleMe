@@ -9,6 +9,7 @@ import numpy as np
 from finaleme_too.config import TestMethod
 from finaleme_too.postprocessing.statistical_testing import (
     TestResult,
+    bayesian_group_comparison,
     compositional_regression_test,
     wilcoxon_test,
 )
@@ -104,8 +105,17 @@ def run_group_comparisons(
     spec: str | None,
     method: TestMethod = TestMethod.ILR_REGRESSION,
     fdr_alpha: float = 0.05,
+    posterior_samples_by_sample: dict[str, np.ndarray] | None = None,
 ) -> list[TestResult]:
-    """Top-level dispatcher."""
+    """Top-level dispatcher.
+
+    Parameters
+    ----------
+    posterior_samples_by_sample
+        Required when ``method == TestMethod.BAYESIAN_POSTERIOR``. Maps
+        sample_id → (T, K+1) MCMC draws. If missing, falls back to ILR
+        regression with a warning.
+    """
     available = sorted({g for g in group_labels if g is not None})
     if len(available) < 2 or spec is None:
         return []
@@ -121,6 +131,24 @@ def run_group_comparisons(
             pairwise = wilcoxon_test(
                 proportions, group_labels, cell_type_names, contrasts, fdr_alpha
             )
+        elif method == TestMethod.BAYESIAN_POSTERIOR:
+            if not posterior_samples_by_sample:
+                # Fall back: no posterior samples available → use ILR regression
+                pairwise = compositional_regression_test(
+                    proportions, sample_ids, group_labels, cell_type_names, contrasts,
+                    fdr_alpha=fdr_alpha,
+                )
+            else:
+                sample_groups_map = {
+                    sid: lab for sid, lab in zip(sample_ids, group_labels)
+                }
+                pairwise = bayesian_group_comparison(
+                    posterior_samples_by_sample=posterior_samples_by_sample,
+                    sample_groups=sample_groups_map,
+                    cell_type_names=cell_type_names,
+                    contrasts=contrasts,
+                    fdr_alpha=fdr_alpha,
+                )
         else:
             pairwise = compositional_regression_test(
                 proportions, sample_ids, group_labels, cell_type_names, contrasts,

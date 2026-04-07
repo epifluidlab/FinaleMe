@@ -351,14 +351,13 @@ def _aggregate_per_cpg_to_markers(
     n_markers = marker_regions.n_markers
     k_arr = np.zeros(n_markers, dtype=np.int64)
     n_arr = np.zeros(n_markers, dtype=np.int64)
-    pct_sum = np.zeros(n_markers, dtype=np.float64) if keep_pct else None
-    pct_n = np.zeros(n_markers, dtype=np.int64) if keep_pct else None
 
     cpg_chrom_arr = np.asarray(cpg_chrom)
     cpg_start_arr = np.asarray(cpg_start, dtype=np.int64)
     cpg_methy_arr = np.asarray(cpg_methy, dtype=np.float64)
     cpg_total_arr = np.asarray(cpg_total, dtype=np.float64)
-    cpg_pct_arr = np.asarray(cpg_pct, dtype=np.float64) if cpg_pct is not None else None
+    # cpg_pct (per-CpG percentage) is no longer used: predicted_beta is now
+    # derived from the count-weighted ratio so it stays consistent with k/n.
 
     # Group CpGs by chromosome
     unique_chroms = np.unique(cpg_chrom_arr)
@@ -384,15 +383,15 @@ def _aggregate_per_cpg_to_markers(
         sel = idx_for_chrom[lo:hi]
         k_arr[mi] = int(np.sum(cpg_methy_arr[sel]))
         n_arr[mi] = int(np.sum(cpg_total_arr[sel]))
-        if keep_pct and cpg_pct_arr is not None:
-            pct_sum[mi] = float(np.sum(cpg_pct_arr[sel]))  # type: ignore[index]
-            pct_n[mi] = sel.size  # type: ignore[index]
 
-    if keep_pct and pct_sum is not None and pct_n is not None:
-        with np.errstate(invalid="ignore"):
-            predicted_beta = np.where(pct_n > 0, pct_sum / np.maximum(pct_n, 1), np.nan).astype(
-                np.float32
-            )
+    if keep_pct:
+        # Derive predicted_beta from the count-weighted ratio so it stays
+        # consistent with k/n. An unweighted mean of per-CpG percentages
+        # would diverge from k/n whenever CpGs have different coverage.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            predicted_beta = np.where(
+                n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+            ).astype(np.float32)
     else:
         predicted_beta = None
 
