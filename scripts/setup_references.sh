@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${FINALEME_DATA_DIR:-${ROOT_DIR}/data}"
 ZENODO_URL="https://zenodo.org/records/19392525/files"
-JAR_PATH="${ROOT_DIR}/target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR_PATH="${ROOT_DIR}/target/FinaleMe-0.61-jar-with-dependencies.jar"
 
 OS=""
 ARCH=""

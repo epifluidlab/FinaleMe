@@ -46,7 +46,7 @@ curl -L "https://zenodo.org/records/6914806/files/BH01.chr22.bam.bai?download=1"
 Set a jar variable once:
 
 ```bash
-JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.61-jar-with-dependencies.jar"
 ```
 
 ### Step 1: Build CpG feature matrix
@@ -98,17 +98,13 @@ java -Xmx20G -cp "$JAR" \
   -t 4 \
   -bwOutput \
   -chromSizeFile data/hg19.chrom.sizes \
-  -patOutput \
-  -cpgIndexFile data/CpG_index.hg19.bed.gz
 ```
 
 Outputs:
 - `results/BH01.decode.prediction.bed.gz`
 - `results/BH01.decode.prediction.methy.bw`
 - `results/BH01.decode.prediction.cov.bw`
-- `results/BH01.decode.prediction.methy_count.bw`
-- `results/BH01.decode.prediction.pat.gz`
-- `results/BH01.decode.prediction.beta`. 
+- `results/BH01.decode.prediction.methy_count.bw`. 
 
 It will cost < 1 min for the test dataset.
 
