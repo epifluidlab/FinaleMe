@@ -50,6 +50,7 @@ from finaleme_too.io.reference_panel import (
     load_cpg_index,
 )
 from finaleme_too.io.sample_sheet import Sample, SampleSheet
+from finaleme_too.preprocessing.batch_correction import combat_correct
 from finaleme_too.preprocessing.calibration import (
     CalibrationParams,
     apply_calibration,
@@ -57,7 +58,9 @@ from finaleme_too.preprocessing.calibration import (
 )
 from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
 from finaleme_too.preprocessing.coverage import CoverageTierAssigner
+from finaleme_too.preprocessing.imputation import CohortImputer
 from finaleme_too.preprocessing.marker_selection import BalancedMarkerSelector
+from finaleme_too.postprocessing.covariate_adjustment import adjust_covariates
 from finaleme_too.postprocessing.group_comparison import run_group_comparisons
 from finaleme_too.postprocessing.qc import compute_qc_flags
 from finaleme_too.utils.parallel import parallel_map
@@ -133,24 +136,120 @@ class TOOPipeline:
             reference = _subset_reference(reference, marker_subset_indices)
             marker_regions = _subset_marker_regions(marker_regions, marker_subset_indices)
 
-        # Per-sample work in parallel
-        def _process(sample: Sample) -> DeconvolutionResult:
-            return self._process_sample(sample, reference, marker_regions, cpg_index, out_dir)
+        # Phase D: load all samples first so we can do cohort-level operations
+        # (batch correction, imputation) before deconvolution.
+        log.info("Loading + calibrating %d samples", len(sample_sheet.samples))
+        loaded_obs: list[MarkerObservations] = parallel_map(
+            lambda s: self._load_and_calibrate(s, marker_regions, cpg_index),
+            sample_sheet.samples,
+            n_jobs=self.config.threads,
+        )
 
-        results = parallel_map(_process, sample_sheet.samples, n_jobs=self.config.threads)
+        # Optional: ComBat-style technical batch correction
+        if self.config.batch_correction.technical_covariates:
+            batch_var = self.config.batch_correction.technical_covariates[0]
+            batch_labels = [
+                str(s.metadata.get(batch_var)) if batch_var in s.metadata else None
+                for s in sample_sheet.samples
+            ]
+            log.info("Applying batch correction on %s", batch_var)
+            loaded_obs = combat_correct(
+                loaded_obs,
+                batch_labels=batch_labels,
+                min_levels=self.config.batch_correction.min_levels,
+                min_per_level=self.config.batch_correction.min_samples_per_level,
+            )
+
+        # Optional: cohort imputation for low-coverage markers (LOW/ULTRALOW)
+        sample_groups_map = {s.sample_id: s.group for s in sample_sheet.samples}
+        if self._should_impute(loaded_obs):
+            imputer = CohortImputer(coverage_threshold=self.config.coverage.min_reads)
+            loaded_obs = [
+                imputer.impute(obs, loaded_obs, sample_groups_map) for obs in loaded_obs
+            ]
+
+        # Per-sample deconvolution (parallel)
+        def _decon(args: tuple[Sample, MarkerObservations]) -> DeconvolutionResult:
+            sample, obs = args
+            return self._deconvolve_sample(sample, obs, reference, out_dir)
+
+        results = parallel_map(
+            _decon,
+            list(zip(sample_sheet.samples, loaded_obs)),
+            n_jobs=self.config.threads,
+        )
+
+        # Phase D: optional ILR-space biological covariate adjustment
+        adjusted_results = self._maybe_adjust_covariates(results, sample_sheet)
 
         # Cohort outputs
         sample_groups = {s.sample_id: s.group for s in sample_sheet.samples}
-        write_cohort_proportions(results, sample_groups, out_dir / "cohort_proportions.tsv")
-        write_qc_summary(results, sample_groups, out_dir / "qc_summary.tsv")
+        write_cohort_proportions(
+            adjusted_results, sample_groups, out_dir / "cohort_proportions.tsv"
+        )
+        write_qc_summary(adjusted_results, sample_groups, out_dir / "qc_summary.tsv")
 
         # Group comparison (P1)
         if self.group_comparison_spec and len(results) >= 4:
-            test_results = self._run_group_comparisons(results, sample_groups)
+            test_results = self._run_group_comparisons(adjusted_results, sample_groups)
             if test_results:
                 write_group_comparison(test_results, out_dir / "group_comparison.tsv")
 
-        return CohortResult(samples=results, sample_groups=sample_groups)
+        return CohortResult(samples=adjusted_results, sample_groups=sample_groups)
+
+    def _should_impute(self, observations: list[MarkerObservations]) -> bool:
+        """Phase D: enable imputation if any sample is in LOW/ULTRALOW tier."""
+        for obs in observations:
+            tier = self.tier_assigner.assign(obs)
+            if tier in (CoverageTier.LOW, CoverageTier.ULTRALOW):
+                return True
+        return False
+
+    def _maybe_adjust_covariates(
+        self,
+        results: list[DeconvolutionResult],
+        sample_sheet: SampleSheet,
+    ) -> list[DeconvolutionResult]:
+        """Apply ILR-space biological covariate adjustment if configured."""
+        bio = self.config.covariate_adjustment.biological_covariates
+        if not bio or len(results) < 3:
+            return results
+
+        # Build a (S, K+1) proportions matrix and a covariates DataFrame
+        sample_ids = [r.sample_id for r in results]
+        prop = np.array([r.proportions for r in results], dtype=np.float64)
+        rows = []
+        for s in sample_sheet.samples:
+            row = {"sample_id": s.sample_id}
+            row.update(s.biological_covariates)
+            rows.append(row)
+        cov_df = pd.DataFrame(rows)
+        adjusted = adjust_covariates(
+            proportions=prop,
+            sample_ids=sample_ids,
+            covariates=cov_df,
+            columns=bio,
+        )
+        out: list[DeconvolutionResult] = []
+        for r, new_p in zip(results, adjusted):
+            out.append(
+                DeconvolutionResult(
+                    sample_id=r.sample_id,
+                    cell_types=r.cell_types,
+                    proportions=new_p,
+                    ci_lower=r.ci_lower,
+                    ci_upper=r.ci_upper,
+                    p_goodness=r.p_goodness,
+                    p_detection=r.p_detection,
+                    reliability=r.reliability,
+                    n_markers=r.n_markers,
+                    bootstrap_proportions=r.bootstrap_proportions,
+                    posterior_samples=r.posterior_samples,
+                    coverage_tier=r.coverage_tier,
+                    qc_flags=list(r.qc_flags),
+                )
+            )
+        return out
 
     def _run_group_comparisons(
         self,
@@ -175,15 +274,19 @@ class TOOPipeline:
     # Per-sample
     # ------------------------------------------------------------------
 
-    def _process_sample(
+    def _load_and_calibrate(
         self,
         sample: Sample,
-        reference: ReferencePanel,
         marker_regions: MarkerRegions,
         cpg_index: dict | None,
-        out_dir: Path,
-    ) -> DeconvolutionResult:
-        log.info("Processing sample %s (%s)", sample.sample_id, sample.mode.value)
+    ) -> MarkerObservations:
+        """Phase D: load methylation data and apply FinaleMe calibration only.
+
+        Coverage tier assignment, observation model construction, and
+        deconvolution are deferred to ``_deconvolve_sample`` so that batch
+        correction and imputation can run in between.
+        """
+        log.info("Loading sample %s (%s)", sample.sample_id, sample.mode.value)
         obs = MethylationLoader.load(
             filepath=sample.methylation_file,
             sample_id=sample.sample_id,
@@ -194,14 +297,28 @@ class TOOPipeline:
             total_col=sample.total_col,
             cpg_index=cpg_index,
         )
-
-        # Phase B: FinaleMe calibration (apply path)
-        calibration_flag: str | None = None
         if sample.mode == MeasurementMode.FINALEME and self.calibration is not None:
             obs = apply_calibration(obs, self.calibration, self.region_annotations)
-            if obs.predicted_beta is not None:
-                qc = compute_inference_qc(obs.predicted_beta, self.calibration)
-                calibration_flag = qc.get("flag")
+        return obs
+
+    def _deconvolve_sample(
+        self,
+        sample: Sample,
+        obs: MarkerObservations,
+        reference: ReferencePanel,
+        out_dir: Path,
+    ) -> DeconvolutionResult:
+        """Build observation model, deconvolve, bootstrap, write per-sample TSV."""
+        log.info("Deconvolving sample %s", sample.sample_id)
+
+        calibration_flag: str | None = None
+        if (
+            sample.mode == MeasurementMode.FINALEME
+            and self.calibration is not None
+            and obs.predicted_beta is not None
+        ):
+            qc = compute_inference_qc(obs.predicted_beta, self.calibration)
+            calibration_flag = qc.get("flag")
 
         tier = self.tier_assigner.assign(obs)
         observation = self.observation_builder.build(
