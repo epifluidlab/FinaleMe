@@ -273,6 +273,19 @@ class TOOPipeline:
         prop = np.array([r.proportions for r in results], dtype=np.float64)  # (S, K+1)
         sample_ids = [r.sample_id for r in results]
         labels = [sample_groups.get(sid) for sid in sample_ids]
+
+        # Bayesian comparison needs per-sample posterior draws (Phase E only)
+        posterior_by_sample: dict[str, np.ndarray] | None = None
+        if (
+            self.config.testing.method.value == "bayesian_posterior"
+            and any(r.posterior_samples is not None for r in results)
+        ):
+            posterior_by_sample = {
+                r.sample_id: r.posterior_samples
+                for r in results
+                if r.posterior_samples is not None
+            }
+
         return run_group_comparisons(
             proportions=prop,
             sample_ids=sample_ids,
@@ -281,11 +294,23 @@ class TOOPipeline:
             spec=self.group_comparison_spec,
             method=self.config.testing.method,
             fdr_alpha=self.config.testing.fdr_alpha,
+            posterior_samples_by_sample=posterior_by_sample,
         )
 
     # ------------------------------------------------------------------
     # Per-sample
     # ------------------------------------------------------------------
+
+    def _marker_cpg_density(self, obs: MarkerObservations) -> np.ndarray | None:
+        """Look up per-marker CpG density from region_annotations, if loaded."""
+        if self.region_annotations is None or self.region_annotations.empty:
+            return None
+        try:
+            ann = self.region_annotations.set_index(["chrom", "start", "end"])["cpg_density"]
+        except KeyError:
+            return None
+        keys = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
+        return np.array([float(ann.get(k, np.nan)) for k in keys], dtype=np.float64)
 
     def _load_and_calibrate(
         self,
@@ -330,7 +355,12 @@ class TOOPipeline:
             and self.calibration is not None
             and obs.predicted_beta is not None
         ):
-            qc = compute_inference_qc(obs.predicted_beta, self.calibration)
+            density_vec = self._marker_cpg_density(obs)
+            qc = compute_inference_qc(
+                obs.predicted_beta,
+                self.calibration,
+                cpg_density=density_vec,
+            )
             calibration_flag = qc.get("flag")
 
         tier = self.tier_assigner.assign(obs)

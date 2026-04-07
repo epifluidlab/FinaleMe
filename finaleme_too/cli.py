@@ -139,10 +139,26 @@ def run_cmd(
     config.coverage.coverage_cap = coverage_cap
     config.coverage.min_reads = min_coverage
     config.uncertainty.n_bootstrap = n_bootstrap
+    config.uncertainty.bayesian_n_samples = bayesian_n_samples
     if bayesian:
         config.model.deconvolution = SolverMethod.BAYESIAN
     if test_method:
         config.testing.method = TestMethod(test_method)
+    config.testing.fdr_alpha = fdr_alpha
+    config.testing.fdr_method = fdr_method
+    # Wire batch and biological covariate lists
+    if batch_correct is not None:
+        config.batch_correction.technical_covariates = [
+            c.strip() for c in batch_correct.split(",") if c.strip()
+        ]
+    if adjust_covariates is not None:
+        config.covariate_adjustment.biological_covariates = [
+            c.strip() for c in adjust_covariates.split(",") if c.strip()
+        ]
+    if configurable_covariates is not None:
+        config.covariate_adjustment.user_configurable = [
+            c.strip() for c in configurable_covariates.split(",") if c.strip()
+        ]
 
     sample_sheet = SampleSheet.from_tsv(sample_sheet_path)
     sample_sheet.validate_files_exist()
@@ -188,11 +204,16 @@ def run_cmd(
         calibration_params = load_optional_calibration(config, calibration)
         region_annotations = load_optional_region_annotations(config, region_annotation)
 
+    # Group comparison: fall back to config default if CLI is omitted
+    effective_group_comparison = (
+        group_comparison if group_comparison is not None else config.testing.group_comparison
+    )
+
     pipeline = TOOPipeline(
         config=config,
         calibration=calibration_params,
         region_annotations=region_annotations,
-        group_comparison_spec=group_comparison,
+        group_comparison_spec=effective_group_comparison,
     )
     pipeline.run(sample_sheet, reference, markers, output_dir, cpg_index=cpg_idx)
     click.echo(f"finaleme-too: wrote outputs to {output_dir}")

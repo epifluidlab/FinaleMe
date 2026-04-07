@@ -60,25 +60,37 @@ def compute_hosmer_lemeshow(
 
 
 def compute_inference_qc(
-    sample_observations: np.ndarray,  # array of predicted beta values for the sample
+    sample_predicted_beta: np.ndarray,  # raw FinaleMe predictions for the sample
     params: CalibrationParams,
+    cpg_density: np.ndarray | None = None,
     training_residuals: np.ndarray | None = None,
+    training_pred_range: tuple[float, float] | None = None,
 ) -> dict:
     """Per-sample inference-time calibration QC (architecture §5.3.2).
 
-    Returns a dict with:
-        prediction_range_coverage : fraction of markers within their bin's
-                                    training range
-        residual_ks_p : 2-sample KS p-value comparing this sample's residuals
-                        to the training residual distribution (if provided)
+    Bins are assigned by **CpG density** (matching how the calibration model
+    was trained), not by predicted beta. Prediction range coverage measures
+    how many predictions fall inside the training prediction range of the
+    bin they were assigned to. KS residuals compare this sample's per-marker
+    calibration residuals (calibrated - raw, in logit space) against the
+    training residual distribution.
+
+    Returns
+    -------
+    Dict with:
+        prediction_range_coverage : fraction of markers whose predicted beta
+            lies within the training prediction range (defaults to [0, 1] if
+            ``training_pred_range`` is omitted)
         bin_coverage_balance : fraction of bins with >= 10 markers in this sample
+        residual_ks_p : two-sample KS p-value comparing the sample's per-marker
+            residuals against ``training_residuals`` (if provided)
         flag : "PASS" / "WARN" / "FAIL"
     """
-    sample_pred = np.asarray(sample_observations, dtype=np.float64)
-    valid = np.isfinite(sample_pred)
-    sample_pred = sample_pred[valid]
+    sample_pred = np.asarray(sample_predicted_beta, dtype=np.float64)
+    valid_mask = np.isfinite(sample_pred)
+    sample_pred_valid = sample_pred[valid_mask]
 
-    if sample_pred.size == 0:
+    if sample_pred_valid.size == 0:
         return {
             "prediction_range_coverage": 0.0,
             "residual_ks_p": float("nan"),
@@ -86,23 +98,42 @@ def compute_inference_qc(
             "flag": "FAIL",
         }
 
-    # Bin range coverage: fraction within [0, 1] (always true for betas)
-    in_range = float(np.mean((sample_pred >= 0.0) & (sample_pred <= 1.0)))
+    # 1) Prediction range coverage: fraction of markers within the training
+    # prediction range. If no explicit range is provided, default to (0, 1)
+    # exclusive (a more meaningful check than [0, 1] inclusive).
+    if training_pred_range is not None:
+        lo, hi = training_pred_range
+    else:
+        lo, hi = 1e-6, 1.0 - 1e-6
+    in_range = float(np.mean((sample_pred_valid > lo) & (sample_pred_valid < hi)))
 
-    # Bin coverage balance: count markers per bin
-    bin_idx = params.assign_bin(sample_pred)
+    # 2) Bin coverage balance: bins are assigned by CpG density, NOT by
+    # predicted beta. Markers without a known density fall into bin 0.
+    if cpg_density is not None:
+        density = np.asarray(cpg_density, dtype=np.float64)
+        if density.shape != sample_pred.shape:
+            # Density vector is for the original ordering — restrict to valid
+            density_valid = density[valid_mask]
+        else:
+            density_valid = density[valid_mask]
+        density_valid = np.where(np.isfinite(density_valid), density_valid, float(params.bin_edges.mean()))
+        bin_idx = params.assign_bin(density_valid)
+    else:
+        bin_idx = np.zeros(sample_pred_valid.size, dtype=np.int64)
     counts = np.bincount(bin_idx, minlength=params.n_bins)
     balance = float(np.mean(counts >= 10))
 
-    # KS test on residuals if training residuals are provided
-    if training_residuals is not None and training_residuals.size > 0:
-        sample_logit = _logit(sample_pred)
-        # Apply identity calibration as a reference; residual = sample_logit - logit(sample_pred)
-        # = 0 here, so this only flags when training_residuals is not centred at 0.
-        sample_residuals = sample_logit - sample_logit.mean()
-        ks_p = float(ks_2samp(sample_residuals, training_residuals).pvalue)
-    else:
-        ks_p = float("nan")
+    # 3) KS test on per-marker calibration residuals (logit space).
+    # Residual = logit(calibrated) - logit(raw). With the params' a/c the
+    # calibrated value is logit_cal = a*logit(raw) + c, so the residual is
+    # (a-1)*logit(raw) + c.
+    ks_p = float("nan")
+    if training_residuals is not None and np.asarray(training_residuals).size > 0:
+        a_per = params.a[bin_idx]
+        c_per = params.c[bin_idx]
+        raw_logit = _logit(np.clip(sample_pred_valid, 1e-6, 1.0 - 1e-6))
+        sample_residuals = (a_per - 1.0) * raw_logit + c_per
+        ks_p = float(ks_2samp(sample_residuals, np.asarray(training_residuals)).pvalue)
 
     flag = "PASS"
     if balance < 0.5 or in_range < 0.95:
