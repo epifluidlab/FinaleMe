@@ -176,8 +176,74 @@ def _apply_fdr(results: list[TestResult], alpha: float) -> None:
         j += 1
 
 
+def bayesian_group_comparison(
+    posterior_samples_by_sample: dict[str, np.ndarray],
+    sample_groups: dict[str, str | None],
+    cell_type_names: list[str],
+    contrasts: list[tuple[str, str]],
+    fdr_alpha: float = 0.05,
+) -> list[TestResult]:
+    """Posterior probability of difference (math doc §8.1).
+
+    posterior_samples_by_sample: maps sample_id → (T, K+1) array of MCMC draws.
+    For each contrast (A, B) and cell type j we draw paired group means and
+    compute P(mean_A > mean_B). The pseudo p-value 2 * min(P, 1-P) is used
+    for FDR-compatible reporting.
+    """
+    if not posterior_samples_by_sample or not contrasts:
+        return []
+
+    # Determine the common number of draws (truncate if mismatched)
+    sample_ids = list(posterior_samples_by_sample.keys())
+    min_T = min(arr.shape[0] for arr in posterior_samples_by_sample.values())
+    K = len(cell_type_names)
+
+    # Stack into (S, T, K+1)
+    stacked = np.stack(
+        [posterior_samples_by_sample[sid][:min_T] for sid in sample_ids], axis=0
+    )
+
+    results: list[TestResult] = []
+    for j in range(K):
+        for group_a, group_b in contrasts:
+            a_mask = np.array(
+                [sample_groups.get(sid) == group_a for sid in sample_ids]
+            )
+            b_mask = np.array(
+                [sample_groups.get(sid) == group_b for sid in sample_ids]
+            )
+            if not (np.any(a_mask) and np.any(b_mask)):
+                continue
+            # Group-level mean per draw
+            mean_a_draws = stacked[a_mask, :, j].mean(axis=0)  # (T,)
+            mean_b_draws = stacked[b_mask, :, j].mean(axis=0)  # (T,)
+            prob = float(np.mean(mean_a_draws > mean_b_draws))
+            pseudo_p = float(2.0 * min(prob, 1.0 - prob))
+            results.append(
+                TestResult(
+                    cell_type=cell_type_names[j],
+                    contrast=f"{group_a}_vs_{group_b}",
+                    test_type="bayesian",
+                    mean_a=float(np.mean(mean_a_draws)),
+                    mean_b=float(np.mean(mean_b_draws)),
+                    effect_size=float(np.mean(mean_a_draws) - np.mean(mean_b_draws)),
+                    se=float(
+                        np.std(mean_a_draws - mean_b_draws, ddof=1)
+                        if min_T > 1
+                        else 0.0
+                    ),
+                    statistic=float(prob),
+                    p_value=pseudo_p,
+                )
+            )
+
+    _apply_fdr(results, fdr_alpha)
+    return results
+
+
 __all__ = [
     "TestResult",
+    "bayesian_group_comparison",
     "compositional_regression_test",
     "wilcoxon_test",
 ]

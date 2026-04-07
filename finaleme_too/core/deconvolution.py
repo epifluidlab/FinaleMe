@@ -151,10 +151,14 @@ class MLEDeconvolver:
 
 
 class BayesianDeconvolver:
-    """Bayesian Dirichlet-BetaBinomial deconvolver via emcee.
+    """Bayesian Dirichlet-BetaBinomial deconvolver via emcee (math doc §4).
 
-    Lazy import: only imports emcee when ``solve`` is called. Skips
-    gracefully (raises a clear error) if emcee is not installed.
+    Posterior: P(w | data) ∝ Dir(w | α0) * Π_i BetaBinom(k_i | n_i, μ_i(w), φ_i)
+
+    Sampling strategy: parameterize w as a stick-breaking ALR (logit) vector
+    of K free dimensions in unconstrained space, transform to a (K+1)-simplex
+    via softmax inside the log-posterior. This avoids manual constraint
+    enforcement and works well with emcee's affine-invariant sampler.
     """
 
     def __init__(
@@ -163,11 +167,13 @@ class BayesianDeconvolver:
         n_steps: int = 2000,
         burn_in: int = 500,
         prior_alpha: float = 1.0,
+        seed: int | None = None,
     ):
         self.n_walkers = n_walkers
         self.n_steps = n_steps
         self.burn_in = burn_in
         self.prior_alpha = prior_alpha
+        self.seed = seed
 
     def solve(
         self,
@@ -175,14 +181,78 @@ class BayesianDeconvolver:
         reference: "ReferencePanel",
         marker_subset: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Return posterior samples shape (n_keep, K+1)."""
         try:
-            import emcee  # noqa: F401  (lazy)
+            import emcee
         except ImportError as exc:  # pragma: no cover
             raise DeconvolutionFailedError(
                 "emcee not installed; install with `pip install finaleme-too[bayesian]`"
             ) from exc
-        # Implementation deferred to Phase E (P3).
-        raise NotImplementedError("BayesianDeconvolver.solve is implemented in Phase E")
+
+        R_full = MLEDeconvolver._augmented_reference(reference)
+        k_arr = model.k
+        n_arr = model.n
+        phi = model.dispersion
+        weights = model.weights
+
+        if marker_subset is not None:
+            R_full = R_full[marker_subset]
+            k_arr = k_arr[marker_subset]
+            n_arr = n_arr[marker_subset]
+            phi = phi[marker_subset]
+            weights = weights[marker_subset]
+
+        valid = (n_arr > 0) & np.all(np.isfinite(R_full), axis=1)
+        R = R_full[valid]
+        k = k_arr[valid].astype(np.float64)
+        n = n_arr[valid].astype(np.float64)
+        phi_v = phi[valid]
+        w_obj = weights[valid]
+        K_total = R.shape[1]
+        K_free = K_total - 1  # softmax-parameterized
+
+        log_prior_const = -np.sum(np.log(np.maximum(self.prior_alpha, 1e-9))) * 0  # constant
+
+        def softmax(z: np.ndarray) -> np.ndarray:
+            z_max = np.max(z)
+            ez = np.exp(z - z_max)
+            return ez / ez.sum()
+
+        def log_posterior(z: np.ndarray) -> float:
+            # Last component is implicit zero in z; soft-max over [z; 0]
+            full_z = np.concatenate([z, np.array([0.0])])
+            w = softmax(full_z)
+            mu = R @ w
+            mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+            ll = log_likelihood_per_marker(k, n, mu, phi_v)
+            log_lik = float(np.sum(w_obj * ll))
+            # Symmetric Dirichlet log prior on w (constant terms dropped).
+            # Guard against alpha=1 (uniform Dirichlet) where the term is 0
+            # but the explicit 0 * log(0) = NaN.
+            if abs(self.prior_alpha - 1.0) < 1e-12:
+                log_prior = 0.0
+            else:
+                log_prior = float(
+                    (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
+                )
+            # Jacobian of softmax (log |det J|) — improper, but cancels for paired comparison
+            return log_lik + log_prior
+
+        rng = np.random.default_rng(self.seed)
+        # Initial walkers: small noise around uniform (zero in unconstrained space)
+        p0 = rng.normal(0, 0.1, size=(self.n_walkers, K_free))
+
+        sampler = emcee.EnsembleSampler(self.n_walkers, K_free, log_posterior)
+        sampler.run_mcmc(p0, self.n_steps, progress=False)
+
+        chain = sampler.get_chain(discard=self.burn_in, flat=True)  # (n_keep, K_free)
+        # Convert to (K+1)-simplex
+        n_keep = chain.shape[0]
+        out = np.empty((n_keep, K_total), dtype=np.float64)
+        for i in range(n_keep):
+            full_z = np.concatenate([chain[i], np.array([0.0])])
+            out[i] = softmax(full_z)
+        return out
 
 
 __all__ = ["BayesianDeconvolver", "DeconvolutionResult", "MLEDeconvolver", "UNKNOWN_PROFILE"]

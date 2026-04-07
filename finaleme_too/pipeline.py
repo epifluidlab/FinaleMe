@@ -26,6 +26,7 @@ from finaleme_too.config import (
     TOOConfig,
 )
 from finaleme_too.core.deconvolution import (
+    BayesianDeconvolver,
     DeconvolutionResult,
     MLEDeconvolver,
 )
@@ -84,11 +85,23 @@ class TOOPipeline:
         region_annotations: pd.DataFrame | None = None,
         group_comparison_spec: str | None = None,
     ):
+        from finaleme_too.config import SolverMethod
+
         self.config = config
         self.calibration = calibration
         self.region_annotations = region_annotations
         self.group_comparison_spec = group_comparison_spec
         self.deconvolver = MLEDeconvolver()
+        self.bayesian_deconvolver = (
+            BayesianDeconvolver(
+                n_walkers=64,
+                n_steps=config.uncertainty.bayesian_n_samples // 64 + 100,
+                burn_in=100,
+                prior_alpha=config.uncertainty.bayesian_prior_alpha,
+            )
+            if config.model.deconvolution == SolverMethod.BAYESIAN
+            else None
+        )
         self.bootstrap = BootstrapCI(
             n_iterations=config.uncertainty.n_bootstrap,
             ci_level=config.uncertainty.ci_level,
@@ -330,11 +343,47 @@ class TOOPipeline:
             coverage_cap=self.config.coverage.coverage_cap,
         )
 
-        # Point-estimate proportions
+        # Point-estimate proportions (always run MLE for the point estimate)
         w_hat = self.deconvolver.solve(observation, reference)
 
-        # Bootstrap CIs
-        boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+        # Uncertainty: Bayesian posterior overrides bootstrap when configured
+        posterior_samples = None
+        if self.bayesian_deconvolver is not None:
+            try:
+                posterior_samples = self.bayesian_deconvolver.solve(
+                    observation, reference
+                )
+                w_hat = posterior_samples.mean(axis=0)
+                ci_lo = np.quantile(
+                    posterior_samples,
+                    (1.0 - self.config.uncertainty.ci_level) / 2.0,
+                    axis=0,
+                )
+                ci_hi = np.quantile(
+                    posterior_samples,
+                    1.0 - (1.0 - self.config.uncertainty.ci_level) / 2.0,
+                    axis=0,
+                )
+
+                @dataclass
+                class _BootShim:
+                    proportions_samples: np.ndarray
+                    ci_lower: np.ndarray
+                    ci_upper: np.ndarray
+                    point_estimate: np.ndarray
+
+                boot = _BootShim(
+                    proportions_samples=posterior_samples,
+                    ci_lower=ci_lo,
+                    ci_upper=ci_hi,
+                    point_estimate=w_hat,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Bayesian solve failed for %s, falling back to bootstrap: %s",
+                            sample.sample_id, exc)
+                boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+        else:
+            boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
 
         # Reliability p-values per cell type
         K = reference.n_cell_types
@@ -376,8 +425,8 @@ class TOOPipeline:
             p_detection=p_detection,
             reliability=reliability,
             n_markers=n_markers,
-            bootstrap_proportions=boot.proportions_samples,
-            posterior_samples=None,
+            bootstrap_proportions=boot.proportions_samples if posterior_samples is None else None,
+            posterior_samples=posterior_samples,
             coverage_tier=tier,
             qc_flags=[],  # filled below
         )
