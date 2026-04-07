@@ -2,7 +2,7 @@
 
 This tutorial explains how to build your own reference methylation atlas restricted to
 CpG Island (CGI) and CGI shore regions, and how to use it for tissues-of-origin
-deconvolution with FinaleMe-predicted methylation data.
+deconvolution with FinaleMe-predicted methylation data using `BetaValueDeconvolution`.
 
 ## Table of Contents
 
@@ -36,8 +36,8 @@ To address this, we provide a pipeline (`generate_cgi_shore_markers.py`) that:
 
 1. Defines CGI+shore regions (CGI extended by +/-2kb)
 2. Identifies tissue-specific differentially methylated regions within CGI+shore only
-3. Builds a UXM-compatible atlas using only these regions
-4. Produces an atlas directly usable with `uxm deconv`
+3. Builds a CGI+shore atlas using only these regions
+4. Produces marker/atlas files directly usable with `BetaValueDeconvolution -markerRegions`
 
 ### What is a reference methylation atlas?
 
@@ -226,7 +226,14 @@ python scripts/generate_cgi_shore_markers.py \
   --betas reference_wgbs/betas/*.beta \
   --pats reference_wgbs/pats/*.pat.gz \
   --groups reference_wgbs/groups.csv \
-  --num-markers 25 \
+  --num-markers 250 \
+  --delta-means 0.4 \
+  --unmeth-mean-thresh 0.1 \
+  --meth-mean-thresh 0.5 \
+  --min-cpg 1 \
+  --max-cpg 1000 \
+  --rlen 3 \
+  --threads 10 \
   --out-dir results/cgi_shore_atlas/ \
   --wgbstools-path /path/to/wgbs_tools \
   --uxm-path /path/to/UXM_deconv \
@@ -234,7 +241,7 @@ python scripts/generate_cgi_shore_markers.py \
 ```
 
 This runs all five stages automatically and produces a ready-to-use atlas at
-`results/cgi_shore_atlas/Atlas.CGI_shore.U25.l4.hg19.tsv`.
+`results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv`.
 
 ### 4.2 Full command with all options
 
@@ -244,17 +251,20 @@ python scripts/generate_cgi_shore_markers.py \
   --betas reference_wgbs/betas/*.beta \
   --pats reference_wgbs/pats/*.pat.gz \
   --groups reference_wgbs/groups.csv \
+  --blocks /path/to/GSE186458_blocks.s205.bed.gz \
   --cgi-bed data/cpgIslandExt.hg19.bed \
   --shore-size 2000 \
   --chrom-sizes data/hg19.chrom.sizes \
-  --num-markers 25 \
-  --delta-means 0.35 \
-  --min-cpg 3 \
-  --max-cpg 50 \
+  --num-markers 250 \
+  --delta-means 0.4 \
+  --unmeth-mean-thresh 0.1 \
+  --meth-mean-thresh 0.5 \
+  --min-cpg 1 \
+  --max-cpg 1000 \
   --min-bp 50 \
   --max-bp 5000 \
-  --rlen 4 \
-  --threads 8 \
+  --rlen 3 \
+  --threads 10 \
   --out-dir results/cgi_shore_atlas/ \
   --wgbstools-path /path/to/wgbs_tools \
   --uxm-path /path/to/UXM_deconv \
@@ -264,7 +274,7 @@ python scripts/generate_cgi_shore_markers.py \
 
 ### 4.3 Command-line options reference
 
-| Option | Default | Description |
+| Option | Tutorial default | Description |
 |--------|---------|-------------|
 | `--genome` | (required) | Genome build: `hg19` or `hg38` |
 | `--betas` | (required) | Reference WGBS beta files (glob pattern) |
@@ -276,15 +286,17 @@ python scripts/generate_cgi_shore_markers.py \
 | `--cgi-bed` | auto-download | CpG Island BED file from UCSC |
 | `--shore-size` | 2000 | Shore extension in bp around each CGI |
 | `--chrom-sizes` | none | Chromosome sizes file for boundary capping |
-| `--blocks` | none | Pre-existing blocks file (skips segmentation) |
-| `--num-markers` | 25 | Target markers per cell type (25 or 250) |
-| `--delta-means` | 0.35 | Minimum methylation difference for markers |
-| `--min-cpg` | 3 | Minimum CpGs per candidate block |
-| `--max-cpg` | 50 | Maximum CpGs per candidate block |
+| `--blocks` | optional | Pre-existing blocks file (recommended for reproducibility) |
+| `--num-markers` | 250 | Target markers per cell type |
+| `--delta-means` | 0.4 | Minimum methylation difference for markers |
+| `--unmeth-mean-thresh` | 0.1 | Upper methylation bound for unmethylated markers |
+| `--meth-mean-thresh` | 0.5 | Lower methylation bound for methylated markers |
+| `--min-cpg` | 1 | Minimum CpGs per candidate block |
+| `--max-cpg` | 1000 | Maximum CpGs per candidate block |
 | `--min-bp` | 50 | Minimum block length in bp |
 | `--max-bp` | 5000 | Maximum block length in bp |
-| `--rlen` | 4 | Minimum CpGs per read for U/X/M classification |
-| `--threads` | 4 | Number of parallel threads |
+| `--rlen` | 3 | Minimum CpGs per read for U/X/M classification |
+| `--threads` | 10 | Number of parallel threads |
 | `--force` | false | Overwrite existing output files |
 | `--verbose` | false | Print detailed progress information |
 
@@ -371,9 +383,9 @@ The pipeline generates a summary report including:
 
 Once you have the atlas, you can deconvolve any FinaleMe-predicted cfDNA sample.
 
-### 6.1 Generate FinaleMe pat output
+### 6.1 Generate FinaleMe decode output
 
-First, run FinaleMe decode with the `-patOutput` flag to produce UXM-compatible output:
+First, run FinaleMe decode to produce `*.prediction.bed.gz`:
 
 ```bash
 JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
@@ -383,40 +395,52 @@ java -Xmx20G -cp "$JAR" \
   results/sample.FinaleMe.model \
   results/sample.cpg_features.hg19.bed.gz \
   results/sample.decode.prediction.bed.gz \
-  -decodeModeOnly \
-  -patOutput \
-  -cpgIndexFile data/CpG_index.hg19.bed.gz
+  -decodeModeOnly
 ```
 
-This produces:
-- `results/sample.decode.prediction.pat.gz` - Fragment methylation patterns
-- `results/sample.decode.prediction.beta` - Per-CpG methylation summary
+### 6.2 Run `BetaValueDeconvolution` with the CGI+shore atlas
 
-### 6.2 Run UXM deconvolution with the CGI+shore atlas
+Use the tested preset:
 
 ```bash
-uxm deconv \
-  results/sample.decode.prediction.pat.gz \
-  -o results/sample.cgi_shore_uxm.csv \
-  -a results/cgi_shore_atlas/Atlas.CGI_shore.U25.l4.hg19.tsv
+JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+
+java -Xmx20G -cp "$JAR" \
+  edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
+  -binarizeThreshold 0.1 \
+  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
+  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
+  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -cpgIndex data/CpG_index.hg19.bed.gz \
+  -solver NNLS \
+  -output results/sample.deconv.beta.tsv \
+  results/sample.decode.prediction.bed.gz
+```
+
+Make `beta_list.txt` if needed:
+
+```bash
+ls reference_wgbs/betas/*.beta > results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt
 ```
 
 ### 6.3 Interpret results
 
-The output CSV contains estimated tissue fractions for each cell type. For example:
+The output TSV is a tissue-fraction matrix (rows = cell types, columns = samples). For example:
 
 ```
-sample,Adipocytes,Blood-B,Blood-Granul,Blood-Mono+Macro,Blood-NK,Blood-T,...
-sample1,0.001,0.023,0.412,0.089,0.045,0.156,...
+cell_type	sample.decode.prediction.bed.gz
+Blood-B	0.0230
+Blood-T	0.1560
+Liver-Hep	0.0890
 ```
 
 Values represent the estimated fraction of cfDNA originating from each cell type.
 They sum approximately to 1.0 (minor deviations are normal due to the NNLS solver).
 
-### 6.4 Compare with genome-wide atlas (optional)
+### 6.4 Optional legacy comparison with UXM
 
-To assess the impact of CGI+shore restriction, you can also run deconvolution with the
-standard genome-wide atlas:
+If you still want to compare against the classic UXM workflow:
+run FinaleMe decode with `-patOutput` first, then use:
 
 ```bash
 # Standard genome-wide atlas
@@ -429,7 +453,7 @@ uxm deconv \
 uxm deconv \
   results/sample.decode.prediction.pat.gz \
   -o results/sample.cgi_shore_uxm.csv \
-  -a results/cgi_shore_atlas/Atlas.CGI_shore.U25.l4.hg19.tsv
+  -a results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv
 ```
 
 When using FinaleMe predictions, the CGI+shore atlas is expected to produce more
@@ -441,13 +465,8 @@ accurate results because it only relies on regions where FinaleMe predictions ar
 
 ### 7.1 Choosing the number of markers
 
-- **25 markers per cell type** (`--num-markers 25`): Recommended for FinaleMe cfDNA data.
-  Fewer markers means less noise from prediction errors. This matches the U25 atlas used
-  in standard UXM deconvolution.
-
-- **250 markers per cell type** (`--num-markers 250`): Use for benchmarking or when working
-  with high-confidence methylation data. Note that CGI+shore regions may not have 250
-  good markers for every cell type.
+- **250 markers per cell type** (`--num-markers 250`): Recommended preset in this tutorial for `BetaValueDeconvolution`.
+- **25 markers per cell type** (`--num-markers 25`): Use when references are sparse or when you want stricter/high-confidence marker subsets.
 
 ### 7.2 Adjusting the shore size
 
@@ -548,14 +567,14 @@ results/cgi_shore_atlas/
 │   ├── Markers.Neuron.bed
 │   ├── ...
 │   └── pass_0/                                # Intermediate results per threshold pass
-├── Markers.CGI_shore.U25.hg19.tsv             # All markers merged (input to atlas builder)
-├── Atlas.CGI_shore.U25.l4.hg19.tsv            # Final atlas (input to uxm deconv)
+├── Markers.CGI_shore.U250.hg19.tsv            # All markers merged (input to atlas builder)
+├── Atlas.CGI_shore.U250.l3.hg19.tsv           # Final atlas (input to BetaValueDeconvolution -markerRegions)
 └── report.txt                                 # Validation summary
 ```
 
 ### Key file formats
 
-**Markers file** (`Markers.CGI_shore.U25.hg19.tsv`):
+**Markers file** (`Markers.CGI_shore.U250.hg19.tsv`):
 
 | Column | Description |
 |--------|-------------|
@@ -576,7 +595,7 @@ results/cgi_shore_atlas/
 | ttest | t-test p-value |
 | direction | U (unmethylated in target) or M (methylated in target) |
 
-**Atlas file** (`Atlas.CGI_shore.U25.l4.hg19.tsv`):
+**Atlas file** (`Atlas.CGI_shore.U250.l3.hg19.tsv`):
 
 | Column | Description |
 |--------|-------------|
@@ -643,7 +662,7 @@ wgbstools segment --betas subset_of_betas/*.beta -o my_blocks.bed -@ 4
 
 Atlas building calls `wgbstools homog` for each marker x sample combination. Speed up with:
 ```bash
---threads 8   # Use more threads
+--threads 10   # Use more threads
 ```
 
 Results are cached in `UXM_deconv/tmp_dir/`, so re-runs are much faster.
@@ -651,7 +670,7 @@ Results are cached in `UXM_deconv/tmp_dir/`, so re-runs are much faster.
 ### Atlas has NaN values
 
 NaN values appear when a reference sample has zero coverage at a marker region. This
-is handled gracefully by UXM deconvolution but may reduce accuracy. Ensure your reference
+is handled gracefully by `BetaValueDeconvolution` but may reduce accuracy. Ensure your reference
 WGBS data has sufficient genome-wide coverage (>10x recommended).
 
 ---

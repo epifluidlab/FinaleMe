@@ -12,7 +12,7 @@ FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/
 2. Train HMM model (`FinaleMe`)
 3. Decode methylation (`FinaleMe`)
 4. Optional legacy conversion to bigWig (Perl helper)
-5. Tissues-of-origin deconvolution (UXM or original methylation-density in 1kb bin in CpG rich region workflow)
+5. Tissues-of-origin deconvolution (`BetaValueDeconvolution` recommended; UXM compatibility optional)
 
 ## 2. Installation and reference setup
 
@@ -356,22 +356,69 @@ This is optional when Step 3 already runs with `-bwOutput`.
 
 ## 8. Step 5: Tissues-of-origin analysis
 
-## 8.1 Option A (recommended): UXM deconvolution
+## 8.1 Recommended: `BetaValueDeconvolution` (atlas mode)
 
-Install tools:
+Run deconvolution with the tested default preset:
 
 ```bash
-git clone https://github.com/nloyfer/wgbs_tools.git
-cd wgbs_tools
-python setup.py
+JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
 
-cd ..
-git clone https://github.com/nloyfer/UXM_deconv.git
-cd UXM_deconv
-pip install -r requirements.txt
+java -Xmx20G -cp "$JAR" \
+  edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
+  -binarizeThreshold 0.1 \
+  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
+  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
+  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -cpgIndex data/CpG_index.hg19.bed.gz \
+  -solver NNLS \
+  -output results/BH01.deconv.beta.tsv \
+  results/BH01.decode.prediction.bed.gz
 ```
 
-Run deconvolution:
+Notes:
+
+- `-markerRegions` accepts atlas TSV/BED with `startCpG/endCpG` columns (the CGI+shore atlas from marker generation pipeline works directly).
+- `-refBetas` can be a comma-separated list or a text file with one `.beta` path per line.
+- Query input can be `*.prediction.bed.gz` (as above) or `*.beta`.
+- Output format is a matrix: rows are cell types and columns are samples.
+
+## 8.2 Build marker atlas with the tested preset
+
+```bash
+python scripts/generate_cgi_shore_markers.py \
+  --genome hg19 \
+  --betas /path/to/reference_wgbs/betas/*.beta \
+  --pats /path/to/reference_wgbs/pats/*.pat.gz \
+  --groups /path/to/groups_pat_ref.hg19.csv \
+  --blocks /path/to/GSE186458_blocks.s205.bed.gz \
+  --cgi-bed /path/to/UCSC.cpgIsland.20190503.hg19.bed \
+  --shore-size 2000 \
+  --chrom-sizes data/hg19.chrom.sizes \
+  --num-markers 250 \
+  --delta-means 0.4 \
+  --unmeth-mean-thresh 0.1 \
+  --meth-mean-thresh 0.5 \
+  --min-cpg 1 \
+  --max-cpg 1000 \
+  --min-bp 50 \
+  --max-bp 5000 \
+  --rlen 3 \
+  --threads 10 \
+  --out-dir results/cgi_shore_atlas/ \
+  --force \
+  --wgbstools-path /path/to/wgbs_tools \
+  --uxm-path /path/to/UXM_deconv
+```
+
+Make a beta list file for `-refBetas`:
+
+```bash
+ls /path/to/reference_wgbs/betas/*.beta > results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt
+```
+
+## 8.3 Optional legacy mode: UXM deconvolution
+
+This requires running Step 3 with `-patOutput`.
 
 ```bash
 uxm deconv results/BH01.decode.prediction.pat.gz \
@@ -379,24 +426,7 @@ uxm deconv results/BH01.decode.prediction.pat.gz \
   -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
 ```
 
-Notes:
-
-- `data/CpG_index.hg19.bed.gz` and `data/CpG_index.hg38.bed.gz` from setup are equivalent to wgbstools generated CpG index files.
-- `wgbstools init_genome` is only needed if you want to regenerate references manually.
-
-## 8.2 Option B: Original methylation-density/QP workflow
-
-This workflow uses bigWig aggregation and quadratic programming.
-
-```bash
-ls *WGS.FinaleMe.mincg7.merged.cov.b37.bw | perl -ne 'chomp;$cov=$_;$m=$cov;$m=~s/cov/methy_count/;print " -bigWig $m -useMean0 0 -regionMode 0 -bigWig $cov -useMean0 0 -regionMode 0";' >> cfdna.methy_summary.cmd.txt
-
-cat cfdna.methy_summary.cmd.txt | perl -ne 'chomp;@f=split " -useMean0 0 -regionMode 0";for($i=1,$j=0;$j<=$#f;$j+=2,$i++){$name=$f[$j];$name=~s/ -bigWig (\S+)\S+methy_count.b37.bw/$1/;print "$i\t$name\n";}' > cfdna.names_order.txt
-
-perl -e '$cmd=`cat cfdna.methy_summary.cmd.txt`;chomp($cmd); `java -Xmx10G -cp "lib/dnaaseUtils-0.14-jar-with-dependencies.jar:lib/java-genomics-io.jar:lib/igv.jar" main.java.edu.mit.compbio.utils.AlignMultiWigInsideBed autosome_1kb_intervals.UCSC.cpgIsland_plus_shore.b37.bed output.add_value.methy.bed.gz $cmd`;'
-```
-
-Reference R script: `src/R/TissueOfOriginExampleScript.R`
+Reference atlas-building details: [tutorial/tutorial_ref_maps.md](tutorial_ref_maps.md)
 
 ## 9. Troubleshooting
 

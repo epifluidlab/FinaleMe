@@ -67,8 +67,8 @@ public class BetaValueDeconvolution {
     @Option(name = "-binarizeThreshold", usage = "Methylation density threshold for binarization (default: 0.1)")
     public double binarizeThreshold = 0.1;
 
-    @Option(name = "-solver", usage = "Solver method: QP (Goldfarb-Idnani, default) or NNLS (Lawson-Hanson + normalize)")
-    public String solver = "QP";
+    @Option(name = "-solver", usage = "Solver method: NNLS (Lawson-Hanson + normalize, default) or QP (Goldfarb-Idnani)")
+    public String solver = "NNLS";
 
     @Option(name = "-replicateMode", usage = "How to combine replicates: aggregate (sum counts, default) or average (mean of ratios)")
     public String replicateMode = "aggregate";

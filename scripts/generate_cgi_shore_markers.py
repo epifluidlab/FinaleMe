@@ -15,7 +15,7 @@ Pipeline stages:
   Stage 5: Generate validation report
 
 Usage:
-  python generate_cgi_shore_markers.py --genome hg19 --num-markers 25 \
+  python generate_cgi_shore_markers.py --genome hg19 --num-markers 250 \
     --out-dir results/ --wgbstools-path /path/to/wgbs_tools \
     --uxm-path /path/to/UXM_deconv
 
@@ -852,37 +852,37 @@ def parse_args():
                         help='Pre-existing blocks file (skip segmentation)')
 
     # Marker selection
-    parser.add_argument('--num-markers', type=int, default=25,
+    parser.add_argument('--num-markers', type=int, default=250,
                         help='Target number of markers per cell type '
-                             '(default: 25, use 250 for high-resolution)')
-    parser.add_argument('--delta-means', type=float, default=0.35,
-                        help='Initial delta_means threshold (default: 0.35)')
-    parser.add_argument('--unmeth-mean-thresh', type=float, default=None,
+                             '(default: 250)')
+    parser.add_argument('--delta-means', type=float, default=0.4,
+                        help='Initial delta_means threshold (default: 0.4)')
+    parser.add_argument('--unmeth-mean-thresh', type=float, default=0.1,
                         help='Max mean methylation for the unmethylated group. '
                              'For binarized beta deconvolution (threshold 0.1), '
                              'use 0.1 so U-markers have target mean < 0.1. '
-                             '(default: wgbstools default)')
-    parser.add_argument('--meth-mean-thresh', type=float, default=None,
+                             '(default: 0.1)')
+    parser.add_argument('--meth-mean-thresh', type=float, default=0.5,
                         help='Min mean methylation for the methylated group. '
                              'For binarized beta deconvolution (threshold 0.1), '
-                             'use 0.3 so background is well above the binarization '
-                             'boundary. (default: wgbstools default)')
-    parser.add_argument('--min-cpg', type=int, default=3,
-                        help='Minimum CpGs per block (default: 3)')
-    parser.add_argument('--max-cpg', type=int, default=50,
-                        help='Maximum CpGs per block (default: 50)')
+                             'use 0.5 so background is well above the binarization '
+                             'boundary. (default: 0.5)')
+    parser.add_argument('--min-cpg', type=int, default=1,
+                        help='Minimum CpGs per block (default: 1)')
+    parser.add_argument('--max-cpg', type=int, default=1000,
+                        help='Maximum CpGs per block (default: 1000)')
     parser.add_argument('--min-bp', type=int, default=50,
                         help='Minimum block length in bp (default: 50)')
     parser.add_argument('--max-bp', type=int, default=5000,
                         help='Maximum block length in bp (default: 5000)')
 
     # Atlas building
-    parser.add_argument('--rlen', type=int, default=4,
-                        help='Minimum CpGs per read for homog (default: 4)')
+    parser.add_argument('--rlen', type=int, default=3,
+                        help='Minimum CpGs per read for homog (default: 3)')
 
     # Runtime
-    parser.add_argument('--threads', type=int, default=4,
-                        help='Number of threads (default: 4)')
+    parser.add_argument('--threads', type=int, default=10,
+                        help='Number of threads (default: 10)')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing output files')
     parser.add_argument('--verbose', '-v', action='store_true',

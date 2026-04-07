@@ -12,7 +12,7 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 - Apache Maven 3.8+: 
 https://maven.apache.org/install.html (or use the build .jar file from release)
 - Optional for bigWig conversion speed/compatibility: `bedGraphToBigWig` (UCSC tools from here: https://hgdownload.soe.ucsc.edu/admin/exe/ and modify $PATH to allow the direct usage). If missing, FinaleMe falls back to built-in Java BigWig writing.
-- Optional for Step 4 tissues-of-origin: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv) 
+- Optional for custom Step 4 tissue reference-map generation: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv)
 
 ## Quick install
 
@@ -114,13 +114,22 @@ It will cost < 1 min for the test dataset.
 
 ### Step 4: Tissues-of-origin analysis
 
-Using UXM deconvolution:
+Using FinaleMe's beta-value deconvolution (`BetaValueDeconvolution`, recommended):
 
 ```bash
-uxm deconv results/BH01.decode.prediction.pat.gz \
-  -o results/BH01.uxm_result.csv \
-  -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
+java -Xmx20G -cp "$JAR" \
+  edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
+  -binarizeThreshold 0.1 \
+  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
+  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
+  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -cpgIndex data/CpG_index.hg19.bed.gz \
+  -solver NNLS \
+  -output results/BH01.deconv.beta.tsv \
+  results/BH01.decode.prediction.bed.gz
 ```
+
+Use [tutorial/tutorial_ref_maps.md](tutorial/tutorial_ref_maps.md) to generate the marker atlas (`-markerRegions`) and reference panel files (`-refBetas`, `-refGroups`).
 
 ## Full tutorial
 
