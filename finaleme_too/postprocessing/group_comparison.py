@@ -9,6 +9,7 @@ import numpy as np
 from finaleme_too.config import TestMethod
 from finaleme_too.postprocessing.statistical_testing import (
     TestResult,
+    apply_fdr,
     bayesian_group_comparison,
     compositional_regression_test,
     wilcoxon_test,
@@ -105,16 +106,14 @@ def run_group_comparisons(
     spec: str | None,
     method: TestMethod = TestMethod.ILR_REGRESSION,
     fdr_alpha: float = 0.05,
+    fdr_method: str = "BH",
     posterior_samples_by_sample: dict[str, np.ndarray] | None = None,
 ) -> list[TestResult]:
     """Top-level dispatcher.
 
-    Parameters
-    ----------
-    posterior_samples_by_sample
-        Required when ``method == TestMethod.BAYESIAN_POSTERIOR``. Maps
-        sample_id → (T, K+1) MCMC draws. If missing, falls back to ILR
-        regression with a warning.
+    All results (omnibus + pairwise) go through a single FDR correction at
+    the end so that omnibus rows also receive an ``adjusted_p_value``. The
+    per-test helpers no longer apply FDR themselves to avoid double-correction.
     """
     available = sorted({g for g in group_labels if g is not None})
     if len(available) < 2 or spec is None:
@@ -127,16 +126,17 @@ def run_group_comparisons(
         results.extend(omnibus_kruskal(proportions, group_labels, cell_type_names))
 
     if contrasts:
+        # Pass fdr_alpha=1.0 so the per-test helpers do not pre-apply FDR;
+        # we run a single combined correction below.
         if method == TestMethod.WILCOXON:
             pairwise = wilcoxon_test(
-                proportions, group_labels, cell_type_names, contrasts, fdr_alpha
+                proportions, group_labels, cell_type_names, contrasts, fdr_alpha=1.0
             )
         elif method == TestMethod.BAYESIAN_POSTERIOR:
             if not posterior_samples_by_sample:
-                # Fall back: no posterior samples available → use ILR regression
                 pairwise = compositional_regression_test(
                     proportions, sample_ids, group_labels, cell_type_names, contrasts,
-                    fdr_alpha=fdr_alpha,
+                    fdr_alpha=1.0,
                 )
             else:
                 sample_groups_map = {
@@ -147,15 +147,18 @@ def run_group_comparisons(
                     sample_groups=sample_groups_map,
                     cell_type_names=cell_type_names,
                     contrasts=contrasts,
-                    fdr_alpha=fdr_alpha,
+                    fdr_alpha=1.0,
                 )
         else:
             pairwise = compositional_regression_test(
                 proportions, sample_ids, group_labels, cell_type_names, contrasts,
-                fdr_alpha=fdr_alpha,
+                fdr_alpha=1.0,
             )
         results.extend(pairwise)
 
+    # Single FDR correction across BOTH omnibus and pairwise results so
+    # omnibus rows are not stuck with NaN adjusted_p_value (architecture §10.3).
+    apply_fdr(results, alpha=fdr_alpha, method=fdr_method)
     return results
 
 

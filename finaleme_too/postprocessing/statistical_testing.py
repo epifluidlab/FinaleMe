@@ -159,14 +159,32 @@ def _skipped_result(cell_type: str, group_a: str, group_b: str, test: str = "ilr
     )
 
 
-def _apply_fdr(results: list[TestResult], alpha: float) -> None:
-    """Benjamini-Hochberg FDR correction in place."""
+def apply_fdr(results: list[TestResult], alpha: float, method: str = "fdr_bh") -> None:
+    """Benjamini-Hochberg FDR correction in place across the supplied results.
+
+    Modifies each TestResult's ``adjusted_p_value`` and ``significant`` fields.
+    Results with NaN p-values are skipped (their adjusted_p_value stays NaN).
+
+    The ``method`` argument is forwarded to statsmodels.stats.multitest.multipletests
+    so callers can pick a different correction (e.g. fdr_by, holm) via config.
+    """
     pvals = [r.p_value for r in results if not np.isnan(r.p_value)]
     if not pvals:
         return
     from statsmodels.stats.multitest import multipletests
 
-    _, padj, _, _ = multipletests(pvals, alpha=alpha, method="fdr_bh")
+    method_map = {
+        "BH": "fdr_bh",
+        "bh": "fdr_bh",
+        "fdr_bh": "fdr_bh",
+        "BY": "fdr_by",
+        "by": "fdr_by",
+        "fdr_by": "fdr_by",
+        "holm": "holm",
+        "bonferroni": "bonferroni",
+    }
+    sm_method = method_map.get(method, method)
+    _, padj, _, _ = multipletests(pvals, alpha=alpha, method=sm_method)
     j = 0
     for r in results:
         if np.isnan(r.p_value):
@@ -174,6 +192,10 @@ def _apply_fdr(results: list[TestResult], alpha: float) -> None:
         r.adjusted_p_value = float(padj[j])
         r.significant = bool(padj[j] <= alpha)
         j += 1
+
+
+# Backward-compatible alias
+_apply_fdr = apply_fdr
 
 
 def bayesian_group_comparison(
@@ -243,6 +265,7 @@ def bayesian_group_comparison(
 
 __all__ = [
     "TestResult",
+    "apply_fdr",
     "bayesian_group_comparison",
     "compositional_regression_test",
     "wilcoxon_test",

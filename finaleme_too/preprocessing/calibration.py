@@ -70,13 +70,43 @@ class CalibrationParams:
         Path(path).write_text(json.dumps(out, indent=2))
 
     def assign_bin(self, density: np.ndarray) -> np.ndarray:
-        """Map per-marker CpG density to a bin index in [0, n_bins-1]."""
+        """Map per-marker CpG density to a bin index in [0, n_bins-1].
+
+        NaN densities are deterministically assigned to ``fallback_bin``.
+        """
+        density_arr = np.asarray(density, dtype=np.float64)
+        nan_mask = ~np.isfinite(density_arr)
+        clean = np.where(nan_mask, 0.0, density_arr)  # placeholder, overwritten
         idx = np.clip(
-            np.searchsorted(self.bin_edges, density, side="right") - 1,
+            np.searchsorted(self.bin_edges, clean, side="right") - 1,
             0,
             self.n_bins - 1,
         )
+        idx = np.where(nan_mask, self.fallback_bin, idx)
         return idx.astype(np.int64)
+
+    @property
+    def fallback_bin(self) -> int:
+        """Bin index used for markers without a known CpG density.
+
+        Picks the bin whose midpoint (between its finite edges) is closest
+        to the median of the *finite* training densities. When all edges
+        are infinite (degenerate B=1 case), falls back to bin 0.
+        """
+        finite_edges = self.bin_edges[np.isfinite(self.bin_edges)]
+        if finite_edges.size == 0:
+            return 0
+        # Use the median of the finite interior edges as a deterministic
+        # representative density and look up its bin.
+        rep = float(np.median(finite_edges))
+        idx = int(
+            np.clip(
+                np.searchsorted(self.bin_edges, rep, side="right") - 1,
+                0,
+                self.n_bins - 1,
+            )
+        )
+        return idx
 
 
 # ----------------------------------------------------------------------------
@@ -121,16 +151,17 @@ def apply_calibration(
     n = np.asarray(obs.n, dtype=np.int64)
     pred = np.asarray(obs.predicted_beta, dtype=np.float64)
 
-    # Build a per-marker density vector by joining on (chrom, start, end)
+    # Build a per-marker density vector by joining on (chrom, start, end).
+    # Markers without a known density become NaN — assign_bin maps those
+    # deterministically to params.fallback_bin (no NaN-mean bug).
     if region_annotations is not None and not region_annotations.empty:
         ann = region_annotations.set_index(["chrom", "start", "end"])["cpg_density"]
         keys = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
         density = np.array([float(ann.get(k, np.nan)) for k in keys], dtype=np.float64)
     else:
-        density = np.full_like(pred, 0.0, dtype=np.float64)
+        density = np.full_like(pred, np.nan, dtype=np.float64)
 
-    # Markers without a known density fall back to the middle bin
-    bin_idx = params.assign_bin(np.where(np.isnan(density), float(params.bin_edges.mean()), density))
+    bin_idx = params.assign_bin(density)
     a = params.a[bin_idx]
     c = params.c[bin_idx]
 
