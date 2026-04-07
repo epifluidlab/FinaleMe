@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finaleme-too"
+version = "0.2.0a1"
+description = "Tissue-of-origin deconvolution for cfDNA methylation data (WGBS and FinaleMe)"
+authors = [{ name = "Yaping Liu Lab, Northwestern University Feinberg School of Medicine", email = "lyping1986@gmail.com" }]
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "scikit-learn>=1.2",
+    "statsmodels>=0.14",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "joblib>=1.3",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+bayesian = ["emcee>=3.1", "arviz>=0.15"]
+fast = ["numba>=0.58"]
+dev = ["pytest>=7", "pytest-cov", "ruff", "mypy"]
+
+[project.scripts]
+finaleme-too = "finaleme_too.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/epifluidlab/FinaleMe"
+Repository = "https://github.com/epifluidlab/FinaleMe"
+
+[tool.setuptools.packages.find]
+include = ["finaleme_too*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+finaleme_too = ["data/*.json", "data/region_annotations/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

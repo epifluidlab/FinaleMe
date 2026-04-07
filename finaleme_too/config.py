@@ -1,0 +1,234 @@
+"""Configuration dataclasses and YAML loading for finaleme_too.
+
+Mirrors the YAML schema in design/TOO_ARCHITECTURE_v2.md §11.2.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields, asdict
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+class MeasurementMode(str, Enum):
+    """Measurement modality of the methylation data."""
+
+    WGBS = "WGBS"
+    FINALEME = "FINALEME"
+
+
+class CoverageTier(str, Enum):
+    """Per-sample coverage tier (architecture §4)."""
+
+    HIGH = "HIGH"
+    LOW = "LOW"
+    ULTRALOW = "ULTRALOW"
+
+
+class SolverMethod(str, Enum):
+    MLE = "mle"
+    BAYESIAN = "bayesian"
+
+
+class TestMethod(str, Enum):
+    ILR_REGRESSION = "ilr_regression"
+    BAYESIAN_POSTERIOR = "bayesian_posterior"
+    WILCOXON = "wilcoxon"
+
+
+# ----------------------------------------------------------------------------
+# Sub-configs (one per top-level YAML key)
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class ModelConfig:
+    observation: str = "beta_binomial"
+    deconvolution: SolverMethod = SolverMethod.MLE
+    unknown_component: bool = True  # always on; flag kept for documentation
+    fragment_level: str = "auto"  # "auto", "always", "never"
+
+
+@dataclass
+class CoverageConfig:
+    tier_high: float = 10.0
+    tier_low: float = 0.5
+    min_reads: int = 3
+    coverage_cap: int = 50
+
+
+@dataclass
+class CalibrationConfig:
+    mode: MeasurementMode = MeasurementMode.FINALEME
+    calibration_file: str | None = None
+    n_density_bins: int = 8
+    use_default: bool = True  # use shipped default if calibration_file is None
+
+
+@dataclass
+class MarkersConfig:
+    marker_regions: str | None = None
+    marker_format: str = "auto"  # "auto", "bed", "uxm_atlas"
+    region_annotation: str | None = None
+    strict_regions: str | None = None  # e.g. "CGI+shore"
+    n_per_type: int = 500
+    specificity_method: str = "entropy"  # "entropy", "t_statistic", "delta_means"
+
+
+@dataclass
+class UncertaintyConfig:
+    method: str = "bootstrap"  # "bootstrap", "bayesian", "both", "none"
+    n_bootstrap: int = 1000
+    ci_level: float = 0.95
+    noise_floor: float = 0.001
+    bayesian_prior_alpha: float = 1.0
+    bayesian_n_samples: int = 5000
+
+
+@dataclass
+class BatchCorrectionConfig:
+    technical_covariates: list[str] = field(default_factory=list)
+    min_levels: int = 2
+    min_samples_per_level: int = 5
+
+
+@dataclass
+class CovariateAdjustmentConfig:
+    biological_covariates: list[str] = field(default_factory=list)
+    user_configurable: list[str] = field(
+        default_factory=lambda: ["treatment", "treatment_efficacy", "mutation_status"]
+    )
+    transform: str = "ILR"
+
+
+@dataclass
+class TestingConfig:
+    method: TestMethod = TestMethod.ILR_REGRESSION
+    group_comparison: str = "omnibus+pairwise"
+    fdr_method: str = "BH"
+    fdr_alpha: float = 0.05
+
+
+@dataclass
+class InputConfig:
+    format: str = "auto"  # "auto", "finaleme_bed", "bissnp_6plus2", "wgbstools_beta", "custom_bed"
+    meth_col: int | None = None
+    total_col: int | None = None
+
+
+@dataclass
+class ReferenceConfig:
+    format: str = "matrix"  # "matrix" or "beta_list"
+    reference_panel: str | None = None
+    ref_betas: str | None = None
+    ref_groups: str | None = None
+    cpg_index: str | None = None
+    coverage_matrix: str | None = None
+
+
+@dataclass
+class QCConfig:
+    max_wbc_fraction: float = 0.95
+    max_unknown_fraction: float = 0.30
+    max_residual_variance: float = 0.40
+
+
+@dataclass
+class TOOConfig:
+    """Top-level finaleme-too configuration."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    coverage: CoverageConfig = field(default_factory=CoverageConfig)
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    markers: MarkersConfig = field(default_factory=MarkersConfig)
+    uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
+    batch_correction: BatchCorrectionConfig = field(default_factory=BatchCorrectionConfig)
+    covariate_adjustment: CovariateAdjustmentConfig = field(
+        default_factory=CovariateAdjustmentConfig
+    )
+    testing: TestingConfig = field(default_factory=TestingConfig)
+    input: InputConfig = field(default_factory=InputConfig)
+    reference: ReferenceConfig = field(default_factory=ReferenceConfig)
+    qc: QCConfig = field(default_factory=QCConfig)
+    threads: int = 1
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> TOOConfig:
+        """Load a TOOConfig from a YAML file. Missing sections fall back to defaults."""
+        with open(path) as fh:
+            raw = yaml.safe_load(fh) or {}
+        return cls.from_dict(raw)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> TOOConfig:
+        """Build a TOOConfig from a nested dict (e.g. parsed YAML)."""
+        cfg = cls()
+        for f in fields(cls):
+            if f.name not in raw:
+                continue
+            section_value = raw[f.name]
+            if isinstance(section_value, dict):
+                section_cls = type(getattr(cfg, f.name))
+                if hasattr(section_cls, "__dataclass_fields__"):
+                    setattr(cfg, f.name, _build_subconfig(section_cls, section_value))
+                    continue
+            setattr(cfg, f.name, section_value)
+        return cfg
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_serializable(asdict(self))
+
+
+def _build_subconfig(cls, raw: dict[str, Any]):
+    """Build a sub-config dataclass, coercing enum-typed fields."""
+    kwargs: dict[str, Any] = {}
+    valid_fields = {f.name: f for f in fields(cls)}
+    for key, value in raw.items():
+        if key not in valid_fields:
+            continue
+        f = valid_fields[key]
+        # Coerce enums
+        if isinstance(f.type, type) and issubclass(f.type, Enum):
+            kwargs[key] = f.type(value)
+        else:
+            try:
+                if issubclass(f.type, Enum):  # type: ignore[arg-type]
+                    kwargs[key] = f.type(value)
+                    continue
+            except TypeError:
+                pass
+            kwargs[key] = value
+    return cls(**kwargs)
+
+
+def _to_serializable(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_serializable(v) for v in obj]
+    return obj
+
+
+__all__ = [
+    "MeasurementMode",
+    "CoverageTier",
+    "SolverMethod",
+    "TestMethod",
+    "ModelConfig",
+    "CoverageConfig",
+    "CalibrationConfig",
+    "MarkersConfig",
+    "UncertaintyConfig",
+    "BatchCorrectionConfig",
+    "CovariateAdjustmentConfig",
+    "TestingConfig",
+    "InputConfig",
+    "ReferenceConfig",
+    "QCConfig",
+    "TOOConfig",
+]

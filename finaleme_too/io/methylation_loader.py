@@ -1,0 +1,411 @@
+"""Multi-format methylation data loader.
+
+Supported formats (architecture §3.2):
+  - finaleme_bed     : FinaleMe prediction.bed.gz output
+  - bissnp_6plus2    : Bis-SNP 6-column BED + 2 extra (methylation_pct, total_count)
+  - wgbstools_beta   : Binary .beta file (NR_SITES x 2 uint8)
+  - custom_bed       : User-defined column mapping via meth_col / total_col
+"""
+
+from __future__ import annotations
+
+import gzip
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from finaleme_too.config import MeasurementMode
+from finaleme_too.exceptions import InvalidInputFormatError
+from finaleme_too.io.marker_regions import MarkerRegions
+
+
+@dataclass(frozen=True)
+class MarkerObservations:
+    """Per-sample methylation observations aligned to marker regions.
+
+    The chrom/start/end arrays represent the marker regions used for this
+    observation. k and n are the per-marker methylated and total read counts.
+    For FINALEME mode, predicted_beta optionally holds the raw FinaleMe
+    prediction (uncalibrated) for each marker.
+    """
+
+    sample_id: str
+    chrom: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+    k: np.ndarray  # int32
+    n: np.ndarray  # int32
+    predicted_beta: np.ndarray | None  # float32 or None
+    mode: MeasurementMode
+
+    def __len__(self) -> int:
+        return len(self.k)
+
+    @property
+    def n_markers(self) -> int:
+        return len(self.k)
+
+    @property
+    def total_reads(self) -> int:
+        return int(np.sum(self.n))
+
+    def with_counts(self, k: np.ndarray, n: np.ndarray) -> "MarkerObservations":
+        return replace(self, k=k.astype(np.int32, copy=False), n=n.astype(np.int32, copy=False))
+
+
+class MethylationLoader:
+    """Static loader: dispatches to format-specific parsers."""
+
+    @staticmethod
+    def load(
+        filepath: str | Path,
+        sample_id: str,
+        mode: MeasurementMode,
+        marker_regions: MarkerRegions,
+        input_format: str | None = None,
+        meth_col: int | None = None,
+        total_col: int | None = None,
+        cpg_index: dict | None = None,  # for wgbstools_beta
+    ) -> MarkerObservations:
+        path = Path(filepath)
+        if not path.exists():
+            raise InvalidInputFormatError(f"Methylation file not found: {path}")
+
+        if input_format is None or input_format == "auto":
+            input_format = MethylationLoader.auto_detect_format(path, mode)
+
+        if input_format == "finaleme_bed":
+            return MethylationLoader._parse_finaleme_bed(path, sample_id, marker_regions, mode)
+        if input_format == "bissnp_6plus2":
+            return MethylationLoader._parse_bissnp(path, sample_id, marker_regions, mode)
+        if input_format == "wgbstools_beta":
+            if cpg_index is None:
+                raise InvalidInputFormatError(
+                    "wgbstools_beta format requires --cpg-index"
+                )
+            return MethylationLoader._parse_wgbstools_beta(
+                path, sample_id, marker_regions, cpg_index, mode
+            )
+        if input_format == "custom_bed":
+            if meth_col is None or total_col is None:
+                raise InvalidInputFormatError(
+                    "custom_bed format requires --meth-col and --total-col (1-indexed)"
+                )
+            return MethylationLoader._parse_custom_bed(
+                path, sample_id, marker_regions, meth_col, total_col, mode
+            )
+        raise InvalidInputFormatError(f"Unknown input_format: {input_format}")
+
+    # ------------------------------------------------------------------
+    # Format detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def auto_detect_format(path: Path, mode: MeasurementMode) -> str:
+        name = path.name.lower()
+        if name.endswith(".beta") or name.endswith(".lbeta"):
+            return "wgbstools_beta"
+        if mode == MeasurementMode.FINALEME:
+            return "finaleme_bed"
+
+        # Peek at the first non-comment line to count columns
+        opener = gzip.open if name.endswith(".gz") else open
+        try:
+            with opener(path, "rt") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("track"):
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) >= 8:
+                        try:
+                            pct = float(parts[6])
+                            if 0.0 <= pct <= 100.0:
+                                return "bissnp_6plus2"
+                        except ValueError:
+                            pass
+                    break
+        except OSError:
+            pass
+
+        raise InvalidInputFormatError(
+            f"Cannot auto-detect format for {path}. "
+            "Specify --input-format or --meth-col/--total-col."
+        )
+
+    # ------------------------------------------------------------------
+    # FinaleMe prediction.bed.gz parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_finaleme_bed(
+        path: Path, sample_id: str, marker_regions: MarkerRegions, mode: MeasurementMode
+    ) -> MarkerObservations:
+        """Columns:
+            #chr start end methy_perc_predict methy_count_predict total_count_predict
+            methy_perc_obs methy_count_obs total_count_obs
+        Per-CpG records are aggregated into the supplied marker regions.
+        """
+        opener = gzip.open if path.name.endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            df = pd.read_csv(
+                fh,
+                sep="\t",
+                comment="#",
+                header=None,
+                usecols=[0, 1, 2, 3, 4, 5],
+                names=["chrom", "start", "end", "methy_pct_pred", "methy_count_pred", "total_count_pred"],
+                dtype={
+                    "chrom": str,
+                    "start": np.int64,
+                    "end": np.int64,
+                    "methy_pct_pred": np.float64,
+                    "methy_count_pred": np.float64,
+                    "total_count_pred": np.float64,
+                },
+            )
+        if df.empty:
+            raise InvalidInputFormatError(f"Empty FinaleMe prediction file: {path}")
+        return _aggregate_per_cpg_to_markers(
+            sample_id=sample_id,
+            cpg_chrom=df["chrom"].to_numpy(),
+            cpg_start=df["start"].to_numpy(),
+            cpg_methy=df["methy_count_pred"].to_numpy(),
+            cpg_total=df["total_count_pred"].to_numpy(),
+            cpg_pct=df["methy_pct_pred"].to_numpy() / 100.0,
+            marker_regions=marker_regions,
+            mode=mode,
+            keep_pct=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Bis-SNP 6+2 BED parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_bissnp(
+        path: Path, sample_id: str, marker_regions: MarkerRegions, mode: MeasurementMode
+    ) -> MarkerObservations:
+        """Standard 6-column BED + col 7 = methylation_pct (0-100), col 8 = total_count.
+        k = round(methylation_pct/100 * total_count)
+        """
+        opener = gzip.open if path.name.endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            df = pd.read_csv(
+                fh,
+                sep="\t",
+                comment="#",
+                header=None,
+                usecols=[0, 1, 2, 6, 7],
+                names=["chrom", "start", "end", "methy_pct", "total"],
+                dtype={
+                    "chrom": str,
+                    "start": np.int64,
+                    "end": np.int64,
+                    "methy_pct": np.float64,
+                    "total": np.float64,
+                },
+            )
+        if df.empty:
+            raise InvalidInputFormatError(f"Empty Bis-SNP file: {path}")
+        methy_count = np.round(df["methy_pct"].to_numpy() / 100.0 * df["total"].to_numpy())
+        return _aggregate_per_cpg_to_markers(
+            sample_id=sample_id,
+            cpg_chrom=df["chrom"].to_numpy(),
+            cpg_start=df["start"].to_numpy(),
+            cpg_methy=methy_count,
+            cpg_total=df["total"].to_numpy(),
+            cpg_pct=None,
+            marker_regions=marker_regions,
+            mode=mode,
+            keep_pct=False,
+        )
+
+    # ------------------------------------------------------------------
+    # wgbstools .beta binary parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_wgbstools_beta(
+        path: Path,
+        sample_id: str,
+        marker_regions: MarkerRegions,
+        cpg_index: dict,
+        mode: MeasurementMode,
+    ) -> MarkerObservations:
+        """Read a binary .beta file (NR_SITES x 2 uint8) and aggregate to marker regions.
+
+        cpg_index has the structure produced by io.reference_panel._load_cpg_index:
+            {
+              "chr_positions": dict[str -> np.ndarray of sorted positions],
+              "chr_offsets":   dict[str -> int],
+              "total_sites":   int,
+            }
+        """
+        with open(path, "rb") as fh:
+            data = np.frombuffer(fh.read(), dtype=np.uint8)
+        if data.size % 2 != 0:
+            raise InvalidInputFormatError(
+                f"Beta file size not a multiple of 2: {path}"
+            )
+        per_cpg = data.reshape((-1, 2)).astype(np.int32)  # cols: methy, total
+
+        chr_positions = cpg_index["chr_positions"]
+        chr_offsets = cpg_index["chr_offsets"]
+
+        n_markers = marker_regions.n_markers
+        k_arr = np.zeros(n_markers, dtype=np.int32)
+        n_arr = np.zeros(n_markers, dtype=np.int32)
+
+        for mi in range(n_markers):
+            chrom = str(marker_regions.chrom[mi])
+            start = int(marker_regions.start[mi])
+            end = int(marker_regions.end[mi])
+            positions = chr_positions.get(chrom)
+            offset = chr_offsets.get(chrom)
+            if positions is None or offset is None:
+                continue
+            lo = int(np.searchsorted(positions, start, side="left"))
+            hi = int(np.searchsorted(positions, end, side="left"))
+            if hi <= lo:
+                continue
+            global_lo = offset + lo
+            global_hi = offset + hi
+            if global_hi > per_cpg.shape[0]:
+                global_hi = per_cpg.shape[0]
+            if global_lo >= global_hi:
+                continue
+            block = per_cpg[global_lo:global_hi]
+            k_arr[mi] = int(block[:, 0].sum())
+            n_arr[mi] = int(block[:, 1].sum())
+
+        return MarkerObservations(
+            sample_id=sample_id,
+            chrom=marker_regions.chrom,
+            start=marker_regions.start,
+            end=marker_regions.end,
+            k=k_arr,
+            n=n_arr,
+            predicted_beta=None,
+            mode=mode,
+        )
+
+    # ------------------------------------------------------------------
+    # Custom BED parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_custom_bed(
+        path: Path,
+        sample_id: str,
+        marker_regions: MarkerRegions,
+        meth_col: int,
+        total_col: int,
+        mode: MeasurementMode,
+    ) -> MarkerObservations:
+        """meth_col and total_col are 1-indexed (matches CLI semantics)."""
+        opener = gzip.open if path.name.endswith(".gz") else open
+        meth_idx = meth_col - 1
+        total_idx = total_col - 1
+        with opener(path, "rt") as fh:
+            df = pd.read_csv(
+                fh,
+                sep="\t",
+                comment="#",
+                header=None,
+                usecols=[0, 1, 2, meth_idx, total_idx],
+                names=["chrom", "start", "end", "methy", "total"],
+            )
+        return _aggregate_per_cpg_to_markers(
+            sample_id=sample_id,
+            cpg_chrom=df["chrom"].astype(str).to_numpy(),
+            cpg_start=df["start"].to_numpy(),
+            cpg_methy=df["methy"].to_numpy(),
+            cpg_total=df["total"].to_numpy(),
+            cpg_pct=None,
+            marker_regions=marker_regions,
+            mode=mode,
+            keep_pct=False,
+        )
+
+
+def _aggregate_per_cpg_to_markers(
+    sample_id: str,
+    cpg_chrom: np.ndarray,
+    cpg_start: np.ndarray,
+    cpg_methy: np.ndarray,
+    cpg_total: np.ndarray,
+    cpg_pct: np.ndarray | None,
+    marker_regions: MarkerRegions,
+    mode: MeasurementMode,
+    keep_pct: bool,
+) -> MarkerObservations:
+    """Aggregate per-CpG methylation records into the supplied marker regions.
+
+    Sorts CpGs by (chrom, start) once, then for each marker region uses
+    binary search to find the CpG range. The same approach is used in the Java
+    BetaValueDeconvolution._loadQueryFromPrediction method.
+    """
+    n_markers = marker_regions.n_markers
+    k_arr = np.zeros(n_markers, dtype=np.int64)
+    n_arr = np.zeros(n_markers, dtype=np.int64)
+    pct_sum = np.zeros(n_markers, dtype=np.float64) if keep_pct else None
+    pct_n = np.zeros(n_markers, dtype=np.int64) if keep_pct else None
+
+    cpg_chrom_arr = np.asarray(cpg_chrom)
+    cpg_start_arr = np.asarray(cpg_start, dtype=np.int64)
+    cpg_methy_arr = np.asarray(cpg_methy, dtype=np.float64)
+    cpg_total_arr = np.asarray(cpg_total, dtype=np.float64)
+    cpg_pct_arr = np.asarray(cpg_pct, dtype=np.float64) if cpg_pct is not None else None
+
+    # Group CpGs by chromosome
+    unique_chroms = np.unique(cpg_chrom_arr)
+    chrom_to_indices: dict[str, np.ndarray] = {}
+    for c in unique_chroms:
+        idx = np.where(cpg_chrom_arr == c)[0]
+        # Sort by start within chromosome
+        idx_sorted = idx[np.argsort(cpg_start_arr[idx], kind="stable")]
+        chrom_to_indices[str(c)] = idx_sorted
+
+    for mi in range(n_markers):
+        chrom = str(marker_regions.chrom[mi])
+        idx_for_chrom = chrom_to_indices.get(chrom)
+        if idx_for_chrom is None or idx_for_chrom.size == 0:
+            continue
+        start = int(marker_regions.start[mi])
+        end = int(marker_regions.end[mi])
+        positions = cpg_start_arr[idx_for_chrom]
+        lo = int(np.searchsorted(positions, start, side="left"))
+        hi = int(np.searchsorted(positions, end, side="left"))
+        if hi <= lo:
+            continue
+        sel = idx_for_chrom[lo:hi]
+        k_arr[mi] = int(np.sum(cpg_methy_arr[sel]))
+        n_arr[mi] = int(np.sum(cpg_total_arr[sel]))
+        if keep_pct and cpg_pct_arr is not None:
+            pct_sum[mi] = float(np.sum(cpg_pct_arr[sel]))  # type: ignore[index]
+            pct_n[mi] = sel.size  # type: ignore[index]
+
+    if keep_pct and pct_sum is not None and pct_n is not None:
+        with np.errstate(invalid="ignore"):
+            predicted_beta = np.where(pct_n > 0, pct_sum / np.maximum(pct_n, 1), np.nan).astype(
+                np.float32
+            )
+    else:
+        predicted_beta = None
+
+    return MarkerObservations(
+        sample_id=sample_id,
+        chrom=marker_regions.chrom,
+        start=marker_regions.start,
+        end=marker_regions.end,
+        k=k_arr.astype(np.int32),
+        n=n_arr.astype(np.int32),
+        predicted_beta=predicted_beta,
+        mode=mode,
+    )
+
+
+__all__ = ["MarkerObservations", "MethylationLoader"]
