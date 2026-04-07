@@ -182,6 +182,47 @@ class TOOConfig:
         return _to_serializable(asdict(self))
 
 
+def _resolve_field_enum_type(cls, field_obj) -> type | None:
+    """Return the Enum subclass for a dataclass field, or None.
+
+    With ``from __future__ import annotations`` everywhere, ``field.type``
+    is a string and may use PEP 604 ``X | None`` syntax that fails to
+    evaluate on Python 3.9-. We try ``typing.get_type_hints`` first and
+    fall back to inspecting the default value's actual type, which is
+    always the enum class for enum-typed fields.
+    """
+    import typing
+    from dataclasses import MISSING
+
+    # 1) Try the proper type-hint resolution path
+    try:
+        hints = typing.get_type_hints(cls)
+        resolved = hints.get(field_obj.name)
+        if isinstance(resolved, type) and issubclass(resolved, Enum):
+            return resolved
+        if resolved is not None:
+            origin = typing.get_origin(resolved)
+            if origin is typing.Union:
+                for arg in typing.get_args(resolved):
+                    if isinstance(arg, type) and issubclass(arg, Enum):
+                        return arg
+    except Exception:
+        pass
+
+    # 2) Fall back to inspecting the default value
+    if field_obj.default is not MISSING and isinstance(field_obj.default, Enum):
+        return type(field_obj.default)
+    if field_obj.default_factory is not MISSING:  # type: ignore[misc]
+        try:
+            sample = field_obj.default_factory()  # type: ignore[misc]
+        except Exception:
+            sample = None
+        if isinstance(sample, Enum):
+            return type(sample)
+
+    return None
+
+
 def _build_subconfig(cls, raw: dict[str, Any]):
     """Build a sub-config dataclass, coercing enum-typed fields."""
     kwargs: dict[str, Any] = {}
@@ -190,17 +231,17 @@ def _build_subconfig(cls, raw: dict[str, Any]):
         if key not in valid_fields:
             continue
         f = valid_fields[key]
-        # Coerce enums
-        if isinstance(f.type, type) and issubclass(f.type, Enum):
-            kwargs[key] = f.type(value)
-        else:
-            try:
-                if issubclass(f.type, Enum):  # type: ignore[arg-type]
-                    kwargs[key] = f.type(value)
-                    continue
-            except TypeError:
-                pass
-            kwargs[key] = value
+        enum_cls = _resolve_field_enum_type(cls, f)
+        if enum_cls is not None:
+            if value is None:
+                kwargs[key] = None
+            elif isinstance(value, enum_cls) and not isinstance(value, str):
+                # Genuine enum instance — pass through
+                kwargs[key] = value
+            else:
+                kwargs[key] = enum_cls(value)
+            continue
+        kwargs[key] = value
     return cls(**kwargs)
 
 

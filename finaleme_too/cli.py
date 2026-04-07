@@ -134,19 +134,39 @@ def run_cmd(
     else:
         config = TOOConfig()
 
-    # Apply CLI overrides
-    config.threads = threads
-    config.coverage.coverage_cap = coverage_cap
-    config.coverage.min_reads = min_coverage
-    config.uncertainty.n_bootstrap = n_bootstrap
-    config.uncertainty.bayesian_n_samples = bayesian_n_samples
-    if bayesian:
+    # Apply CLI overrides ONLY for options the user explicitly passed.
+    # Click's get_parameter_source returns COMMANDLINE for explicit args
+    # and DEFAULT for the click option default. This way YAML values are
+    # not silently clobbered by Click defaults.
+    ctx = click.get_current_context()
+
+    def _was_provided(name: str) -> bool:
+        try:
+            from click.core import ParameterSource
+
+            return ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
+        except Exception:  # pragma: no cover
+            return False
+
+    if _was_provided("threads"):
+        config.threads = threads
+    if _was_provided("coverage_cap"):
+        config.coverage.coverage_cap = coverage_cap
+    if _was_provided("min_coverage"):
+        config.coverage.min_reads = min_coverage
+    if _was_provided("n_bootstrap"):
+        config.uncertainty.n_bootstrap = n_bootstrap
+    if _was_provided("bayesian_n_samples"):
+        config.uncertainty.bayesian_n_samples = bayesian_n_samples
+    if bayesian:  # is_flag — only True when explicitly set
         config.model.deconvolution = SolverMethod.BAYESIAN
-    if test_method:
+    if _was_provided("test_method"):
         config.testing.method = TestMethod(test_method)
-    config.testing.fdr_alpha = fdr_alpha
-    config.testing.fdr_method = fdr_method
-    # Wire batch and biological covariate lists
+    if _was_provided("fdr_alpha"):
+        config.testing.fdr_alpha = fdr_alpha
+    if _was_provided("fdr_method"):
+        config.testing.fdr_method = fdr_method
+    # Lists: set them only when the user explicitly passed them
     if batch_correct is not None:
         config.batch_correction.technical_covariates = [
             c.strip() for c in batch_correct.split(",") if c.strip()

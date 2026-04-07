@@ -294,6 +294,7 @@ class TOOPipeline:
             spec=self.group_comparison_spec,
             method=self.config.testing.method,
             fdr_alpha=self.config.testing.fdr_alpha,
+            fdr_method=self.config.testing.fdr_method,
             posterior_samples_by_sample=posterior_by_sample,
         )
 

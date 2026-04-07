@@ -108,18 +108,14 @@ def compute_inference_qc(
     in_range = float(np.mean((sample_pred_valid > lo) & (sample_pred_valid < hi)))
 
     # 2) Bin coverage balance: bins are assigned by CpG density, NOT by
-    # predicted beta. Markers without a known density fall into bin 0.
+    # predicted beta. Markers without a known density are routed by
+    # ``CalibrationParams.assign_bin`` to ``fallback_bin`` (deterministic).
     if cpg_density is not None:
         density = np.asarray(cpg_density, dtype=np.float64)
-        if density.shape != sample_pred.shape:
-            # Density vector is for the original ordering — restrict to valid
-            density_valid = density[valid_mask]
-        else:
-            density_valid = density[valid_mask]
-        density_valid = np.where(np.isfinite(density_valid), density_valid, float(params.bin_edges.mean()))
+        density_valid = density[valid_mask]
         bin_idx = params.assign_bin(density_valid)
     else:
-        bin_idx = np.zeros(sample_pred_valid.size, dtype=np.int64)
+        bin_idx = np.full(sample_pred_valid.size, params.fallback_bin, dtype=np.int64)
     counts = np.bincount(bin_idx, minlength=params.n_bins)
     balance = float(np.mean(counts >= 10))
 
