@@ -16,6 +16,11 @@ FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/
 
 ## 2. Installation and reference setup
 
+Default pipeline requirement summary:
+
+- Steps 1-4 in this tutorial require only FinaleMe (Java + jar build).
+- `wgbstools` and `UXM_deconv` are only needed for optional custom atlas generation in Step 5.2.
+
 ## 2.1 Install source
 
 ```bash
@@ -381,8 +386,9 @@ Notes:
 - `-refBetas` can be a comma-separated list or a text file with one `.beta` path per line.
 - Query input can be `*.prediction.bed.gz` (as above) or `*.beta`.
 - Output format is a matrix: rows are cell types and columns are samples.
+- This default deconvolution command does not require `wgbstools` or `UXM_deconv`.
 
-## 8.2 Build marker atlas with the tested preset
+## 8.2 Optional: Build marker atlas with the tested preset (requires `wgbstools` + `UXM_deconv`)
 
 ```bash
 python scripts/generate_cgi_shore_markers.py \

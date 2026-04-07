@@ -314,7 +314,7 @@ print_summary() {
     log "All reference files are present."
   fi
 
-  log "Note: wgbstools/UXM_deconv are needed only for Step 5 (tissues-of-origin analysis)."
+  log "Note: wgbstools/UXM_deconv are only needed for optional custom atlas generation in Step 5."
 }
 
 usage() {

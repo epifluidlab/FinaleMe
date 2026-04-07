@@ -4,6 +4,9 @@ This tutorial explains how to build your own reference methylation atlas restric
 CpG Island (CGI) and CGI shore regions, and how to use it for tissues-of-origin
 deconvolution with FinaleMe-predicted methylation data using `BetaValueDeconvolution`.
 
+This is an optional advanced tutorial. The default FinaleMe run workflow does not require
+`wgbstools` or `UXM_deconv`.
+
 ## Table of Contents
 
 1. [Background](#1-background)
@@ -64,7 +67,7 @@ cd wgbs_tools
 python setup.py
 cd ..
 
-# 2. UXM_deconv (required for atlas building and deconvolution)
+# 2. UXM_deconv (required for atlas building in this custom-map workflow)
 git clone https://github.com/nloyfer/UXM_deconv.git
 cd UXM_deconv
 pip install -r requirements.txt
@@ -129,7 +132,7 @@ one WGBS sample.
   Convert BAM files to beta using:
   ```bash
   wgbstools bam2pat sample.bam -o sample
-  # This creates sample.pat.gz and sample.beta
+  # This creates sample.pat.gz and sample.beta (or directly use their beta files in GEO)
   ```
 
 - **Option B: Your own WGBS data**:
@@ -326,7 +329,7 @@ methylation. There are two approaches:
   regions. This produces biologically meaningful boundaries.
 
 - **Pre-existing blocks**: If you already have a blocks file (e.g., from a previous
-  segmentation), pass it via `--blocks` and the pipeline will just intersect it with
+  segmentation, or just directly use the hg19/hg38 block files from GSE186458), pass it via `--blocks` and the pipeline will just intersect it with
   CGI+shore.
 
 Blocks are filtered to retain only those with 3-50 CpGs and 50-5000 bp length.
@@ -403,7 +406,7 @@ java -Xmx20G -cp "$JAR" \
 Use the tested preset:
 
 ```bash
-JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.61-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
@@ -437,27 +440,6 @@ Liver-Hep	0.0890
 Values represent the estimated fraction of cfDNA originating from each cell type.
 They sum approximately to 1.0 (minor deviations are normal due to the NNLS solver).
 
-### 6.4 Optional legacy comparison with UXM
-
-If you still want to compare against the classic UXM workflow:
-run FinaleMe decode with `-patOutput` first, then use:
-
-```bash
-# Standard genome-wide atlas
-uxm deconv \
-  results/sample.decode.prediction.pat.gz \
-  -o results/sample.genomewide_uxm.csv \
-  -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
-
-# CGI+shore restricted atlas
-uxm deconv \
-  results/sample.decode.prediction.pat.gz \
-  -o results/sample.cgi_shore_uxm.csv \
-  -a results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv
-```
-
-When using FinaleMe predictions, the CGI+shore atlas is expected to produce more
-accurate results because it only relies on regions where FinaleMe predictions are reliable.
 
 ---
 
