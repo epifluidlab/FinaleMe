@@ -1,8 +1,13 @@
 """TOOPipeline orchestrator.
 
-Phase A scope: single-sample MLE deconvolution end-to-end with bootstrap CIs
-and per-cell-type reliability p-values. Coverage tiers, calibration, batch
-correction, ILR testing, and Bayesian/fragment paths are added in later phases.
+Phase A scope (P0): single-sample MLE deconvolution end-to-end with bootstrap
+CIs and per-cell-type reliability p-values.
+
+Phase B scope (P1): coverage tiers, marker selection, FinaleMe calibration
+apply path, ILR statistical testing, multi-group comparisons, QC summary.
+
+Phases C-E (calibration training, batch correction, Bayesian, fragment-level)
+extend further.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+import pandas as pd
 
 from finaleme_too.config import (
     CoverageTier,
@@ -34,6 +40,7 @@ from finaleme_too.io.marker_regions import MarkerRegions, MarkerRegionsLoader
 from finaleme_too.io.methylation_loader import MarkerObservations, MethylationLoader
 from finaleme_too.io.output_writer import (
     write_cohort_proportions,
+    write_group_comparison,
     write_per_sample_too,
     write_qc_summary,
 )
@@ -43,6 +50,16 @@ from finaleme_too.io.reference_panel import (
     load_cpg_index,
 )
 from finaleme_too.io.sample_sheet import Sample, SampleSheet
+from finaleme_too.preprocessing.calibration import (
+    CalibrationParams,
+    apply_calibration,
+    load_default_calibration,
+)
+from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
+from finaleme_too.preprocessing.coverage import CoverageTierAssigner
+from finaleme_too.preprocessing.marker_selection import BalancedMarkerSelector
+from finaleme_too.postprocessing.group_comparison import run_group_comparisons
+from finaleme_too.postprocessing.qc import compute_qc_flags
 from finaleme_too.utils.parallel import parallel_map
 
 log = logging.getLogger(__name__)
@@ -55,16 +72,35 @@ class CohortResult:
 
 
 class TOOPipeline:
-    """End-to-end TOO pipeline (Phase A scope: P0)."""
+    """End-to-end TOO pipeline (Phase A + B scope: P0 + P1)."""
 
-    def __init__(self, config: TOOConfig):
+    def __init__(
+        self,
+        config: TOOConfig,
+        calibration: CalibrationParams | None = None,
+        region_annotations: pd.DataFrame | None = None,
+        group_comparison_spec: str | None = None,
+    ):
         self.config = config
+        self.calibration = calibration
+        self.region_annotations = region_annotations
+        self.group_comparison_spec = group_comparison_spec
         self.deconvolver = MLEDeconvolver()
         self.bootstrap = BootstrapCI(
             n_iterations=config.uncertainty.n_bootstrap,
             ci_level=config.uncertainty.ci_level,
         )
         self.observation_builder = BetaBinomialModel()
+        self.tier_assigner = CoverageTierAssigner(config.coverage)
+        self.marker_selector = (
+            BalancedMarkerSelector(
+                n_per_type=config.markers.n_per_type,
+                method=config.markers.specificity_method,
+                strict_regions=config.markers.strict_regions,
+            )
+            if config.markers.n_per_type and config.markers.n_per_type > 0
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Top-level
@@ -82,6 +118,21 @@ class TOOPipeline:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Cell-type-balanced marker selection (P1)
+        marker_subset_indices: np.ndarray | None = None
+        if self.marker_selector is not None and reference.n_markers > self.marker_selector.n_per_type:
+            marker_subset_indices = self.marker_selector.select(
+                reference,
+                region_annotations=self.region_annotations,
+            )
+            log.info(
+                "Marker selection: kept %d / %d markers",
+                marker_subset_indices.size,
+                reference.n_markers,
+            )
+            reference = _subset_reference(reference, marker_subset_indices)
+            marker_regions = _subset_marker_regions(marker_regions, marker_subset_indices)
+
         # Per-sample work in parallel
         def _process(sample: Sample) -> DeconvolutionResult:
             return self._process_sample(sample, reference, marker_regions, cpg_index, out_dir)
@@ -92,7 +143,33 @@ class TOOPipeline:
         sample_groups = {s.sample_id: s.group for s in sample_sheet.samples}
         write_cohort_proportions(results, sample_groups, out_dir / "cohort_proportions.tsv")
         write_qc_summary(results, sample_groups, out_dir / "qc_summary.tsv")
+
+        # Group comparison (P1)
+        if self.group_comparison_spec and len(results) >= 4:
+            test_results = self._run_group_comparisons(results, sample_groups)
+            if test_results:
+                write_group_comparison(test_results, out_dir / "group_comparison.tsv")
+
         return CohortResult(samples=results, sample_groups=sample_groups)
+
+    def _run_group_comparisons(
+        self,
+        results: list[DeconvolutionResult],
+        sample_groups: dict[str, str | None],
+    ) -> list:
+        K = len(results[0].cell_types)
+        prop = np.array([r.proportions for r in results], dtype=np.float64)  # (S, K+1)
+        sample_ids = [r.sample_id for r in results]
+        labels = [sample_groups.get(sid) for sid in sample_ids]
+        return run_group_comparisons(
+            proportions=prop,
+            sample_ids=sample_ids,
+            group_labels=labels,
+            cell_type_names=results[0].cell_types,
+            spec=self.group_comparison_spec,
+            method=self.config.testing.method,
+            fdr_alpha=self.config.testing.fdr_alpha,
+        )
 
     # ------------------------------------------------------------------
     # Per-sample
@@ -118,10 +195,20 @@ class TOOPipeline:
             cpg_index=cpg_index,
         )
 
-        tier = self._assign_tier_simple(obs)
+        # Phase B: FinaleMe calibration (apply path)
+        calibration_flag: str | None = None
+        if sample.mode == MeasurementMode.FINALEME and self.calibration is not None:
+            obs = apply_calibration(obs, self.calibration, self.region_annotations)
+            if obs.predicted_beta is not None:
+                qc = compute_inference_qc(obs.predicted_beta, self.calibration)
+                calibration_flag = qc.get("flag")
+
+        tier = self.tier_assigner.assign(obs)
         observation = self.observation_builder.build(
             obs=obs,
             reference=reference,
+            calibration=self.calibration,
+            region_annotations=self.region_annotations,
             tier=tier,
             coverage_cap=self.config.coverage.coverage_cap,
         )
@@ -175,43 +262,45 @@ class TOOPipeline:
             bootstrap_proportions=boot.proportions_samples,
             posterior_samples=None,
             coverage_tier=tier,
-            qc_flags=self._compute_qc_flags(w_hat, observation, tier),
+            qc_flags=[],  # filled below
+        )
+        result.qc_flags = compute_qc_flags(
+            result=result,
+            observation=observation,
+            qc_config=self.config.qc,
+            calibration_flag=calibration_flag,
+            hemolysis=sample.metadata.get("hemolysis_flag")
+            if hasattr(sample, "metadata") else None,
         )
 
         write_per_sample_too(result, out_dir / f"{sample.sample_id}.too.tsv")
         return result
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
-    def _assign_tier_simple(self, obs: MarkerObservations) -> CoverageTier:
-        """Phase A: simple total-reads-per-marker heuristic.
 
-        The full effective-coverage logic from §4 is added in Phase B.
-        """
-        if obs.n.size == 0:
-            return CoverageTier.ULTRALOW
-        median_cov = float(np.median(obs.n))
-        if median_cov >= self.config.coverage.tier_high:
-            return CoverageTier.HIGH
-        if median_cov >= self.config.coverage.tier_low:
-            return CoverageTier.LOW
-        return CoverageTier.ULTRALOW
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    def _compute_qc_flags(
-        self,
-        w_hat: np.ndarray,
-        observation: ObservationModel,
-        tier: CoverageTier,
-    ) -> list[str]:
-        flags: list[str] = []
-        unknown = float(w_hat[-1])
-        if unknown > self.config.qc.max_unknown_fraction:
-            flags.append("HIGH_UNKNOWN")
-        if tier == CoverageTier.ULTRALOW:
-            flags.append("ULTRALOW_COVERAGE")
-        return flags
+
+def _subset_reference(reference: ReferencePanel, indices: np.ndarray) -> ReferencePanel:
+    return ReferencePanel(
+        chrom=reference.chrom[indices],
+        start=reference.start[indices],
+        end=reference.end[indices],
+        cell_types=list(reference.cell_types),
+        methylation=reference.methylation[indices],
+        coverage=reference.coverage[indices] if reference.coverage is not None else None,
+    )
+
+
+def _subset_marker_regions(mr: MarkerRegions, indices: np.ndarray) -> MarkerRegions:
+    return MarkerRegions(
+        chrom=mr.chrom[indices],
+        start=mr.start[indices],
+        end=mr.end[indices],
+        marker_name=mr.marker_name[indices] if mr.marker_name is not None else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,4 +366,37 @@ def build_reference_and_markers(
     return reference, marker_regions, cpg_index
 
 
-__all__ = ["CohortResult", "TOOPipeline", "build_reference_and_markers"]
+def load_optional_calibration(
+    config: TOOConfig,
+    explicit_path: str | None,
+    use_default: bool = True,
+) -> CalibrationParams | None:
+    """Load calibration parameters JSON if available, else default, else None."""
+    path = explicit_path or config.calibration.calibration_file
+    if path is not None:
+        return CalibrationParams.load(path)
+    if use_default and config.calibration.use_default:
+        try:
+            return load_default_calibration()
+        except Exception as exc:  # pragma: no cover
+            log.warning("Could not load default calibration: %s", exc)
+            return None
+    return None
+
+
+def load_optional_region_annotations(
+    config: TOOConfig, explicit_path: str | None
+) -> pd.DataFrame | None:
+    path = explicit_path or config.markers.region_annotation
+    if path is None:
+        return None
+    return pd.read_csv(path, sep="\t", comment="#")
+
+
+__all__ = [
+    "CohortResult",
+    "TOOPipeline",
+    "build_reference_and_markers",
+    "load_optional_calibration",
+    "load_optional_region_annotations",
+]

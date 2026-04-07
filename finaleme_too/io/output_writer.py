@@ -123,6 +123,31 @@ def write_qc_summary(
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.4f")
 
 
+def write_group_comparison(
+    test_results: list,  # list[TestResult]
+    path: str | Path,
+) -> None:
+    """Write group_comparison.tsv (architecture §10.3)."""
+    rows = []
+    for r in test_results:
+        rows.append(
+            {
+                "test_type": r.test_type,
+                "contrast": r.contrast,
+                "cell_type": r.cell_type,
+                "mean_A": r.mean_a,
+                "mean_B": r.mean_b,
+                "effect_size": r.effect_size,
+                "se": r.se,
+                "statistic": r.statistic,
+                "p_value": r.p_value,
+                "adjusted_p": r.adjusted_p_value,
+                "significant": r.significant,
+            }
+        )
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.4g")
+
+
 def write_calibration_report(report: dict, path: str | Path) -> None:
     Path(path).write_text(json.dumps(report, indent=2, default=_json_default))
 
@@ -138,6 +163,7 @@ def _json_default(obj):
 __all__ = [
     "write_calibration_report",
     "write_cohort_proportions",
+    "write_group_comparison",
     "write_per_sample_too",
     "write_qc_summary",
 ]

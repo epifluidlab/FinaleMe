@@ -3,7 +3,7 @@
 target
 .mvn/repository
 .claude
-data/
+/data/
 
 # Python
 __pycache__/

@@ -19,7 +19,12 @@ from finaleme_too.config import (
     TOOConfig,
 )
 from finaleme_too.io.sample_sheet import SampleSheet
-from finaleme_too.pipeline import TOOPipeline, build_reference_and_markers
+from finaleme_too.pipeline import (
+    TOOPipeline,
+    build_reference_and_markers,
+    load_optional_calibration,
+    load_optional_region_annotations,
+)
 
 
 @click.group()
@@ -159,6 +164,12 @@ def run_cmd(
         for s in sample_sheet.samples:
             s.total_col = total_col  # type: ignore[misc]
 
+    # Apply marker selection / strict regions overrides from CLI
+    if strict_regions is not None:
+        config.markers.strict_regions = strict_regions
+    if n_markers_per_type is not None:
+        config.markers.n_per_type = n_markers_per_type
+
     reference, markers, cpg_idx = build_reference_and_markers(
         config=config,
         explicit_reference=reference_panel,
@@ -169,7 +180,20 @@ def run_cmd(
         explicit_marker_format=marker_format,
     )
 
-    pipeline = TOOPipeline(config)
+    # Phase B: load calibration + region annotations (FinaleMe mode)
+    calibration_params = None
+    region_annotations = None
+    has_finaleme = any(s.mode.value == "FINALEME" for s in sample_sheet.samples)
+    if has_finaleme:
+        calibration_params = load_optional_calibration(config, calibration)
+        region_annotations = load_optional_region_annotations(config, region_annotation)
+
+    pipeline = TOOPipeline(
+        config=config,
+        calibration=calibration_params,
+        region_annotations=region_annotations,
+        group_comparison_spec=group_comparison,
+    )
     pipeline.run(sample_sheet, reference, markers, output_dir, cpg_index=cpg_idx)
     click.echo(f"finaleme-too: wrote outputs to {output_dir}")
 
