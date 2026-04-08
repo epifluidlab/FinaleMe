@@ -1101,3 +1101,509 @@ def test_round4_config_input_format_honored_from_yaml(tmp_path):
     assert cfg.input.format == "finaleme_bed"
     assert cfg.input.meth_col == 5
     assert cfg.input.total_col == 6
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — `finaleme-too run` parallelization regression tests
+# ---------------------------------------------------------------------------
+# Symptom: user passed --threads 8 but observed <100% CPU usage. Root cause
+# was the same as the train-calibration fix (commit 0747df1): the default
+# loky backend pickles the (large) reference panel + cpg_index for every
+# task, dominating the runtime. Switched the run-path parallel_map sites to
+# the threading backend (numpy/scipy/pandas release the GIL), parallelized
+# the imputation loop, parallelized load_beta_list, and added a bootstrap
+# inner-loop parallelization that lights up unused cores when the cohort is
+# smaller than --threads.
+
+
+def _build_synth_cohort(tmp_path: Path, n_samples: int = 6) -> tuple:
+    """Build a synthetic Sample sheet that the pipeline can run end-to-end.
+
+    Each sample is a small WGBS BED in finaleme_bed format (with predicted
+    beta + counts), with the methylation generated from a known reference
+    profile so the deconvolver has something signal-rich to do.
+
+    Returns ``(SampleSheet, ReferencePanel, MarkerRegions)``.
+    Stays at 40 markers (10 per cell type) so the WGBS-HIGH per-sample
+    dispersion MLE path is skipped — the brent bracket is unstable on
+    pristine binomial-distributed data and that has nothing to do with
+    parallelization correctness.
+    """
+    from finaleme_too.config import MeasurementMode
+    from finaleme_too.io.marker_regions import MarkerRegions
+    from finaleme_too.io.reference_panel import ReferencePanel
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+
+    n_markers = 40
+    n_cell_types = 4
+    per_ct = n_markers // n_cell_types
+    rng = np.random.default_rng(42)
+
+    # Reference panel: each cell type owns ``per_ct`` markers (low at its own,
+    # high at others' markers)
+    methy = np.full((n_markers, n_cell_types), 0.5, dtype=np.float32)
+    for j in range(n_cell_types):
+        idx = slice(j * per_ct, (j + 1) * per_ct)
+        methy[idx, j] = rng.uniform(0.0, 0.05, size=per_ct).astype(np.float32)
+        for jj in range(n_cell_types):
+            if jj != j:
+                methy[idx, jj] = rng.uniform(0.85, 1.0, size=per_ct).astype(np.float32)
+    chrom = np.array(["chr1"] * n_markers, dtype=object)
+    starts = np.array([1000 + i * 5000 for i in range(n_markers)], dtype=np.int64)
+    ends = starts + 500
+    reference = ReferencePanel(
+        chrom=chrom,
+        start=starts,
+        end=ends,
+        cell_types=[f"CT{j+1}" for j in range(n_cell_types)],
+        methylation=methy,
+        coverage=np.full((n_markers, n_cell_types), 50, dtype=np.int32),
+    )
+    marker_regions = MarkerRegions(
+        chrom=chrom, start=starts, end=ends, marker_name=None
+    )
+
+    # Each sample is a 50/50 mixture of two cell types — generates the WGBS
+    # BED that MethylationLoader can parse with the bissnp_6plus2 format
+    # (chrom, start, end, name, score, strand, methPct, totalCount).
+    samples = []
+    for i in range(n_samples):
+        ct_a = i % n_cell_types
+        ct_b = (i + 1) % n_cell_types
+        true_w = np.zeros(n_cell_types, dtype=np.float64)
+        true_w[ct_a] = 0.6
+        true_w[ct_b] = 0.4
+        beta = methy.astype(np.float64) @ true_w
+        n_arr = np.full(n_markers, 30, dtype=np.int32)
+        k_arr = rng.binomial(n_arr.astype(np.int64), beta).astype(np.int32)
+
+        # Write as bissnp_6plus2 BED
+        bed = tmp_path / f"sample_{i}.bed"
+        with open(bed, "w") as fh:
+            for m in range(n_markers):
+                pct = 100.0 * k_arr[m] / max(int(n_arr[m]), 1)
+                fh.write(
+                    f"{chrom[m]}\t{int(starts[m])}\t{int(ends[m])}\t.\t0\t+"
+                    f"\t{pct:.4f}\t{int(n_arr[m])}\n"
+                )
+        samples.append(
+            Sample(
+                sample_id=f"s_{i}",
+                methylation_file=bed,
+                mode=MeasurementMode.WGBS,
+                input_format="bissnp_6plus2",
+                group="A" if i < n_samples // 2 else "B",
+            )
+        )
+
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+    return sheet, reference, marker_regions
+
+
+def test_parallel_run_threaded_matches_serial_proportions(tmp_path):
+    """Running TOOPipeline with threads=4 must produce the same per-sample
+    proportions as threads=1. The bootstrap is seeded so the inner loops are
+    deterministic.
+
+    Regression: this is the test that would have caught the loky-vs-threading
+    backend issue if any of the parallelized stages (loading, imputation,
+    deconvolution) drifted in the threaded path.
+    """
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=4)
+
+    def _run(threads: int) -> list:
+        cfg = TOOConfig()
+        cfg.threads = threads
+        cfg.uncertainty.n_bootstrap = 20
+        cfg.uncertainty.seed = 7  # determinism
+        cfg.coverage.tier_high = 0.0  # force HIGH for everything
+        cfg.coverage.tier_low = -1.0
+        cfg.markers.n_per_type = 0  # skip marker selection
+        # Disable optional cohort steps that could drift between runs
+        cfg.batch_correction.technical_covariates = []
+        cfg.covariate_adjustment.biological_covariates = []
+        cfg.testing.method = cfg.testing.method  # leave default
+        out_dir = tmp_path / f"out_t{threads}"
+        out_dir.mkdir(exist_ok=True)
+        pipeline = TOOPipeline(cfg)
+        cohort = pipeline.run(sheet, reference, marker_regions, out_dir)
+        return cohort.samples
+
+    serial = _run(1)
+    parallel = _run(4)
+
+    # Same number of results, in the same order
+    assert len(serial) == len(parallel)
+    for s_res, p_res in zip(serial, parallel):
+        assert s_res.sample_id == p_res.sample_id
+        # Point estimates must be exactly identical: the threading backend
+        # never re-pickles arrays, so the numerics are bit-for-bit the same
+        # (the bootstrap rng is pre-generated, so iteration order does not
+        # matter).
+        np.testing.assert_allclose(
+            s_res.proportions, p_res.proportions, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            s_res.ci_lower, p_res.ci_lower, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            s_res.ci_upper, p_res.ci_upper, rtol=0, atol=1e-12
+        )
+
+
+def test_bootstrap_inner_jobs_match_serial(synthetic_observations_pure_celltype, synthetic_reference):
+    """BootstrapCI.estimate(n_jobs=4) must give the same samples as n_jobs=1.
+
+    The threading backend uses a pre-generated index matrix so the per-task
+    iteration is deterministic — there are no rng state hazards.
+    """
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+    from finaleme_too.core.observation_model import BetaBinomialModel
+    from finaleme_too.core.uncertainty import BootstrapCI
+
+    obs = BetaBinomialModel().build(
+        synthetic_observations_pure_celltype, reference=synthetic_reference
+    )
+    bootstrap = BootstrapCI(n_iterations=15, ci_level=0.9, seed=11)
+    deconvolver = MLEDeconvolver()
+    serial = bootstrap.estimate(obs, synthetic_reference, deconvolver, n_jobs=1)
+    parallel = bootstrap.estimate(obs, synthetic_reference, deconvolver, n_jobs=4)
+
+    np.testing.assert_allclose(
+        serial.proportions_samples, parallel.proportions_samples, rtol=0, atol=1e-12
+    )
+    np.testing.assert_allclose(serial.ci_lower, parallel.ci_lower, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(serial.ci_upper, parallel.ci_upper, rtol=0, atol=1e-12)
+
+
+def test_pipeline_outer_inner_thread_split_for_single_sample(tmp_path):
+    """Single-sample run with --threads 8 should hand the bootstrap 8 jobs.
+
+    Regression: previously the outer parallel_map could only use 1 thread for
+    1 sample, leaving 7 cores idle. The fix computes
+    inner_jobs = max(1, threads // outer_jobs) and passes it to the bootstrap.
+    """
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+    import finaleme_too.core.uncertainty as uncertainty_mod
+
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=1)
+
+    cfg = TOOConfig()
+    cfg.threads = 8
+    cfg.uncertainty.n_bootstrap = 4
+    cfg.uncertainty.seed = 13
+    cfg.coverage.tier_high = 0.0
+    cfg.coverage.tier_low = -1.0
+    cfg.markers.n_per_type = 0
+
+    # Spy on BootstrapCI.estimate to capture the n_jobs argument
+    captured = {"n_jobs": None}
+    orig = uncertainty_mod.BootstrapCI.estimate
+
+    def spy(self, model, reference, deconvolver, n_jobs=1):
+        captured["n_jobs"] = n_jobs
+        return orig(self, model, reference, deconvolver, n_jobs=n_jobs)
+
+    uncertainty_mod.BootstrapCI.estimate = spy  # type: ignore[assignment]
+    try:
+        out_dir = tmp_path / "out_single"
+        out_dir.mkdir(exist_ok=True)
+        TOOPipeline(cfg).run(sheet, reference, marker_regions, out_dir)
+    finally:
+        uncertainty_mod.BootstrapCI.estimate = orig  # type: ignore[assignment]
+
+    # 1 sample × 8 threads → bootstrap should get all 8 inner jobs
+    assert captured["n_jobs"] == 8
+
+
+def test_pipeline_outer_inner_thread_split_for_multi_sample(tmp_path):
+    """Cohort run with samples >= threads should leave the inner bootstrap
+    serial (n_jobs=1) so the outer parallel_map drives the parallelism."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+    import finaleme_too.core.uncertainty as uncertainty_mod
+
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=4)
+
+    cfg = TOOConfig()
+    cfg.threads = 4
+    cfg.uncertainty.n_bootstrap = 3
+    cfg.uncertainty.seed = 19
+    cfg.coverage.tier_high = 0.0
+    cfg.coverage.tier_low = -1.0
+    cfg.markers.n_per_type = 0
+
+    captured_n_jobs: list[int] = []
+    orig = uncertainty_mod.BootstrapCI.estimate
+
+    def spy(self, model, reference, deconvolver, n_jobs=1):
+        captured_n_jobs.append(n_jobs)
+        return orig(self, model, reference, deconvolver, n_jobs=n_jobs)
+
+    uncertainty_mod.BootstrapCI.estimate = spy  # type: ignore[assignment]
+    try:
+        out_dir = tmp_path / "out_multi"
+        out_dir.mkdir(exist_ok=True)
+        TOOPipeline(cfg).run(sheet, reference, marker_regions, out_dir)
+    finally:
+        uncertainty_mod.BootstrapCI.estimate = orig  # type: ignore[assignment]
+
+    # 4 samples × 4 threads → outer absorbs the parallelism, inner stays at 1
+    assert all(n == 1 for n in captured_n_jobs)
+    assert len(captured_n_jobs) == 4
+
+
+def test_load_beta_list_threaded_matches_serial(tmp_path):
+    """ReferencePanelLoader.load_beta_list must produce identical reference
+    panels regardless of ``threads``. The threaded path parses each .beta in
+    parallel and accumulates afterwards, so accumulation order doesn't matter
+    for the aggregate-mode counts."""
+    from finaleme_too.io.marker_regions import MarkerRegions
+    from finaleme_too.io.reference_panel import ReferencePanelLoader
+
+    # Build a tiny CpG index covering chr1:0..1000
+    cpg_path = tmp_path / "cpg_index.bed"
+    cpg_lines = [f"chr1\t{p}\n" for p in range(0, 1000, 5)]
+    cpg_path.write_text("".join(cpg_lines))
+
+    # 4 marker regions on chr1 (each spanning a few CpGs)
+    marker_regions = MarkerRegions(
+        chrom=np.array(["chr1"] * 4, dtype=object),
+        start=np.array([0, 100, 200, 300], dtype=np.int64),
+        end=np.array([50, 150, 250, 350], dtype=np.int64),
+        marker_name=None,
+    )
+
+    # 6 .beta files in 2 groups
+    rng = np.random.default_rng(0)
+    n_sites = len(cpg_lines)
+    beta_paths = []
+    for i in range(6):
+        # Per-CpG (methylated_count, total_count) pairs
+        m = rng.integers(0, 20, size=n_sites, dtype=np.uint8)
+        n = np.maximum(m, rng.integers(20, 40, size=n_sites, dtype=np.uint8))
+        data = np.empty((n_sites, 2), dtype=np.uint8)
+        data[:, 0] = m
+        data[:, 1] = n
+        p = tmp_path / f"sample_{i}.beta"
+        p.write_bytes(data.tobytes())
+        beta_paths.append(str(p))
+
+    groups_path = tmp_path / "groups.csv"
+    groups_path.write_text(
+        "name,group\n"
+        + "\n".join(
+            f"sample_{i},{'A' if i < 3 else 'B'}" for i in range(6)
+        )
+        + "\n"
+    )
+
+    serial = ReferencePanelLoader.load_beta_list(
+        ref_betas_arg=",".join(beta_paths),
+        groups_file=groups_path,
+        cpg_index_path=cpg_path,
+        marker_regions=marker_regions,
+        threads=1,
+    )
+    parallel = ReferencePanelLoader.load_beta_list(
+        ref_betas_arg=",".join(beta_paths),
+        groups_file=groups_path,
+        cpg_index_path=cpg_path,
+        marker_regions=marker_regions,
+        threads=4,
+    )
+
+    assert serial.cell_types == parallel.cell_types
+    np.testing.assert_array_equal(serial.methylation, parallel.methylation)
+    np.testing.assert_array_equal(serial.coverage, parallel.coverage)
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — coverage tier ↔ mean_coverage consistency
+# ---------------------------------------------------------------------------
+# Symptom: qc_summary.tsv showed coverage_tier=ULTRALOW for two samples whose
+# mean_coverage values were 124.67 and 74.12 — clearly HIGH-coverage samples.
+#
+# Root cause: CoverageTierAssigner.assign computed
+#     mean_cov = sum(obs.n) * FRAGMENT_LENGTH / GENOME_SIZE
+# treating sum(obs.n) (reads at marker positions) as if it were the whole-BAM
+# total fragment count. With ~1000 markers at ~100 reads/marker that yields
+# mean_cov ≈ 0.006, which always falls below tier_low=0.5 → ULTRALOW.
+#
+# Fix: compute the effective coverage from data we already have — total reads
+# at marker positions × cfDNA fragment length ÷ total marker region area.
+# This is the depth-of-coverage WITHIN the marker regions and needs no extra
+# sample sheet inputs. Both qc_summary.tsv columns (``coverage_tier`` and
+# ``mean_coverage``) report this same quantity, so they can no longer
+# contradict each other.
+
+
+def _make_obs(
+    sample_id: str,
+    n_per_marker: int,
+    n_markers: int = 100,
+    marker_width: int = 100,
+):
+    """Build a MarkerObservations with a deterministic per-marker read count
+    and uniform marker region width.
+
+    Default 100 markers × 100bp wide → 10,000 bp of marker area, so the
+    effective coverage formula simplifies to:
+        coverage = n_per_marker * 100 markers * 167 / 10000 bp
+                 = 1.67 * n_per_marker
+    """
+    starts = np.array(
+        [1000 + i * (marker_width + 100) for i in range(n_markers)], dtype=np.int64
+    )
+    ends = starts + marker_width
+    return MarkerObservations(
+        sample_id=sample_id,
+        chrom=np.array(["chr1"] * n_markers, dtype=object),
+        start=starts,
+        end=ends,
+        k=np.zeros(n_markers, dtype=np.int32),
+        n=np.full(n_markers, n_per_marker, dtype=np.int32),
+        predicted_beta=None,
+        mode=MeasurementMode.WGBS,
+    )
+
+
+def test_high_mean_coverage_classified_as_high_tier():
+    """A sample with mean reads-per-marker well above tier_high must be
+    classified as HIGH, not ULTRALOW.
+
+    Regression: this is exactly the user-reported bug — qc_summary showed
+    mean_coverage values in the 70-125 range with coverage_tier=ULTRALOW.
+    Under the new effective-coverage formula, those samples come out
+    deeply HIGH.
+    """
+    from finaleme_too.config import CoverageConfig, CoverageTier
+    from finaleme_too.preprocessing.coverage import (
+        CoverageTierAssigner,
+        effective_coverage_in_markers,
+    )
+
+    assigner = CoverageTierAssigner(CoverageConfig())  # defaults: 10, 0.5
+
+    # User-reported sample 1: 125 reads/marker × 100 markers × 167 bp / 10000 bp
+    # ≈ 208× effective depth — comfortably HIGH.
+    obs_high_124 = _make_obs("s_high_124", n_per_marker=125)
+    cov = effective_coverage_in_markers(obs_high_124)
+    assert cov > 100, f"Expected ~208, got {cov}"
+    assert assigner.assign(obs_high_124) == CoverageTier.HIGH
+
+    # User-reported sample 2: 74 reads/marker → ~123× depth → HIGH.
+    obs_high_74 = _make_obs("s_high_74", n_per_marker=74)
+    assert effective_coverage_in_markers(obs_high_74) > 100
+    assert assigner.assign(obs_high_74) == CoverageTier.HIGH
+
+
+def test_effective_coverage_formula_matches_expected_depth():
+    """The effective coverage formula equals
+    Σ reads × fragment_length / Σ marker_widths."""
+    from finaleme_too.preprocessing.coverage import (
+        FRAGMENT_LENGTH_BP,
+        effective_coverage_in_markers,
+    )
+
+    obs = _make_obs("s", n_per_marker=10, n_markers=50, marker_width=200)
+    expected = 50 * 10 * FRAGMENT_LENGTH_BP / (50 * 200)
+    actual = effective_coverage_in_markers(obs)
+    assert abs(actual - expected) < 1e-9, f"{actual} != {expected}"
+
+
+def test_coverage_tier_thresholds_use_effective_coverage():
+    """Boundary cases for the tier classifier under the effective-coverage
+    formula. With 100 markers × 100bp wide and 167bp fragments, the per-marker
+    reads needed to cross thresholds are:
+      tier_high (10):  10 / 1.67 ≈ 6 reads/marker
+      tier_low  (0.5): 0.5 / 1.67 ≈ 0.3 reads/marker (so 1 read/marker → LOW)
+    """
+    from finaleme_too.config import CoverageConfig, CoverageTier
+    from finaleme_too.preprocessing.coverage import CoverageTierAssigner
+
+    assigner = CoverageTierAssigner(CoverageConfig())
+
+    # 7 reads/marker → coverage ≈ 11.7 → HIGH (>10)
+    assert assigner.assign(_make_obs("s_7", 7)) == CoverageTier.HIGH
+    # 5 reads/marker → coverage ≈ 8.35 → LOW (between 0.5 and 10)
+    assert assigner.assign(_make_obs("s_5", 5)) == CoverageTier.LOW
+    # 1 read/marker → coverage ≈ 1.67 → LOW
+    assert assigner.assign(_make_obs("s_1", 1)) == CoverageTier.LOW
+    # 0 reads/marker → ULTRALOW (sum-zero short circuit)
+    assert assigner.assign(_make_obs("s_0", 0)) == CoverageTier.ULTRALOW
+
+
+def test_coverage_tier_ultralow_when_marker_area_is_huge(tmp_path):
+    """A small number of reads spread over a huge marker region area should
+    produce ULTRALOW. Confirms the denominator (marker area) actually matters."""
+    from finaleme_too.config import CoverageConfig, CoverageTier
+    from finaleme_too.preprocessing.coverage import CoverageTierAssigner
+
+    # 100 markers × 1,000,000 bp wide each → 100,000,000 bp marker area.
+    # 1 read/marker → 100 reads × 167 / 1e8 ≈ 1.67e-4 → ULTRALOW.
+    obs = _make_obs("s_dilute", n_per_marker=1, n_markers=100, marker_width=1_000_000)
+    assigner = CoverageTierAssigner(CoverageConfig())
+    assert assigner.assign(obs) == CoverageTier.ULTRALOW
+
+
+def test_pipeline_writes_consistent_qc_summary_for_high_coverage_sample(tmp_path):
+    """End-to-end: a sample with deep effective coverage must show
+    coverage_tier=HIGH and a matching mean_coverage in qc_summary.tsv.
+
+    This is the symptom the user actually saw: contradictory columns in
+    qc_summary.tsv. The fix puts both columns on the same effective-coverage
+    scale so they cannot disagree.
+    """
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+    from finaleme_too.preprocessing.coverage import FRAGMENT_LENGTH_BP
+
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=2)
+    # Bump the per-marker reads to ~120 by editing the BED files in place.
+    # _build_synth_cohort writes 30 reads/marker by default.
+    for s in sheet.samples:
+        bed = s.methylation_file
+        lines = bed.read_text().splitlines()
+        new_lines = []
+        for line in lines:
+            parts = line.split("\t")
+            # bissnp_6plus2: chrom start end name score strand methPct totalCount
+            parts[7] = "120"
+            new_lines.append("\t".join(parts))
+        bed.write_text("\n".join(new_lines) + "\n")
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 5
+    cfg.uncertainty.seed = 3
+    cfg.markers.n_per_type = 0  # skip marker selection
+    # Use the production tier_high default (10) and tier_low (0.5) so we
+    # actually exercise the fix.
+    cfg.coverage.tier_high = 10.0
+    cfg.coverage.tier_low = 0.5
+
+    out_dir = tmp_path / "out_qc"
+    out_dir.mkdir(exist_ok=True)
+    TOOPipeline(cfg).run(sheet, reference, marker_regions, out_dir)
+
+    qc_path = out_dir / "qc_summary.tsv"
+    assert qc_path.exists(), "qc_summary.tsv must be written"
+    qc = pd.read_csv(qc_path, sep="\t")
+    assert len(qc) == len(sheet.samples)
+    # _build_synth_cohort uses 500bp markers (start, start+500). Per-marker
+    # n=120 → effective coverage = 120 * 167 / 500 ≈ 40.08× → HIGH.
+    expected_cov = 120 * FRAGMENT_LENGTH_BP / 500
+    assert all(qc["coverage_tier"] == "HIGH"), \
+        f"Expected all HIGH, got {qc['coverage_tier'].tolist()}"
+    for mc in qc["mean_coverage"]:
+        # Allow ±5% slack for the tier-filter and bootstrap noise.
+        assert abs(float(mc) - expected_cov) < 2.0, \
+            f"mean_coverage {mc} not close to expected {expected_cov}"

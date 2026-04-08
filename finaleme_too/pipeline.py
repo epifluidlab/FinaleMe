@@ -63,6 +63,7 @@ from finaleme_too.preprocessing.calibration import (
 from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
 from finaleme_too.preprocessing.coverage import (
     CoverageTierAssigner,
+    effective_coverage_in_markers,
     per_marker_min_reads,
     per_marker_min_reads_vector,
 )
@@ -137,6 +138,7 @@ class TOOPipeline:
         self.bootstrap = BootstrapCI(
             n_iterations=config.uncertainty.n_bootstrap,
             ci_level=config.uncertainty.ci_level,
+            seed=config.uncertainty.seed,
         )
         # Track whether model.deconvolution is Bayesian so the solver
         # dispatcher can prefer the posterior mean as the point estimate.
@@ -192,11 +194,16 @@ class TOOPipeline:
 
         # Phase D: load all samples first so we can do cohort-level operations
         # (batch correction, imputation) before deconvolution.
+        # Use the threading backend: pandas.read_csv / numpy releases the GIL
+        # in the inner loops, and the marker_regions / cpg_index arguments are
+        # large — pickling them per task (the loky default) would dominate the
+        # runtime and produce the <100% CPU symptom the user reported.
         log.info("Loading + calibrating %d samples", len(sample_sheet.samples))
         loaded_obs: list[MarkerObservations] = parallel_map(
             lambda s: self._load_and_calibrate(s, marker_regions, cpg_index),
             sample_sheet.samples,
             n_jobs=self.config.threads,
+            backend="threading",
         )
 
         # Optional: ComBat-style technical batch correction
@@ -222,21 +229,44 @@ class TOOPipeline:
         sample_groups_map = {s.sample_id: s.group for s in sample_sheet.samples}
         if self._should_impute(loaded_obs):
             imputer = CohortImputer(coverage_threshold=self.config.coverage.min_reads)
-            loaded_obs = [
-                imputer.impute(obs, loaded_obs, sample_groups_map) for obs in loaded_obs
-            ]
+            # Imputation is pure numpy on per-sample arrays — releases the GIL
+            # and shares the cohort donor list by reference, so the threading
+            # backend wins by avoiding the per-task pickle of all donors.
+            loaded_obs = parallel_map(
+                lambda obs: imputer.impute(obs, loaded_obs, sample_groups_map),
+                loaded_obs,
+                n_jobs=self.config.threads,
+                backend="threading",
+            )
+
+        # Compute the per-sample inner-thread count. When the cohort is
+        # smaller than --threads (e.g. one sample run with --threads 8), the
+        # outer parallel_map can only saturate `len(samples)` cores. Hand the
+        # remaining budget to the bootstrap inner loop so all of --threads
+        # are actually used.
+        n_samples = len(sample_sheet.samples)
+        outer_jobs = max(1, min(self.config.threads, n_samples))
+        inner_jobs = max(1, self.config.threads // outer_jobs)
 
         # Per-sample deconvolution (parallel)
         def _decon(
             args: tuple[Sample, MarkerObservations, np.ndarray],
         ) -> DeconvolutionResult:
             sample, obs, pre_n = args
-            return self._deconvolve_sample(sample, obs, reference, out_dir, pre_n)
+            return self._deconvolve_sample(
+                sample, obs, reference, out_dir, pre_n, bootstrap_jobs=inner_jobs
+            )
 
+        # Threading backend: scipy.optimize SLSQP, the bootstrap, and the
+        # observation-model construction are pure numpy/scipy and release the
+        # GIL. Loky here would re-pickle the (large) reference panel for every
+        # sample, which is what was capping CPU usage well below the user's
+        # `--threads` setting.
         results = parallel_map(
             _decon,
             list(zip(sample_sheet.samples, loaded_obs, pre_impute_n)),
-            n_jobs=self.config.threads,
+            n_jobs=outer_jobs,
+            backend="threading",
         )
 
         # Phase D: optional ILR-space biological covariate adjustment
@@ -459,11 +489,17 @@ class TOOPipeline:
         reference: ReferencePanel,
         out_dir: Path,
         pre_impute_n: np.ndarray | None = None,
+        bootstrap_jobs: int = 1,
     ) -> DeconvolutionResult:
         """Build observation model, deconvolve, bootstrap, write per-sample TSV.
 
         ``pre_impute_n`` is the pre-imputation per-marker read count (n) for
         this sample. It is used to compute ``pct_imputed`` in the result.
+
+        ``bootstrap_jobs`` controls inner-loop parallelism over bootstrap
+        iterations. The pipeline computes this from
+        ``threads // num_samples`` so a single-sample run with ``--threads 8``
+        actually uses all 8 cores instead of just the one outer thread.
         """
         log.info("Deconvolving sample %s", sample.sample_id)
 
@@ -498,11 +534,11 @@ class TOOPipeline:
             # No usable markers at this tier — return an all-unknown result
             return self._emit_fallback_result(
                 sample=sample,
+                obs=obs,
                 reference=reference,
                 tier=tier,
                 calibration_flag=calibration_flag,
                 pre_impute_n=pre_impute_n,
-                post_impute_n=np.asarray(obs.n, dtype=np.int64),
                 out_dir=out_dir,
             )
         obs_filtered = _subset_observations(obs, valid_mask)
@@ -620,7 +656,9 @@ class TOOPipeline:
 
         # 2) Pick the "primary" boot struct that drives reliability + CIs.
         if self._wants_bootstrap:
-            boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+            boot = self.bootstrap.estimate(
+                observation, reference, self.deconvolver, n_jobs=bootstrap_jobs
+            )
         elif self._wants_bayesian_uncertainty and posterior_samples is not None:
             boot = _posterior_to_boot(posterior_samples)
         elif not self._wants_any_uncertainty:
@@ -634,7 +672,9 @@ class TOOPipeline:
             )
         else:
             # Requested bayesian/both but Bayesian failed → fall back to bootstrap
-            boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+            boot = self.bootstrap.estimate(
+                observation, reference, self.deconvolver, n_jobs=bootstrap_jobs
+            )
 
         # Reliability p-values per cell type
         K = reference.n_cell_types
@@ -672,7 +712,11 @@ class TOOPipeline:
             reference_methylation=reference.methylation,
             top_n=50,
         )
-        mean_coverage = float(np.mean(observation.n)) if observation.n.size > 0 else 0.0
+        # Mean coverage = effective depth of coverage in marker regions
+        # (Σ reads * fragment_length / Σ marker_widths). Same scale as the
+        # tier classification thresholds, so qc_summary.tsv's coverage_tier
+        # and mean_coverage columns are always self-consistent.
+        mean_coverage = effective_coverage_in_markers(obs_filtered)
 
         # pct_imputed: fraction of markers where the pre-imputation n was below
         # the per-marker tier threshold but the post-imputation n is at or
@@ -759,11 +803,11 @@ class TOOPipeline:
     def _emit_fallback_result(
         self,
         sample: Sample,
+        obs: MarkerObservations,
         reference: ReferencePanel,
         tier: CoverageTier,
         calibration_flag: str | None,
         pre_impute_n: np.ndarray | None,
-        post_impute_n: np.ndarray,
         out_dir: Path,
     ) -> DeconvolutionResult:
         """Return an all-unknown result when no markers pass the tier filter."""
@@ -784,7 +828,10 @@ class TOOPipeline:
             coverage_tier=tier,
             qc_flags=["NO_MARKERS_PASS_TIER_FILTER"],
             mean_dispersion=np.zeros(K, dtype=np.float64),
-            mean_coverage=float(np.mean(post_impute_n)) if post_impute_n.size else 0.0,
+            # Same effective-coverage formula used everywhere else, so the
+            # NO_MARKERS_PASS_TIER_FILTER row in qc_summary still has a
+            # comparable mean_coverage value.
+            mean_coverage=effective_coverage_in_markers(obs),
             n_markers_used=0,
             pct_imputed=0.0,
             calibration_flag=calibration_flag,
@@ -896,8 +943,14 @@ def build_reference_and_markers(
     explicit_ref_groups: str | None = None,
     explicit_cpg_index: str | None = None,
     explicit_marker_format: str | None = None,
+    threads: int = 1,
 ) -> tuple[ReferencePanel, MarkerRegions, dict | None]:
-    """Resolve reference panel and marker regions from CLI / config."""
+    """Resolve reference panel and marker regions from CLI / config.
+
+    ``threads`` is forwarded to the binary .beta loader so the per-sample
+    .beta parsing in ``load_beta_list`` runs in parallel for large reference
+    panels.
+    """
     cpg_index = None
     cpg_index_path = explicit_cpg_index or config.reference.cpg_index
     if cpg_index_path is not None:
@@ -939,6 +992,7 @@ def build_reference_and_markers(
             groups_file=ref_groups,
             cpg_index_path=cpg_index_path,
             marker_regions=marker_regions,
+            threads=threads,
         )
     else:
         raise ValueError("No reference panel: provide --reference-panel or --ref-betas")
