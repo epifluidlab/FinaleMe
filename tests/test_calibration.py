@@ -864,3 +864,870 @@ def test_train_calibration_auto_generates_region_annotation_from_cpg_index(tmp_p
     # A useful sanity check: the training metadata records the number of
     # observations, which is n_samples * n_markers when density is non-zero
     assert params.training_metadata["n_observations"] == n_samples * n_markers
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — 4 calibration bugs reported from a user's HD45 run:
+#
+# Bug 1 (HIGH): Best-bin selection is mathematically wrong when CV is
+#   unavailable. The old _select_best_candidate fell back to
+#   ``min(candidates, key=lambda c: (c["cv_rmse"], c.get("aic", inf)))``
+#   which silently returns the first candidate because NaN comparisons
+#   are undefined — AIC was never consulted.
+#
+# Bug 2 (HIGH): train_calibration treated zero-coverage rows as valid
+#   betas via ``total_count.clip(lower=1)``, turning k/0 into k/1. This
+#   biased the regression, RMSE, AIC, and bin tuning. Must drop those
+#   rows before computing betas.
+#
+# Bug 3 (MEDIUM): The FinaleMe prediction parser did not clamp
+#   methylated_count <= total_count, so malformed rows could yield
+#   beta > 1 and distort the regression after logit clipping.
+#
+# Bug 4 (MEDIUM, design mismatch): per-bin dispersion was estimated from
+#   residual variance (phi ≈ 1/Var) rather than by beta-binomial MLE on
+#   the calibration residuals as the design (math doc §6.2) requires.
+# ---------------------------------------------------------------------------
+
+
+def test_bug1_select_best_candidate_falls_back_to_aic_when_cv_unavailable():
+    """When every candidate has cv_rmse=NaN (CV couldn't run), the best
+    candidate must be chosen by AIC — not just the first one in the list.
+    """
+    from finaleme_too.preprocessing.calibration_eval import _select_best_candidate
+
+    # Four candidates with NaN cv_rmse; only B=8 has the lowest AIC.
+    candidates = [
+        {"n_bins": 4, "cv_rmse": float("nan"), "aic": 100.0, "in_sample_rmse": 0.3},
+        {"n_bins": 6, "cv_rmse": float("nan"), "aic": 80.0, "in_sample_rmse": 0.28},
+        {"n_bins": 8, "cv_rmse": float("nan"), "aic": 50.0, "in_sample_rmse": 0.26},
+        {"n_bins": 10, "cv_rmse": float("nan"), "aic": 90.0, "in_sample_rmse": 0.27},
+    ]
+    result = _select_best_candidate(candidates)
+    # The old code would have returned candidates[0] (n_bins=4); the fix
+    # picks the one with lowest AIC (n_bins=8).
+    assert result["selected_n_bins"] == 8
+
+
+def test_bug1_select_best_candidate_still_prefers_cv_when_available():
+    """Sanity check that cv_rmse is still the primary criterion when
+    it is finite."""
+    from finaleme_too.preprocessing.calibration_eval import _select_best_candidate
+
+    candidates = [
+        {"n_bins": 4, "cv_rmse": 0.20, "aic": 100.0, "in_sample_rmse": 0.25},
+        {"n_bins": 6, "cv_rmse": 0.15, "aic": 90.0, "in_sample_rmse": 0.20},  # best by CV
+        {"n_bins": 8, "cv_rmse": 0.18, "aic": 50.0, "in_sample_rmse": 0.18},  # best by AIC but worse CV
+    ]
+    result = _select_best_candidate(candidates)
+    assert result["selected_n_bins"] == 6
+
+
+def test_bug1_select_best_candidate_falls_back_to_rmse_when_no_cv_or_aic():
+    """When neither cv_rmse nor aic are finite, fall through to in-sample
+    RMSE instead of returning an arbitrary candidate."""
+    from finaleme_too.preprocessing.calibration_eval import _select_best_candidate
+
+    candidates = [
+        {"n_bins": 4, "cv_rmse": float("nan"), "aic": float("nan"), "in_sample_rmse": 0.40},
+        {"n_bins": 6, "cv_rmse": float("nan"), "aic": float("nan"), "in_sample_rmse": 0.15},
+        {"n_bins": 8, "cv_rmse": float("nan"), "aic": float("nan"), "in_sample_rmse": 0.25},
+    ]
+    result = _select_best_candidate(candidates)
+    assert result["selected_n_bins"] == 6
+
+
+def test_bug2_zero_coverage_rows_dropped_before_training(tmp_path):
+    """train_calibration must drop rows with total_count=0 on either side
+    instead of silently turning k/0 into k/1.
+
+    Inject several zero-coverage rows on both sides and verify:
+      (a) n_observations reflects only the non-zero-coverage rows
+      (b) the calibration params are unchanged by adding those garbage rows
+    """
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rng = np.random.default_rng(99)
+    n_samples = 3
+    n_markers = 60
+
+    def _build(rows_w, rows_f, prefix: str):
+        pd.DataFrame(
+            rows_w,
+            columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+        ).to_csv(tmp_path / f"{prefix}_wgbs.tsv", sep="\t", index=False)
+        pd.DataFrame(
+            rows_f,
+            columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+        ).to_csv(tmp_path / f"{prefix}_fme.tsv", sep="\t", index=False)
+
+    # Build clean data
+    clean_w, clean_f = [], []
+    for s in range(n_samples):
+        for m in range(n_markers):
+            b = float(rng.beta(2, 5))
+            k_w = int(rng.binomial(30, b))
+            fme_b = float(
+                expit((logit(np.clip(b, 1e-6, 1 - 1e-6)) - 0.1) / 0.8 + rng.normal(0, 0.1))
+            )
+            k_f = int(rng.binomial(30, fme_b))
+            clean_w.append((f"S{s}", "chr1", m * 100, m * 100 + 1, k_w, 30))
+            clean_f.append((f"S{s}", "chr1", m * 100, m * 100 + 1, k_f, 30))
+
+    _build(clean_w, clean_f, "clean")
+    clean_params = train_calibration(
+        matched_wgbs=tmp_path / "clean_wgbs.tsv",
+        matched_finaleme=tmp_path / "clean_fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "clean.json",
+        out_report=tmp_path / "clean_report.json",
+    )
+    assert clean_params.training_metadata["n_observations"] == n_samples * n_markers
+
+    # Inject zero-coverage garbage rows — same sample/coord layout but
+    # total_count=0. These rows must be filtered before beta computation.
+    dirty_w = list(clean_w) + [
+        (f"S{s}", "chr1", 9000 + i, 9001 + i, 5, 0)
+        for s in range(n_samples)
+        for i in range(10)
+    ]
+    dirty_f = list(clean_f) + [
+        (f"S{s}", "chr1", 9000 + i, 9001 + i, 3, 0)
+        for s in range(n_samples)
+        for i in range(10)
+    ]
+    _build(dirty_w, dirty_f, "dirty")
+    dirty_params = train_calibration(
+        matched_wgbs=tmp_path / "dirty_wgbs.tsv",
+        matched_finaleme=tmp_path / "dirty_fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "dirty.json",
+        out_report=tmp_path / "dirty_report.json",
+    )
+    # Same number of surviving observations
+    assert dirty_params.training_metadata["n_observations"] == n_samples * n_markers
+    # Same fitted parameters (identical valid rows → identical output)
+    assert dirty_params.n_bins == clean_params.n_bins
+    np.testing.assert_allclose(dirty_params.a, clean_params.a, rtol=1e-12)
+    np.testing.assert_allclose(dirty_params.c, clean_params.c, rtol=1e-12)
+    np.testing.assert_allclose(
+        dirty_params.log_dispersion, clean_params.log_dispersion, rtol=1e-12
+    )
+
+
+def test_bug2_zero_coverage_only_input_raises(tmp_path):
+    """If every row has zero coverage on one side, train_calibration must
+    fail loudly instead of silently fitting on garbage k/1 betas."""
+    from finaleme_too.exceptions import InvalidCalibrationError
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rows_w = [("S0", "chr1", i * 100, i * 100 + 1, 1, 0) for i in range(20)]
+    rows_f = [("S0", "chr1", i * 100, i * 100 + 1, 1, 5) for i in range(20)]
+
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    with pytest.raises(InvalidCalibrationError):
+        train_calibration(
+            matched_wgbs=tmp_path / "wgbs.tsv",
+            matched_finaleme=tmp_path / "fme.tsv",
+            region_annotation=None,
+            n_bins_candidates=[2],
+            out_params=tmp_path / "cal.json",
+            out_report=tmp_path / "report.json",
+        )
+
+
+def test_bug3_finaleme_parser_clamps_methylated_above_total(tmp_path):
+    """_parse_finaleme_prediction must enforce methylated_count <= total_count
+    so malformed FinaleMe files cannot yield beta > 1."""
+    import gzip
+
+    from finaleme_too.preprocessing.calibration import _parse_finaleme_prediction
+
+    path = tmp_path / "pred.bed.gz"
+    # Columns: chr start end methy_pct methy_count total_count ...
+    # Row 1: normal, k=5, n=10 (beta 0.5)
+    # Row 2: malformed, k=12, n=10 (beta 1.2 — must be clamped to k=n=10)
+    # Row 3: normal, k=0, n=8 (beta 0.0)
+    lines = [
+        "#chr\tstart\tend\tmethy_perc\tmethy_count\ttotal_count\n",
+        "chr1\t100\t101\t50.0\t5\t10\n",
+        "chr1\t200\t201\t120.0\t12\t10\n",
+        "chr1\t300\t301\t0.0\t0\t8\n",
+    ]
+    with gzip.open(path, "wt") as fh:
+        fh.writelines(lines)
+    df = _parse_finaleme_prediction(path, sample_id="test")
+
+    # All (k, n) must satisfy 0 <= k <= n
+    assert (df["methylated_count"] >= 0).all()
+    assert (df["methylated_count"] <= df["total_count"]).all()
+    # Row 2 specifically: methylated was clamped from 12 to 10
+    row_200 = df[df["start"] == 200].iloc[0]
+    assert int(row_200["methylated_count"]) == 10
+    assert int(row_200["total_count"]) == 10
+    # Resulting beta = 1.0, not 1.2
+    beta = int(row_200["methylated_count"]) / int(row_200["total_count"])
+    assert beta == 1.0
+
+
+def test_bug4_dispersion_estimated_by_beta_binomial_mle(tmp_path):
+    """When raw WGBS (k, n) counts are provided, the per-bin dispersion
+    must come from a beta-binomial MLE rather than the residual-variance
+    heuristic. This test verifies the MLE path is actually exercised and
+    produces a dispersion that differs from the heuristic when the two
+    estimators should disagree.
+    """
+    from finaleme_too.preprocessing.calibration_eval import (
+        _fit_logistic_bin,
+        fit_calibration,
+    )
+
+    rng = np.random.default_rng(123)
+    n = 500
+    # Simulate well-calibrated data: fme_beta ≈ wgbs_beta with small noise.
+    wgbs_beta = rng.beta(2, 5, size=n)
+    fme_beta = np.clip(wgbs_beta + rng.normal(0, 0.03, size=n), 0.01, 0.99)
+    wgbs_n = np.full(n, 30, dtype=np.int64)
+    # Generate realistic WGBS counts under the beta-binomial with phi=80
+    wgbs_k = rng.binomial(wgbs_n, wgbs_beta).astype(np.int64)
+
+    # Heuristic path (no counts)
+    a_h, c_h, log_phi_h = _fit_logistic_bin(fme_beta, wgbs_beta)
+
+    # MLE path (with counts)
+    a_m, c_m, log_phi_m = _fit_logistic_bin(
+        fme_beta, wgbs_beta, wgbs_k=wgbs_k, wgbs_n=wgbs_n
+    )
+
+    # (a, c) come from the same OLS, so they match exactly.
+    assert abs(a_h - a_m) < 1e-12
+    assert abs(c_h - c_m) < 1e-12
+
+    # Dispersion must differ: the MLE uses the binomial information in
+    # (k, n), the heuristic uses the variance of the logit-space residual.
+    # These are distinct estimators and must not collapse to the same
+    # value on real data.
+    assert abs(log_phi_h - log_phi_m) > 1e-6
+
+    # Also verify that fit_calibration propagates the counts correctly:
+    # calling with counts vs without yields different log_dispersion.
+    cpg_density = rng.uniform(0, 0.1, size=n)
+    fit_no_counts = fit_calibration(
+        fme_beta, wgbs_beta, cpg_density, n_bins=2
+    )
+    fit_with_counts = fit_calibration(
+        fme_beta, wgbs_beta, cpg_density, n_bins=2,
+        wgbs_k=wgbs_k, wgbs_n=wgbs_n,
+    )
+    # a and c must match; log_dispersion must diverge.
+    np.testing.assert_allclose(fit_no_counts.a, fit_with_counts.a, rtol=1e-12)
+    np.testing.assert_allclose(fit_no_counts.c, fit_with_counts.c, rtol=1e-12)
+    assert not np.allclose(
+        fit_no_counts.log_dispersion, fit_with_counts.log_dispersion, atol=1e-6
+    )
+
+
+def test_bug4_dispersion_mle_is_finite_on_clean_data():
+    """Regression: the old bracketed Brent MLE threw "Not a bracketing
+    interval" on well-calibrated synthetic data. The bounded minimizer
+    used now must return a finite phi in the same scenario.
+    """
+    from finaleme_too.utils.beta_binomial import estimate_dispersion_mle
+
+    rng = np.random.default_rng(7)
+    n = 200
+    mu = rng.uniform(0.3, 0.7, size=n)
+    n_arr = np.full(n, 30, dtype=np.int64)
+    # Pristine binomial counts — the old brent bracket failed on this.
+    k_arr = rng.binomial(n_arr, mu)
+
+    phi = estimate_dispersion_mle(
+        k=k_arr.astype(np.float64),
+        n=n_arr.astype(np.float64),
+        mu=mu,
+        phi_init=50.0,
+        bounds=(1.0, 1000.0),
+    )
+    assert np.isfinite(phi)
+    assert 1.0 <= phi <= 1000.0
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — region-level K-fold CV for few-sample calibration runs
+# ---------------------------------------------------------------------------
+# When only 1-2 matched WGBS/FinaleMe samples are available, leave-one-sample-
+# out CV can't run (cv_rmse=NaN for every candidate). The new ``cv_strategy``
+# parameter on train_calibration/tune_n_bins/cross_validate_calibration lets
+# the user ask for random K-fold CV on row indices instead, which gives a
+# finite cv_rmse — biased low compared to true held-out-sample error, but
+# strictly better than NaN for picking the best n_bins.
+
+
+def _synth_matched_arrays(
+    n_samples: int,
+    n_markers_per_sample: int,
+    seed: int = 0,
+):
+    """Build synthetic (finaleme_beta, wgbs_beta, wgbs_k, wgbs_n, density,
+    sample_ids) arrays with a known miscalibration."""
+    from scipy.special import expit, logit
+
+    rng = np.random.default_rng(seed)
+    rows = []
+    for s in range(n_samples):
+        for m in range(n_markers_per_sample):
+            b = float(rng.beta(2, 5))
+            k_w = int(rng.binomial(30, b))
+            fme_b = float(
+                expit(
+                    (logit(np.clip(b, 1e-6, 1 - 1e-6)) - 0.1) / 0.8
+                    + rng.normal(0, 0.1)
+                )
+            )
+            rows.append((f"S{s}", b, fme_b, k_w, 30))
+    sample_ids = np.array([r[0] for r in rows])
+    wgbs_beta = np.array([r[1] for r in rows], dtype=np.float64)
+    fme_beta = np.clip(np.array([r[2] for r in rows], dtype=np.float64), 1e-6, 1 - 1e-6)
+    wgbs_k = np.array([r[3] for r in rows], dtype=np.int64)
+    wgbs_n = np.array([r[4] for r in rows], dtype=np.int64)
+    density = np.linspace(0.0, 0.1, len(rows))
+    return fme_beta, wgbs_beta, wgbs_k, wgbs_n, density, sample_ids
+
+
+def test_region_cv_returns_finite_rmse_with_single_sample():
+    """A 1-sample run with cv_strategy='region' (or 'auto') must produce a
+    finite cv_rmse instead of NaN."""
+    from finaleme_too.preprocessing.calibration_eval import (
+        cross_validate_calibration,
+    )
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=300, seed=0
+    )
+
+    result_region = cross_validate_calibration(
+        finaleme_beta=fme,
+        wgbs_beta=wgbs,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins=4,
+        wgbs_k=k,
+        wgbs_n=n,
+        cv_strategy="region",
+        cv_n_folds=5,
+        cv_seed=42,
+    )
+    assert np.isfinite(result_region["cv_rmse"])
+    assert result_region["n_folds"] == 5
+    assert result_region["cv_strategy"] == "region"
+
+    # "auto" with 1 sample should also fall back to region
+    result_auto = cross_validate_calibration(
+        finaleme_beta=fme,
+        wgbs_beta=wgbs,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins=4,
+        wgbs_k=k,
+        wgbs_n=n,
+        cv_strategy="auto",
+        cv_n_folds=5,
+        cv_seed=42,
+    )
+    assert np.isfinite(result_auto["cv_rmse"])
+    assert result_auto["cv_strategy"] == "region"
+    # Same seed + same n_folds → identical rmse
+    assert result_region["cv_rmse"] == result_auto["cv_rmse"]
+
+
+def test_region_cv_seed_is_reproducible():
+    """Same cv_seed must produce the same region-level CV rmse across runs."""
+    from finaleme_too.preprocessing.calibration_eval import (
+        cross_validate_calibration,
+    )
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=300, seed=11
+    )
+
+    a = cross_validate_calibration(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="region", cv_n_folds=10, cv_seed=777,
+    )
+    b = cross_validate_calibration(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="region", cv_n_folds=10, cv_seed=777,
+    )
+    assert abs(a["cv_rmse"] - b["cv_rmse"]) < 1e-12
+
+    # Different seed → different result (with overwhelmingly high probability)
+    c = cross_validate_calibration(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="region", cv_n_folds=10, cv_seed=999,
+    )
+    assert abs(a["cv_rmse"] - c["cv_rmse"]) > 1e-12
+
+
+def test_auto_cv_prefers_sample_when_multi_sample():
+    """With >=2 samples, auto must resolve to sample-level CV (the
+    unbiased estimator)."""
+    from finaleme_too.preprocessing.calibration_eval import (
+        cross_validate_calibration,
+    )
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=3, n_markers_per_sample=200, seed=2
+    )
+    result = cross_validate_calibration(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="auto",
+    )
+    assert result["cv_strategy"] == "sample"
+    assert result["n_folds"] == 3
+
+
+def test_cv_strategy_none_skips_cv_entirely():
+    """cv_strategy='none' must return NaN cv_rmse and 0 folds, even with
+    multiple samples."""
+    from finaleme_too.preprocessing.calibration_eval import (
+        cross_validate_calibration,
+    )
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=3, n_markers_per_sample=200, seed=3
+    )
+    result = cross_validate_calibration(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="none",
+    )
+    assert result["cv_strategy"] == "none"
+    assert result["n_folds"] == 0
+    assert np.isnan(result["cv_rmse"])
+    # In-sample metrics must still be populated
+    assert np.isfinite(result["in_sample_rmse"])
+
+
+def test_tune_n_bins_picks_by_cv_rmse_in_region_mode():
+    """tune_n_bins with cv_strategy='region' must produce finite cv_rmse
+    for every candidate and choose by cv_rmse (not AIC fallback)."""
+    from finaleme_too.preprocessing.calibration_eval import tune_n_bins
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=600, seed=5
+    )
+    result = tune_n_bins(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 6, 8],
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="region", cv_n_folds=10, cv_seed=1,
+    )
+    # Every candidate got a finite cv_rmse
+    for cand in result["candidates"]:
+        assert np.isfinite(cand["cv_rmse"]), f"NaN cv_rmse for B={cand['n_bins']}"
+        assert cand["n_folds"] == 10
+        assert cand["cv_strategy"] == "region"
+    # Selected n_bins is the one with lowest cv_rmse
+    best = min(result["candidates"], key=lambda c: c["cv_rmse"])
+    assert result["selected_n_bins"] == best["n_bins"]
+
+
+def test_tune_n_bins_serial_and_threaded_region_cv_match():
+    """Region-level CV must be deterministic regardless of thread count
+    when cv_seed is fixed."""
+    from finaleme_too.preprocessing.calibration_eval import tune_n_bins
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=500, seed=9
+    )
+    serial = tune_n_bins(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 6],
+        wgbs_k=k, wgbs_n=n,
+        threads=1,
+        cv_strategy="region", cv_n_folds=5, cv_seed=13,
+    )
+    threaded = tune_n_bins(
+        finaleme_beta=fme, wgbs_beta=wgbs, cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 6],
+        wgbs_k=k, wgbs_n=n,
+        threads=4,
+        cv_strategy="region", cv_n_folds=5, cv_seed=13,
+    )
+    assert serial["selected_n_bins"] == threaded["selected_n_bins"]
+    for s, t in zip(serial["candidates"], threaded["candidates"]):
+        assert s["n_bins"] == t["n_bins"]
+        assert abs(s["cv_rmse"] - t["cv_rmse"]) < 1e-12
+        assert s["n_folds"] == t["n_folds"]
+
+
+def test_train_calibration_single_sample_with_region_cv(tmp_path):
+    """End-to-end: train_calibration on ONE matched sample with
+    cv_strategy='region' must produce:
+      * a finite cv_rmse per candidate
+      * a selected n_bins (not silently "the first one")
+      * cv_strategy_effective='region' in the training report
+    """
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    fme_arr, wgbs_arr, k_arr, n_arr, _density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=300, seed=17
+    )
+    # Write as legacy joined TSVs
+    rows_w = [
+        ("S0", "chr1", i * 100, i * 100 + 1, int(k_arr[i]), int(n_arr[i]))
+        for i in range(len(wgbs_arr))
+    ]
+    rows_f = [
+        ("S0", "chr1", i * 100, i * 100 + 1,
+         int(round(fme_arr[i] * 30)), 30)
+        for i in range(len(fme_arr))
+    ]
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    params = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4, 6],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+        cv_strategy="region",
+        cv_n_folds=5,
+        cv_seed=3,
+    )
+    # Metadata captures the strategy
+    md = params.training_metadata
+    assert md["cv_strategy_requested"] == "region"
+    assert md["cv_strategy_effective"] == "region"
+    assert md["cv_n_folds"] == 5
+    assert md["cv_seed"] == 3
+
+    # Report must have finite cv_rmse per candidate
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["cv_strategy_requested"] == "region"
+    assert report["cv_strategy_effective"] == "region"
+    for cand in report["candidates"]:
+        assert np.isfinite(cand["cv_rmse"]), \
+            f"cv_rmse must be finite in region mode; got {cand}"
+        assert cand["n_folds"] == 5
+
+
+def test_train_calibration_single_sample_auto_falls_back_to_region(tmp_path):
+    """train_calibration with cv_strategy='auto' (the default) and only
+    one sample must automatically use region-level CV."""
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    fme_arr, wgbs_arr, k_arr, n_arr, _density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=300, seed=21
+    )
+    rows_w = [
+        ("S0", "chr1", i * 100, i * 100 + 1, int(k_arr[i]), int(n_arr[i]))
+        for i in range(len(wgbs_arr))
+    ]
+    rows_f = [
+        ("S0", "chr1", i * 100, i * 100 + 1,
+         int(round(fme_arr[i] * 30)), 30)
+        for i in range(len(fme_arr))
+    ]
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    params = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+        cv_strategy="auto",  # default
+        cv_seed=5,
+    )
+    assert params.training_metadata["cv_strategy_requested"] == "auto"
+    assert params.training_metadata["cv_strategy_effective"] == "region"
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — Pearson/Spearman correlations in the calibration report
+# ---------------------------------------------------------------------------
+# User request: include raw vs calibrated Pearson/Spearman on the full
+# dataset and on the CV test set, so report readers can see at a glance
+# whether calibration actually improved the FinaleMe-vs-WGBS agreement.
+
+
+def test_fit_calibration_reports_full_dataset_correlations():
+    """fit_calibration.overall must carry four correlation columns:
+    pearson_raw, pearson_calibrated, spearman_raw, spearman_calibrated."""
+    from finaleme_too.preprocessing.calibration_eval import fit_calibration
+
+    fme, wgbs, k, n, density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=400, seed=31
+    )
+    result = fit_calibration(fme, wgbs, density, n_bins=4, wgbs_k=k, wgbs_n=n)
+    for key in (
+        "pearson_raw",
+        "pearson_calibrated",
+        "spearman_raw",
+        "spearman_calibrated",
+    ):
+        assert key in result.overall, f"missing key {key} in fit.overall"
+        assert np.isfinite(result.overall[key]), f"{key} is not finite"
+        assert -1.0 <= result.overall[key] <= 1.0
+
+
+def test_fit_calibration_full_correlations_improve_on_bad_raw_predictions():
+    """When raw FinaleMe predictions are genuinely misaligned with WGBS,
+    the calibrated correlation should be >= the raw correlation on the
+    full dataset.
+    """
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration_eval import fit_calibration
+
+    rng = np.random.default_rng(77)
+    n = 600
+    # WGBS beta distribution
+    wgbs_beta = rng.beta(2, 5, size=n)
+    # Miscalibrated FinaleMe: shrink+shift in logit space then add noise.
+    # The raw Pearson will be lower than the calibrated Pearson because
+    # the calibration model undoes the shrink/shift.
+    raw_logit = (logit(np.clip(wgbs_beta, 1e-6, 1 - 1e-6)) - 0.6) / 0.4
+    fme_beta = np.clip(
+        expit(raw_logit + rng.normal(0, 0.2, size=n)), 1e-6, 1 - 1e-6
+    )
+    wgbs_n = np.full(n, 30, dtype=np.int64)
+    wgbs_k = rng.binomial(wgbs_n, wgbs_beta).astype(np.int64)
+    density = rng.uniform(0, 0.1, size=n)
+
+    fit = fit_calibration(
+        fme_beta, wgbs_beta, density, n_bins=4,
+        wgbs_k=wgbs_k, wgbs_n=wgbs_n,
+    )
+    raw_r = fit.overall["pearson_raw"]
+    cal_r = fit.overall["pearson_calibrated"]
+    # Calibration should not make things worse; with the miscalibrated
+    # setup it should strictly improve.
+    assert cal_r >= raw_r - 1e-6
+    # And the effect must be non-trivial given the setup.
+    assert cal_r - raw_r > 0.01
+
+
+def test_fit_calibration_per_bin_reports_correlations():
+    """Per-bin metrics must also include the four correlation columns."""
+    from finaleme_too.preprocessing.calibration_eval import fit_calibration
+
+    fme, wgbs, k, n, density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=400, seed=32
+    )
+    result = fit_calibration(fme, wgbs, density, n_bins=4, wgbs_k=k, wgbs_n=n)
+    for m in result.per_bin_metrics:
+        for key in (
+            "pearson_raw",
+            "pearson_calibrated",
+            "spearman_raw",
+            "spearman_calibrated",
+        ):
+            assert key in m, f"missing {key} in per-bin metrics"
+
+
+def test_cv_fold_task_returns_dict_with_correlations():
+    """_cv_fold_task must now return a dict of test-set metrics instead
+    of a bare RMSE float. The dict must include the four correlations."""
+    from finaleme_too.preprocessing.calibration_eval import _cv_fold_task
+
+    fme, wgbs, k, n, density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=200, seed=33
+    )
+    train_mask = np.zeros(fme.size, dtype=bool)
+    train_mask[:150] = True
+    test_mask = ~train_mask
+
+    result = _cv_fold_task(
+        fme, wgbs, density, train_mask, test_mask, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+    )
+    assert isinstance(result, dict)
+    for key in (
+        "rmse",
+        "pearson_raw",
+        "pearson_calibrated",
+        "spearman_raw",
+        "spearman_calibrated",
+        "n",
+    ):
+        assert key in result, f"missing {key}"
+    assert result["n"] == 50
+    assert np.isfinite(result["rmse"])
+
+
+def test_cross_validate_reports_cv_test_set_correlations():
+    """cross_validate_calibration must propagate fold-aggregated Pearson
+    and Spearman (raw + calibrated) to the top-level result dict."""
+    from finaleme_too.preprocessing.calibration_eval import (
+        cross_validate_calibration,
+    )
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=3, n_markers_per_sample=200, seed=34
+    )
+    result = cross_validate_calibration(
+        fme, wgbs, density, sample_ids, n_bins=4,
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="sample",
+    )
+    for key in (
+        "cv_pearson_raw",
+        "cv_pearson_calibrated",
+        "cv_spearman_raw",
+        "cv_spearman_calibrated",
+        "cv_rmse_std",
+        "fold_metrics",
+    ):
+        assert key in result, f"missing {key}"
+    assert np.isfinite(result["cv_pearson_raw"])
+    assert np.isfinite(result["cv_pearson_calibrated"])
+    # Every per-fold entry must have the same keys as the aggregated dict.
+    assert len(result["fold_metrics"]) == 3
+    for fold in result["fold_metrics"]:
+        assert "pearson_raw" in fold
+        assert "pearson_calibrated" in fold
+
+
+def test_tune_n_bins_candidates_carry_correlations():
+    """Every candidate in the tune_n_bins output must carry the test-set
+    correlations so _select_best_candidate and the report have access."""
+    from finaleme_too.preprocessing.calibration_eval import tune_n_bins
+
+    fme, wgbs, k, n, density, sample_ids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=500, seed=35
+    )
+    result = tune_n_bins(
+        fme, wgbs, density, sample_ids,
+        n_bins_candidates=[2, 4, 6],
+        wgbs_k=k, wgbs_n=n,
+        cv_strategy="region", cv_n_folds=5, cv_seed=100,
+    )
+    assert len(result["candidates"]) == 3
+    for cand in result["candidates"]:
+        for key in (
+            "cv_pearson_raw",
+            "cv_pearson_calibrated",
+            "cv_spearman_raw",
+            "cv_spearman_calibrated",
+        ):
+            assert key in cand, f"candidate missing {key}"
+            assert np.isfinite(cand[key])
+
+
+def test_train_calibration_report_has_correlation_summary(tmp_path):
+    """The top-level training report must have a ``correlation_summary``
+    block with both full-dataset and CV-test-set Pearson/Spearman values.
+    """
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    fme_arr, wgbs_arr, k_arr, n_arr, _density, _sids = _synth_matched_arrays(
+        n_samples=1, n_markers_per_sample=400, seed=40
+    )
+    rows_w = [
+        ("S0", "chr1", i * 100, i * 100 + 1, int(k_arr[i]), int(n_arr[i]))
+        for i in range(len(wgbs_arr))
+    ]
+    rows_f = [
+        ("S0", "chr1", i * 100, i * 100 + 1,
+         int(round(fme_arr[i] * 30)), 30)
+        for i in range(len(fme_arr))
+    ]
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+        cv_strategy="region",
+        cv_n_folds=5,
+        cv_seed=42,
+    )
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert "correlation_summary" in report
+    cs = report["correlation_summary"]
+
+    assert set(cs.keys()) == {"full_dataset", "cv_test_set"}
+    full = cs["full_dataset"]
+    for key in (
+        "pearson_raw",
+        "pearson_calibrated",
+        "spearman_raw",
+        "spearman_calibrated",
+        "n_markers",
+    ):
+        assert key in full, f"full_dataset missing {key}"
+        if key != "n_markers":
+            assert -1.0 <= float(full[key]) <= 1.0
+
+    cv = cs["cv_test_set"]
+    for key in (
+        "pearson_raw",
+        "pearson_calibrated",
+        "spearman_raw",
+        "spearman_calibrated",
+        "cv_rmse",
+        "n_folds",
+        "cv_strategy",
+    ):
+        assert key in cv, f"cv_test_set missing {key}"
+    assert cv["n_folds"] == 5
+    assert cv["cv_strategy"] == "region"
+    for key in (
+        "pearson_raw",
+        "pearson_calibrated",
+        "spearman_raw",
+        "spearman_calibrated",
+    ):
+        assert np.isfinite(float(cv[key])), f"cv_test_set.{key} is not finite"

@@ -129,19 +129,44 @@ def estimate_dispersion_mle(
 ) -> float:
     """One-shot MLE of a single shared dispersion phi over all markers.
 
-    Used for WGBS HIGH-tier per-sample dispersion estimation. Returns a scalar
-    dispersion that maximizes Σ_i log P(k_i | n_i, mu_i, phi).
+    Returns the scalar dispersion that maximizes
+    ``Σ_i log P(k_i | n_i, mu_i, phi)`` under the beta-binomial model.
+
+    Uses a bounded Brent search in log-phi space rather than the
+    triple-bracket Brent method — the bracketed method fails on
+    monotone objectives (which happens whenever the data is
+    essentially binomial and the likelihood keeps climbing toward
+    the upper bound), whereas ``method="bounded"`` handles the
+    corner gracefully.
     """
     from scipy.optimize import minimize_scalar
 
+    k_arr = np.asarray(k, dtype=np.float64).ravel()
+    n_arr = np.asarray(n, dtype=np.float64).ravel()
+    mu_arr = np.asarray(mu, dtype=np.float64).ravel()
+    # Drop rows where coverage is zero — they contribute nothing to the
+    # beta-binomial likelihood and can produce NaN in the digamma terms.
+    valid = n_arr > 0
+    if int(np.sum(valid)) == 0:
+        return float(phi_init)
+    k_v = k_arr[valid]
+    n_v = n_arr[valid]
+    mu_v = mu_arr[valid]
+
     def neg_ll(log_phi: float) -> float:
         phi = float(np.exp(log_phi))
-        return -float(np.sum(log_likelihood_per_marker(k, n, mu, np.full_like(k, phi, dtype=np.float64))))
+        phi_arr = np.full_like(k_v, phi, dtype=np.float64)
+        return -float(
+            np.sum(log_likelihood_per_marker(k_v, n_v, mu_v, phi_arr))
+        )
 
     log_lo = float(np.log(bounds[0]))
     log_hi = float(np.log(bounds[1]))
     res = minimize_scalar(
-        neg_ll, bracket=(log_lo, np.log(phi_init), log_hi), method="brent"
+        neg_ll,
+        bounds=(log_lo, log_hi),
+        method="bounded",
+        options={"xatol": 1e-4},
     )
     return float(np.exp(res.x))
 
