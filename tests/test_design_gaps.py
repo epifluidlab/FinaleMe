@@ -46,18 +46,20 @@ def test_gap5_per_marker_min_reads_table():
 def test_gap5_pipeline_filters_low_coverage_markers(
     tmp_path: Path, synthetic_marker_regions, synthetic_reference
 ):
-    """Samples with some markers below the tier threshold should produce
-    results that ignore those markers without crashing."""
+    """Samples with some markers well below the mean should still keep
+    those markers via effective-coverage down-tiering (architecture §4.2),
+    while markers with absolutely zero coverage get filtered."""
     from finaleme_too.config import MeasurementMode, TOOConfig
     from finaleme_too.io.sample_sheet import Sample, SampleSheet
     from finaleme_too.pipeline import TOOPipeline
 
-    # Build a mixed-coverage observation: half markers have n=50 (HIGH),
-    # half have n=1 (below HIGH threshold of 3)
+    # Half markers high-coverage, half zero-coverage.
+    # Under per-marker min_reads_vector, zero-coverage markers fail even
+    # in ULTRALOW (min=1), so they are filtered. Other markers pass.
     n_markers = synthetic_marker_regions.n_markers
     rng = np.random.default_rng(0)
     p = synthetic_reference.methylation[:, 0].astype(np.float64)
-    n_arr = np.where(np.arange(n_markers) < n_markers // 2, 50, 1).astype(np.int32)
+    n_arr = np.where(np.arange(n_markers) < n_markers // 2, 50, 0).astype(np.int32)
     k_arr = rng.binomial(n_arr.astype(np.int64), p).astype(np.int32)
 
     # Write a FinaleMe prediction.bed.gz with these counts (one CpG per marker)
@@ -120,9 +122,8 @@ def test_gap5_pipeline_filters_low_coverage_markers(
     cohort = pipeline.run(sample_sheet, reference, marker_regions, tmp_path / "out")
     assert len(cohort.samples) == 1
     r = cohort.samples[0]
-    # Half the markers have n=50 (pass tier filter), half have n=1 (fail).
-    # n_markers_used should be approximately n_markers // 2 (plus any that
-    # happened to land in HIGH tier after mean-coverage computation).
+    # Half the markers have n=50 (always pass), half have n=0 (always fail
+    # even under ULTRALOW down-tiering). So exactly half pass the filter.
     assert r.n_markers_used == n_markers // 2
     # Proportions are still valid
     assert abs(np.sum(r.proportions) - 1.0) < 1e-6

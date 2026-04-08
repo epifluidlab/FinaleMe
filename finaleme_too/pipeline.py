@@ -64,6 +64,7 @@ from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
 from finaleme_too.preprocessing.coverage import (
     CoverageTierAssigner,
     per_marker_min_reads,
+    per_marker_min_reads_vector,
 )
 from finaleme_too.preprocessing.imputation import CohortImputer
 from finaleme_too.preprocessing.marker_selection import BalancedMarkerSelector
@@ -105,19 +106,42 @@ class TOOPipeline:
         self.cpg_index = cpg_index
         self.deconvolver = MLEDeconvolver()
         self.fragment_deconvolver = FragmentLevelDeconvolver()
+
+        # Decouple uncertainty source from the point-estimate solver.
+        # ``uncertainty.method`` selects bootstrap / bayesian / both / none;
+        # ``model.deconvolution`` selects MLE / Bayesian for the point estimate.
+        uncertainty_method = (config.uncertainty.method or "bootstrap").lower()
+        self._wants_bootstrap = uncertainty_method in ("bootstrap", "both")
+        self._wants_bayesian_uncertainty = uncertainty_method in (
+            "bayesian", "both",
+        )
+        self._wants_any_uncertainty = uncertainty_method != "none"
+
+        # Instantiate BayesianDeconvolver if needed either for the point
+        # estimate (model.deconvolution==BAYESIAN) or for uncertainty
+        # (uncertainty.method in {bayesian, both}).
+        needs_bayesian = (
+            config.model.deconvolution == SolverMethod.BAYESIAN
+            or self._wants_bayesian_uncertainty
+        )
         self.bayesian_deconvolver = (
             BayesianDeconvolver(
                 n_walkers=64,
-                n_steps=config.uncertainty.bayesian_n_samples // 64 + 100,
+                n_steps=max(config.uncertainty.bayesian_n_samples // 64, 1) + 100,
                 burn_in=100,
                 prior_alpha=config.uncertainty.bayesian_prior_alpha,
             )
-            if config.model.deconvolution == SolverMethod.BAYESIAN
+            if needs_bayesian
             else None
         )
         self.bootstrap = BootstrapCI(
             n_iterations=config.uncertainty.n_bootstrap,
             ci_level=config.uncertainty.ci_level,
+        )
+        # Track whether model.deconvolution is Bayesian so the solver
+        # dispatcher can prefer the posterior mean as the point estimate.
+        self._point_estimate_is_bayesian = (
+            config.model.deconvolution == SolverMethod.BAYESIAN
         )
         self.observation_builder = BetaBinomialModel()
         self.tier_assigner = CoverageTierAssigner(config.coverage)
@@ -242,44 +266,55 @@ class TOOPipeline:
         sample_groups: dict[str, str | None],
         out_dir: Path,
     ) -> None:
-        """Cohort-level NMF residual discovery + per-sample residual TSV."""
+        """Cohort-level NMF residual discovery + per-sample residual TSV.
+
+        Always emits ``residual_analysis.tsv`` as long as ``results`` is not
+        empty (architecture §10.5). The NMF discovery step is optional and
+        only runs if enough samples carry residuals + high unknown fraction.
+        """
         if not results:
             return
-        # Collect per-sample residual vectors aligned on (chrom, start, end).
-        # Use a stable key set from the first sample; samples that don't
-        # share the same marker layout contribute zeros.
-        base = results[0]
-        if base.residuals is None or base.residuals.size == 0:
-            return
-        key_len = base.residuals.size
-        residual_matrix = np.zeros((len(results), key_len), dtype=np.float64)
-        sample_order: list[str] = []
-        for i, r in enumerate(results):
-            sample_order.append(r.sample_id)
-            if r.residuals is not None and r.residuals.size == key_len:
-                vec = r.residuals.copy()
-                vec[~np.isfinite(vec)] = 0.0
-                residual_matrix[i] = vec
 
-        # Only run NMF if at least 3 samples have a "high-unknown" signal —
-        # otherwise residuals are near-zero and NMF adds no value.
-        high_unknown = sum(
-            1 for r in results if r.proportions[-1] > self.config.qc.max_unknown_fraction
-        )
+        # Pick the reference residual length from the FIRST sample that
+        # actually has residuals. A per-sample fallback (e.g. the sample
+        # hit _emit_fallback_result) used to abort the whole analysis.
+        key_len = 0
+        for r in results:
+            if r.residuals is not None and r.residuals.size > 0:
+                key_len = int(r.residuals.size)
+                break
+
         nmf_summary: dict | None = None
-        if high_unknown >= 3 and residual_matrix.shape[0] >= 3:
-            try:
-                nmf = discover_residual_components(residual_matrix, n_components=3)
-                nmf["sample_order"] = sample_order
-                nmf_summary = nmf
-                log.info(
-                    "NMF residual discovery: %d components, explained variance %s",
-                    nmf["components"].shape[0],
-                    np.round(nmf["explained_variance_ratio"], 3).tolist(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("NMF residual discovery failed: %s", exc)
+        if key_len > 0:
+            residual_matrix = np.zeros((len(results), key_len), dtype=np.float64)
+            sample_order: list[str] = []
+            for i, r in enumerate(results):
+                sample_order.append(r.sample_id)
+                if r.residuals is not None and r.residuals.size == key_len:
+                    vec = r.residuals.copy()
+                    vec[~np.isfinite(vec)] = 0.0
+                    residual_matrix[i] = vec
 
+            high_unknown = sum(
+                1
+                for r in results
+                if r.proportions[-1] > self.config.qc.max_unknown_fraction
+            )
+            if high_unknown >= 3 and residual_matrix.shape[0] >= 3:
+                try:
+                    nmf = discover_residual_components(residual_matrix, n_components=3)
+                    nmf["sample_order"] = sample_order
+                    nmf_summary = nmf
+                    log.info(
+                        "NMF residual discovery: %d components, explained variance %s",
+                        nmf["components"].shape[0],
+                        np.round(nmf["explained_variance_ratio"], 3).tolist(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("NMF residual discovery failed: %s", exc)
+
+        # Always write the per-sample residual TSV. Samples that had no
+        # residuals (e.g. tier-filter fallback) show up with NaN stats.
         write_residual_analysis(
             results,
             sample_groups,
@@ -448,12 +483,17 @@ class TOOPipeline:
 
         tier = self.tier_assigner.assign(obs)
 
-        # -------- Gap 5: per-tier min-read filtering --------
-        # Apply the tier-specific minimum reads-per-marker threshold BEFORE
-        # building the observation model so the solver, bootstrap, and
-        # reliability computations all see the filtered marker set uniformly.
-        min_reads = per_marker_min_reads(tier)
-        valid_mask = np.asarray(obs.n, dtype=np.int64) >= min_reads
+        # -------- Per-marker effective-coverage filtering --------
+        # A marker with below-expected coverage is down-tiered to the next
+        # lower tier for that sample (architecture §4.2), so its minimum
+        # read threshold becomes less strict. Markers that still fall below
+        # their effective tier's minimum are filtered before the observation
+        # model is built so the solver, bootstrap, and reliability
+        # computations all see the filtered marker set uniformly.
+        min_reads_vec = per_marker_min_reads_vector(
+            np.asarray(obs.n, dtype=np.int64), tier
+        )
+        valid_mask = np.asarray(obs.n, dtype=np.int64) >= min_reads_vec
         if not np.any(valid_mask):
             # No usable markers at this tier — return an all-unknown result
             return self._emit_fallback_result(
@@ -529,43 +569,71 @@ class TOOPipeline:
         if w_hat_fragment is not None:
             w_hat = w_hat_fragment
 
-        # Uncertainty: Bayesian posterior overrides bootstrap when configured
-        posterior_samples = None
+        # Uncertainty dispatch honors ``config.uncertainty.method``:
+        #   - bootstrap : marker-resampling bootstrap on the MLE
+        #   - bayesian  : MCMC posterior quantiles
+        #   - both      : run bootstrap AND MCMC (bootstrap is primary,
+        #                 posterior samples are stored alongside)
+        #   - none      : skip uncertainty, CIs = point estimate
+        #
+        # Separately, ``config.model.deconvolution == BAYESIAN`` says the
+        # point estimate should come from the posterior mean (regardless
+        # of which uncertainty source drives the CIs).
+        posterior_samples: np.ndarray | None = None
+        boot = None
+
+        @dataclass
+        class _BootShim:
+            proportions_samples: np.ndarray
+            ci_lower: np.ndarray
+            ci_upper: np.ndarray
+            point_estimate: np.ndarray
+
+        def _posterior_to_boot(samples: np.ndarray) -> _BootShim:
+            lo = np.quantile(
+                samples, (1.0 - self.config.uncertainty.ci_level) / 2.0, axis=0
+            )
+            hi = np.quantile(
+                samples, 1.0 - (1.0 - self.config.uncertainty.ci_level) / 2.0, axis=0
+            )
+            return _BootShim(
+                proportions_samples=samples,
+                ci_lower=lo,
+                ci_upper=hi,
+                point_estimate=samples.mean(axis=0),
+            )
+
+        # 1) Run Bayesian posterior if we need it (for point or uncertainty)
         if self.bayesian_deconvolver is not None:
             try:
                 posterior_samples = self.bayesian_deconvolver.solve(
                     observation, reference
                 )
-                w_hat = posterior_samples.mean(axis=0)
-                ci_lo = np.quantile(
-                    posterior_samples,
-                    (1.0 - self.config.uncertainty.ci_level) / 2.0,
-                    axis=0,
-                )
-                ci_hi = np.quantile(
-                    posterior_samples,
-                    1.0 - (1.0 - self.config.uncertainty.ci_level) / 2.0,
-                    axis=0,
-                )
-
-                @dataclass
-                class _BootShim:
-                    proportions_samples: np.ndarray
-                    ci_lower: np.ndarray
-                    ci_upper: np.ndarray
-                    point_estimate: np.ndarray
-
-                boot = _BootShim(
-                    proportions_samples=posterior_samples,
-                    ci_lower=ci_lo,
-                    ci_upper=ci_hi,
-                    point_estimate=w_hat,
-                )
+                if self._point_estimate_is_bayesian:
+                    w_hat = posterior_samples.mean(axis=0)
             except Exception as exc:  # noqa: BLE001
-                log.warning("Bayesian solve failed for %s, falling back to bootstrap: %s",
-                            sample.sample_id, exc)
-                boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+                log.warning(
+                    "Bayesian solve failed for %s, falling back to bootstrap: %s",
+                    sample.sample_id, exc,
+                )
+                posterior_samples = None
+
+        # 2) Pick the "primary" boot struct that drives reliability + CIs.
+        if self._wants_bootstrap:
+            boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
+        elif self._wants_bayesian_uncertainty and posterior_samples is not None:
+            boot = _posterior_to_boot(posterior_samples)
+        elif not self._wants_any_uncertainty:
+            # uncertainty.method == "none": zero-width CIs around the point
+            zero_samples = np.tile(w_hat, (1, 1))
+            boot = _BootShim(
+                proportions_samples=zero_samples,
+                ci_lower=w_hat.copy(),
+                ci_upper=w_hat.copy(),
+                point_estimate=w_hat.copy(),
+            )
         else:
+            # Requested bayesian/both but Bayesian failed → fall back to bootstrap
             boot = self.bootstrap.estimate(observation, reference, self.deconvolver)
 
         # Reliability p-values per cell type
@@ -607,11 +675,16 @@ class TOOPipeline:
         mean_coverage = float(np.mean(observation.n)) if observation.n.size > 0 else 0.0
 
         # pct_imputed: fraction of markers where the pre-imputation n was below
-        # the tier threshold but the post-imputation n is at or above it.
+        # the per-marker tier threshold but the post-imputation n is at or
+        # above it.
         if pre_impute_n_filtered is not None and pre_impute_n_filtered.size:
             post = np.asarray(observation.n, dtype=np.int64)
-            was_low = pre_impute_n_filtered < min_reads
-            was_lifted = was_low & (post >= min_reads)
+            # Recompute the per-marker threshold vector on the filtered subset
+            post_min_reads = per_marker_min_reads_vector(
+                np.asarray(observation.n, dtype=np.int64), tier
+            )
+            was_low = pre_impute_n_filtered < post_min_reads
+            was_lifted = was_low & (post >= post_min_reads)
             pct_imputed = float(np.mean(was_lifted))
         else:
             pct_imputed = 0.0
@@ -632,6 +705,14 @@ class TOOPipeline:
             if hv is not None:
                 hemolysis_flag = bool(hv) if not isinstance(hv, str) else hv.lower() in ("true", "1", "yes")
 
+        # Bootstrap vs posterior samples are stored independently: bootstrap
+        # samples are populated iff we ran the bootstrap; posterior samples
+        # are populated iff we ran the Bayesian deconvolver. Both can coexist
+        # when uncertainty.method == "both".
+        bootstrap_samples_field: np.ndarray | None = None
+        if self._wants_bootstrap and boot is not None:
+            bootstrap_samples_field = boot.proportions_samples
+
         result = DeconvolutionResult(
             sample_id=sample.sample_id,
             cell_types=list(reference.cell_types),
@@ -642,7 +723,7 @@ class TOOPipeline:
             p_detection=p_detection,
             reliability=reliability,
             n_markers=n_markers,
-            bootstrap_proportions=boot.proportions_samples if posterior_samples is None else None,
+            bootstrap_proportions=bootstrap_samples_field,
             posterior_samples=posterior_samples,
             coverage_tier=tier,
             qc_flags=[],  # filled below
