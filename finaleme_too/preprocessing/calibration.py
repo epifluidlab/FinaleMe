@@ -408,6 +408,170 @@ def _parse_finaleme_prediction(path: Path, sample_id: str) -> pd.DataFrame:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Region annotation: local CpG density from a CpG index (architecture §3.5)
+# ---------------------------------------------------------------------------
+
+
+def _load_cpg_index_by_chrom(cpg_index_path: Path) -> dict[str, np.ndarray]:
+    """Return ``{chrom (no prefix) -> sorted np.int64 array of CpG starts}``.
+
+    Accepts the same CpG index BED format used elsewhere in the package:
+    tab-separated ``chrom start end`` with optional gzip. Chromosome names
+    are stripped of any leading ``chr`` so the lookup works regardless of
+    whether the downstream data uses GRCh37 or UCSC conventions.
+    """
+    chr_to_pos: dict[str, list[int]] = {}
+    with _open_text(cpg_index_path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#") or line.startswith("track"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            try:
+                pos = int(parts[1])
+            except ValueError:
+                continue
+            chrom = parts[0]
+            if chrom.startswith("chr"):
+                chrom = chrom[3:]
+            chr_to_pos.setdefault(chrom, []).append(pos)
+    out: dict[str, np.ndarray] = {}
+    for chrom, positions in chr_to_pos.items():
+        arr = np.asarray(sorted(set(positions)), dtype=np.int64)
+        out[chrom] = arr
+    return out
+
+
+def compute_region_annotation(
+    regions: pd.DataFrame,
+    cpg_index_path: str | Path,
+    window: int = 1000,
+) -> pd.DataFrame:
+    """Compute per-row CpG density from a CpG index BED.
+
+    For each ``(chrom, start, end)`` row in ``regions``, the density is
+    ``count of CpGs in [center - window/2, center + window/2) / window``
+    where ``center = (start + end) / 2``. Rows whose chromosome is not in
+    the CpG index get density = 0 (they won't join anywhere downstream
+    anyway).
+
+    Parameters
+    ----------
+    regions
+        Any DataFrame with ``chrom``, ``start``, ``end`` columns. Any
+        leading ``chr`` prefix is stripped before lookup.
+    cpg_index_path
+        Path to a CpG index BED file (tab-separated, optionally gzipped).
+        Same file that FinaleMe ships as ``data/CpG_index.hg19.bed.gz``
+        and that ``BetaValueDeconvolution -cpgIndex`` consumes.
+    window
+        Window size in base pairs centered on each row. Default 1000.
+
+    Returns
+    -------
+    New DataFrame with columns ``chrom start end cpg_density`` — same row
+    order and same row count as the input, with the chromosome prefix
+    already stripped.
+    """
+    if window <= 0:
+        raise InvalidCalibrationError(f"window must be positive, got {window}")
+    if not {"chrom", "start", "end"}.issubset(regions.columns):
+        raise InvalidCalibrationError(
+            "regions DataFrame must have chrom, start, end columns"
+        )
+
+    cpg_by_chrom = _load_cpg_index_by_chrom(Path(cpg_index_path))
+    if not cpg_by_chrom:
+        raise InvalidCalibrationError(f"empty CpG index: {cpg_index_path}")
+
+    chroms = regions["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
+    starts = regions["start"].astype(np.int64).to_numpy()
+    ends = regions["end"].astype(np.int64).to_numpy()
+    centers = (starts + ends) // 2
+    half = window // 2
+    lows = centers - half
+    highs = centers + (window - half)  # upper bound exclusive, matches window size
+
+    density = np.zeros(len(regions), dtype=np.float64)
+    # Group by chromosome for a single searchsorted per chrom
+    unique_chroms = chroms.unique()
+    for chrom in unique_chroms:
+        mask = (chroms == chrom).to_numpy()
+        cpg_arr = cpg_by_chrom.get(chrom)
+        if cpg_arr is None or cpg_arr.size == 0:
+            continue
+        lo_sub = lows[mask]
+        hi_sub = highs[mask]
+        lo_idx = np.searchsorted(cpg_arr, lo_sub, side="left")
+        hi_idx = np.searchsorted(cpg_arr, hi_sub, side="left")
+        density[mask] = (hi_idx - lo_idx).astype(np.float64) / float(window)
+
+    return pd.DataFrame(
+        {
+            "chrom": chroms.to_numpy(),
+            "start": starts,
+            "end": ends,
+            "cpg_density": density,
+        }
+    )
+
+
+def make_region_annotation_from_regions_file(
+    regions_path: str | Path,
+    cpg_index_path: str | Path,
+    output_path: str | Path,
+    window: int = 1000,
+) -> None:
+    """Build a ``region_annotation.tsv`` for a BED/TSV of regions.
+
+    The input can be:
+      * a BED file with 3+ columns (``chrom start end``), or
+      * a TSV with a header that includes the same columns.
+
+    The output TSV has columns ``chrom start end cpg_density`` and is
+    directly consumable by ``finaleme-too train-calibration --region-annotation``.
+    """
+    path = Path(regions_path)
+    # Sniff the header — if the first non-comment line has non-numeric
+    # columns after col 0, treat as a headered TSV; otherwise treat as
+    # a headerless BED.
+    first_data_line: str | None = None
+    with _open_text(path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#") or line.startswith("track"):
+                continue
+            first_data_line = line
+            break
+    has_header = False
+    if first_data_line is not None:
+        try:
+            int(first_data_line.split("\t")[1])
+        except (ValueError, IndexError):
+            has_header = True
+
+    if has_header:
+        df = pd.read_csv(path, sep="\t", comment="#")
+    else:
+        df = pd.read_csv(
+            path,
+            sep="\t",
+            comment="#",
+            header=None,
+            usecols=[0, 1, 2],
+            names=["chrom", "start", "end"],
+            dtype={"chrom": str, "start": np.int64, "end": np.int64},
+        )
+    if df.empty:
+        raise InvalidCalibrationError(f"no regions found in {regions_path}")
+
+    annotation = compute_region_annotation(
+        df, cpg_index_path=cpg_index_path, window=window
+    )
+    annotation.to_csv(output_path, sep="\t", index=False)
+
+
 def train_calibration(
     matched_wgbs: str | Path,
     matched_finaleme: str | Path,
@@ -415,6 +579,8 @@ def train_calibration(
     n_bins_candidates: list[int],
     out_params: str | Path,
     out_report: str | Path,
+    cpg_index: str | Path | None = None,
+    region_annotation_window: int = 1000,
 ) -> CalibrationParams:
     """Train per-bin calibration parameters from matched WGBS / FinaleMe samples.
 
@@ -431,11 +597,19 @@ def train_calibration(
     and the optional region annotation so that GRCh37-style WGBS data
     (``1``, ``2``) joins cleanly with FinaleMe output (``chr1``, ``chr2``).
 
+    CpG density source (priority order):
+      1. ``region_annotation`` TSV if explicitly provided
+      2. ``cpg_index`` → density is auto-computed via
+         :func:`compute_region_annotation` over a ``region_annotation_window``-bp
+         window centered on each (chrom, start, end) row
+      3. Neither → all rows get density 0 and the calibration collapses
+         to a single bin
+
     Workflow (math doc §6.4):
         1. Load + normalize WGBS and FinaleMe tables
         2. Join on (sample_id, chrom, start, end)
         3. Compute beta = methylated / total on each side
-        4. Join CpG density from region_annotation (if provided)
+        4. Resolve CpG density per the priority above
         5. tune_n_bins via leave-one-sample-out CV
         6. Fit final calibration and write JSON params + report
     """
@@ -456,11 +630,26 @@ def train_calibration(
             "chromosome naming — the loader already strips any 'chr' prefix."
         )
 
-    # CpG density: join from region_annotation if available
+    # CpG density: prefer an explicit --region-annotation file; otherwise
+    # auto-compute from --cpg-index so the user does not have to pre-build
+    # the annotation themselves.
     if region_annotation is not None:
         ann = pd.read_csv(region_annotation, sep="\t", comment="#")
-        # Normalize chromosome prefix on the annotation side too
         ann = _normalize_chrom(ann)
+        merged = merged.merge(
+            ann[["chrom", "start", "end", "cpg_density"]],
+            on=["chrom", "start", "end"],
+            how="left",
+        )
+    elif cpg_index is not None:
+        # Compute density on the fly for the distinct (chrom, start, end)
+        # rows we actually need, rather than building a genome-wide file.
+        unique_regions = merged[["chrom", "start", "end"]].drop_duplicates()
+        ann = compute_region_annotation(
+            unique_regions,
+            cpg_index_path=cpg_index,
+            window=region_annotation_window,
+        )
         merged = merged.merge(
             ann[["chrom", "start", "end", "cpg_density"]],
             on=["chrom", "start", "end"],
@@ -525,7 +714,9 @@ def train_calibration(
 __all__ = [
     "CalibrationParams",
     "apply_calibration",
+    "compute_region_annotation",
     "load_default_calibration",
+    "make_region_annotation_from_regions_file",
     "shipped_default_calibration_path",
     "train_calibration",
 ]

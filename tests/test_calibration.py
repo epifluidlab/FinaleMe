@@ -516,3 +516,181 @@ def test_load_matched_table_rejects_malformed(tmp_path):
     pd.DataFrame({"foo": [1], "bar": [2]}).to_csv(p, sep="\t", index=False)
     with pytest.raises(InvalidCalibrationError):
         _load_matched_table(p, modality="wgbs")
+
+
+# ---------------------------------------------------------------------------
+# Region annotation generation from a CpG index
+# ---------------------------------------------------------------------------
+
+
+def _write_cpg_index(path, chroms_to_positions):
+    """Write a tiny CpG index BED file: ``chrom start end`` per CpG."""
+    with open(path, "w") as fh:
+        for chrom, positions in chroms_to_positions.items():
+            for p in positions:
+                fh.write(f"{chrom}\t{p}\t{p + 1}\n")
+
+
+def test_compute_region_annotation_matches_windowed_count(tmp_path):
+    """Per-row density should equal (#CpGs in window) / window."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import compute_region_annotation
+
+    # 5 CpGs on chr1 at positions 100, 200, 300, 400, 500
+    # 2 CpGs on chr2 at positions 1000, 5000
+    cpg_path = tmp_path / "cpg.bed"
+    _write_cpg_index(cpg_path, {"chr1": [100, 200, 300, 400, 500], "chr2": [1000, 5000]})
+
+    regions = pd.DataFrame(
+        {
+            "chrom": ["chr1", "chr1", "chr2", "chr2"],
+            "start": [250, 800, 1000, 4000],
+            "end": [251, 801, 1001, 4001],
+        }
+    )
+    ann = compute_region_annotation(regions, cpg_path, window=1000)
+
+    # Row 0: center=250, window=[250-500, 250+500)=[-250, 750). CpGs at
+    # 100,200,300,400,500 all fall in there → 5 CpGs / 1000 bp = 0.005
+    assert ann.iloc[0]["cpg_density"] == pytest.approx(5 / 1000)
+    # Row 1: center=800, window=[300, 1300). CpGs 300,400,500 → 3/1000
+    assert ann.iloc[1]["cpg_density"] == pytest.approx(3 / 1000)
+    # Row 2: chr2 center=1000, window=[500, 1500). CpG 1000 → 1/1000
+    assert ann.iloc[2]["cpg_density"] == pytest.approx(1 / 1000)
+    # Row 3: chr2 center=4000, window=[3500, 4500). No CpG → 0
+    assert ann.iloc[3]["cpg_density"] == pytest.approx(0.0)
+    # chromosomes should be stripped of 'chr' prefix
+    assert set(ann["chrom"]) == {"1", "2"}
+
+
+def test_compute_region_annotation_handles_unknown_chromosome(tmp_path):
+    """Rows on a chrom missing from the index get density 0 and do not crash."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import compute_region_annotation
+
+    cpg_path = tmp_path / "cpg.bed"
+    _write_cpg_index(cpg_path, {"chr1": [100, 200]})
+
+    regions = pd.DataFrame(
+        {"chrom": ["chrX"], "start": [500], "end": [501]}
+    )
+    ann = compute_region_annotation(regions, cpg_path, window=1000)
+    assert ann.iloc[0]["cpg_density"] == 0.0
+
+
+def test_make_region_annotation_from_bed_round_trip(tmp_path):
+    """make_region_annotation_from_regions_file reads a headerless BED,
+    writes the expected 4-col TSV, and the output is loadable."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import (
+        make_region_annotation_from_regions_file,
+    )
+
+    cpg_path = tmp_path / "cpg.bed"
+    _write_cpg_index(cpg_path, {"chr1": list(range(100, 1100, 10))})  # 100 CpGs
+
+    regions_path = tmp_path / "regions.bed"
+    with open(regions_path, "w") as fh:
+        fh.write("chr1\t500\t501\n")
+        fh.write("chr1\t900\t901\n")
+
+    out_path = tmp_path / "ann.tsv"
+    make_region_annotation_from_regions_file(
+        regions_path, cpg_path, out_path, window=1000
+    )
+    assert out_path.exists()
+
+    df = pd.read_csv(out_path, sep="\t")
+    assert list(df.columns) == ["chrom", "start", "end", "cpg_density"]
+    assert len(df) == 2
+    # Both rows should have a non-zero density since we seeded the CpG index
+    assert all(df["cpg_density"] > 0)
+
+
+def test_make_region_annotation_from_headered_tsv(tmp_path):
+    """Also accept a TSV that already has a header row."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import (
+        make_region_annotation_from_regions_file,
+    )
+
+    cpg_path = tmp_path / "cpg.bed"
+    _write_cpg_index(cpg_path, {"chr1": [100, 200, 300, 400, 500]})
+
+    regions_path = tmp_path / "regions.tsv"
+    pd.DataFrame(
+        {"chrom": ["chr1"], "start": [250], "end": [251]}
+    ).to_csv(regions_path, sep="\t", index=False)
+
+    out_path = tmp_path / "ann.tsv"
+    make_region_annotation_from_regions_file(
+        regions_path, cpg_path, out_path, window=1000
+    )
+    df = pd.read_csv(out_path, sep="\t")
+    assert len(df) == 1
+    assert df.iloc[0]["cpg_density"] == pytest.approx(5 / 1000)
+
+
+def test_train_calibration_auto_generates_region_annotation_from_cpg_index(tmp_path):
+    """When --region-annotation is omitted but --cpg-index is provided,
+    train_calibration must auto-compute density per row and use it."""
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rng = np.random.default_rng(7)
+    n_samples = 3
+    n_markers = 80
+
+    # CpG index: 1 CpG per row, matching the training positions
+    cpg_path = tmp_path / "cpg.bed"
+    positions = [100 + m * 1000 for m in range(n_markers)]
+    with open(cpg_path, "w") as fh:
+        for p in positions:
+            fh.write(f"chr1\t{p}\t{p + 1}\n")
+
+    # Build matched data (legacy TSV format for brevity)
+    rows_w = []
+    rows_f = []
+    for s in range(n_samples):
+        for m, p in enumerate(positions):
+            b = float(rng.beta(2, 5))
+            k_w = int(rng.binomial(30, b))
+            # Miscalibration: logit_fme = (logit_wgbs - 0.1) / 0.8
+            fme_b = float(
+                expit((logit(np.clip(b, 1e-6, 1 - 1e-6)) - 0.1) / 0.8 + rng.normal(0, 0.1))
+            )
+            k_f = int(rng.binomial(30, fme_b))
+            rows_w.append((f"S{s}", "chr1", p, p + 1, k_w, 30))
+            rows_f.append((f"S{s}", "chr1", p, p + 1, k_f, 30))
+
+    import pandas as pd
+
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    params = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,  # NOT provided
+        cpg_index=cpg_path,  # NEW: auto-compute density
+        region_annotation_window=2000,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+    )
+    assert params.n_bins in (2, 4)
+    assert (tmp_path / "cal.json").exists()
+    # A useful sanity check: the training metadata records the number of
+    # observations, which is n_samples * n_markers when density is non-zero
+    assert params.training_metadata["n_observations"] == n_samples * n_markers

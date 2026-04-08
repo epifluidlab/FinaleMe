@@ -17,7 +17,8 @@ This is an optional advanced tutorial. The default FinaleMe run workflow does no
 6. [Use the Atlas for Deconvolution](#6-use-the-atlas-for-deconvolution)
 7. [Customization and Advanced Usage](#7-customization-and-advanced-usage)
 8. [Output File Reference](#8-output-file-reference)
-9. [Troubleshooting](#9-troubleshooting)
+9. [Training a FinaleMe calibration for `finaleme-too`](#9-training-a-finaleme-calibration-for-finaleme-too)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -595,7 +596,117 @@ results/cgi_shore_atlas/
 
 ---
 
-## 9. Troubleshooting
+## 9. Training a FinaleMe calibration for `finaleme-too`
+
+The Python `finaleme-too` package (a separate tool from `BetaValueDeconvolution`) can use a
+per-CpG-density calibration model to map FinaleMe predictions onto the same scale as
+WGBS truth before running the beta-binomial deconvolution. Training this calibration
+needs three inputs:
+
+1. **WGBS counts** — Bis-SNP `*.cpg.6plus2.bed` output, one per sample
+2. **Matched FinaleMe counts** — the `*.prediction.bed.gz` output from FinaleMe decode, one per sample
+3. **Per-row CpG density** — a TSV with `chrom start end cpg_density`
+
+This section shows how to produce #3 (the `region_annotation.tsv`).
+
+### 9.1 What is `region_annotation.tsv`?
+
+For every row that appears in the matched WGBS/FinaleMe tables, the calibration trainer
+needs a `cpg_density` value so it can bin rows into CpG-density classes (one regression
+slope/intercept per bin — see math doc §6.1). The density is simply the number of CpGs in
+a local window around each row divided by the window size (default 1000 bp).
+
+| Column | Description |
+|--------|-------------|
+| `chrom` | Chromosome (no `chr` prefix is needed; both conventions are accepted) |
+| `start` | Start position (0-based) |
+| `end` | End position (half-open) |
+| `cpg_density` | (# CpGs in window centered on the row) / window_size |
+
+### 9.2 Three ways to produce it
+
+#### Option A — Let `train-calibration` auto-generate it (simplest)
+
+Pass `--cpg-index` to `finaleme-too train-calibration` and skip `--region-annotation`
+entirely. The trainer will compute density on the fly for the unique `(chrom, start, end)`
+rows that actually appear in the merged training data, avoiding a genome-wide file.
+
+```bash
+finaleme-too train-calibration \
+  --matched-wgbs wgbs_samples.tsv \
+  --matched-finaleme finaleme_samples.tsv \
+  --cpg-index data/CpG_index.hg19.bed.gz \
+  --region-annotation-window 1000 \
+  --n-bins-candidates 4,6,8 \
+  --output calibration_params.json \
+  --report calibration_report.json
+```
+
+The `--cpg-index` argument accepts the same CpG index BED that `BetaValueDeconvolution`
+uses with `-cpgIndex` (downloaded by `scripts/setup_references.sh` into `data/`).
+
+#### Option B — Build it once with `make-region-annotation`
+
+If you want a reusable file (e.g. across many training runs, or to inspect), use the
+dedicated subcommand:
+
+```bash
+finaleme-too make-region-annotation \
+  --regions data/CpG_index.hg19.bed.gz \
+  --cpg-index data/CpG_index.hg19.bed.gz \
+  --window 1000 \
+  --output region_annotation.hg19.tsv
+```
+
+Here we pass the CpG index as BOTH the regions and the reference CpG catalog, which
+produces a genome-wide per-CpG density file. The output TSV has columns
+`chrom  start  end  cpg_density` and is directly consumable by
+`finaleme-too train-calibration --region-annotation region_annotation.hg19.tsv`.
+
+If you only care about a specific set of markers (not the full CpG index), pass your
+marker BED file to `--regions` instead:
+
+```bash
+finaleme-too make-region-annotation \
+  --regions my_markers.bed \
+  --cpg-index data/CpG_index.hg19.bed.gz \
+  --output my_markers.region_annotation.tsv
+```
+
+#### Option C — Build it yourself
+
+The file format is trivial. Any script that counts CpGs in a local window around each
+row and writes `chrom start end cpg_density` as TSV will work. For example, using
+`bedtools` + the CpG index:
+
+```bash
+# Compute a 1kb window around each CpG, intersect with the CpG index, count overlaps,
+# and divide by 1000. Rough sketch:
+awk 'BEGIN{OFS="\t"} {print $1, ($2-500 < 0 ? 0 : $2-500), $3+500}' CpG_index.hg19.bed.gz \
+  | bedtools intersect -a - -b CpG_index.hg19.bed.gz -c \
+  | awk 'BEGIN{OFS="\t"; print "chrom","start","end","cpg_density"}
+         {print $1, $2+500, $2+501, $4/1000}' \
+  > region_annotation.hg19.tsv
+```
+
+The Python helper is cleaner and handles chrom-prefix normalization automatically.
+
+### 9.3 Which window size should I use?
+
+Default is **1000 bp**. Larger windows smooth out local CpG variation (more stable
+density estimates but less resolution); smaller windows pick up tight clusters (more
+resolution but noisier). The `--region-annotation-window` flag on both
+`make-region-annotation` and `train-calibration` lets you tune this per run.
+
+### 9.4 How many bins should I choose?
+
+`train-calibration` already tunes this for you via leave-one-sample-out cross validation
+over `--n-bins-candidates` (default `4,6,8,10,12,16`) and picks the B that minimizes
+CV-RMSE. The chosen B and the full candidate table are written to the `--report` JSON.
+
+---
+
+## 10. Troubleshooting
 
 ### "wgbstools not found"
 
