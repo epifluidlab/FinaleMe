@@ -6,6 +6,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from finaleme_too.config import MeasurementMode
 from finaleme_too.io.methylation_loader import MarkerObservations
@@ -227,3 +228,291 @@ def test_train_calibration_end_to_end(tmp_path):
     # Round-trip
     loaded = CalibrationParams.load(tmp_path / "cal.json")
     np.testing.assert_allclose(loaded.a, params.a)
+
+
+# ---------------------------------------------------------------------------
+# Raw-input calibration training: Bis-SNP 6+2 + FinaleMe prediction.bed.gz
+# ---------------------------------------------------------------------------
+
+
+def _write_bissnp_6plus2(path, rows, *, with_track_line: bool = True, with_chr_prefix: bool = False):
+    """Write a minimal Bis-SNP 6+2 BED file.
+
+    Each row is (chrom, start, end, methylation_pct, total_count). An
+    optional ``track name=...`` line is prepended to test header skipping.
+    """
+    with open(path, "w") as fh:
+        if with_track_line:
+            fh.write(
+                'track name=test type=bedDetail description="methylation level"\n'
+            )
+        for chrom, start, end, pct, total in rows:
+            c = f"chr{chrom}" if with_chr_prefix else str(chrom)
+            fh.write(f"{c}\t{start}\t{end}\t.\t500\t-\t{pct:.2f}\t{total}\n")
+
+
+def _write_finaleme_prediction(path, rows):
+    import gzip as _gzip
+
+    with _gzip.open(path, "wt") as fh:
+        fh.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\t"
+            "total_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n"
+        )
+        for chrom, start, end, meth_count, total in rows:
+            pct = 100.0 * meth_count / max(total, 1)
+            fh.write(
+                f"chr{chrom}\t{start}\t{end}\t{pct:.1f}\t{meth_count}\t{total}\t"
+                f"{pct:.1f}\t{meth_count}\t{total}\n"
+            )
+
+
+def test_parse_bissnp_6plus2_round_trip(tmp_path):
+    """Bis-SNP parser must drop the track line and compute methylated_count
+    from methylation_pct * total_count correctly."""
+    from finaleme_too.preprocessing.calibration import _parse_bissnp_6plus2
+
+    rows = [
+        (1, 10469, 10470, 50.00, 4),  # 2 methylated
+        (1, 10471, 10472, 75.00, 4),  # 3 methylated
+        (2, 5000, 5001, 0.00, 10),    # 0 methylated
+        (2, 6000, 6001, 100.00, 5),   # 5 methylated
+    ]
+    p = tmp_path / "s1.cpg.6plus2.bed"
+    _write_bissnp_6plus2(p, rows, with_track_line=True, with_chr_prefix=False)
+
+    df = _parse_bissnp_6plus2(p, sample_id="S1")
+    assert list(df["sample_id"]) == ["S1"] * 4
+    assert list(df["chrom"]) == ["1", "1", "2", "2"]
+    assert list(df["methylated_count"]) == [2, 3, 0, 5]
+    assert list(df["total_count"]) == [4, 4, 10, 5]
+
+
+def test_parse_finaleme_prediction_round_trip(tmp_path):
+    """FinaleMe prediction parser must pull columns 4 and 5 (predicted counts)."""
+    from finaleme_too.preprocessing.calibration import _parse_finaleme_prediction
+
+    rows = [
+        (9, 110744061, 110744062, 3, 4),
+        (6, 144773899, 144773900, 7, 8),
+        (13, 111851314, 111851315, 14, 14),
+    ]
+    p = tmp_path / "s1.prediction.bed.gz"
+    _write_finaleme_prediction(p, rows)
+
+    df = _parse_finaleme_prediction(p, sample_id="S1")
+    assert list(df["sample_id"]) == ["S1"] * 3
+    assert list(df["methylated_count"]) == [3, 7, 14]
+    assert list(df["total_count"]) == [4, 8, 14]
+    # FinaleMe always has "chr" prefix at this point; normalization happens
+    # one level up in _load_matched_table via _normalize_chrom.
+    assert list(df["chrom"]) == ["chr9", "chr6", "chr13"]
+
+
+def test_load_matched_table_sample_sheet_bissnp(tmp_path):
+    """Loading a Bis-SNP sample sheet should concat per-sample tables and
+    strip the chr prefix."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    rows_s1 = [(1, 100, 101, 50.0, 4), (1, 200, 201, 25.0, 4)]
+    rows_s2 = [(1, 100, 101, 75.0, 4), (1, 200, 201, 0.0, 4)]
+    _write_bissnp_6plus2(tmp_path / "s1.bed", rows_s1, with_chr_prefix=False)
+    _write_bissnp_6plus2(tmp_path / "s2.bed", rows_s2, with_chr_prefix=True)  # has chr
+
+    sheet = tmp_path / "wgbs_samples.tsv"
+    pd.DataFrame(
+        [
+            {"sample_id": "S1", "methylation_file": "s1.bed"},
+            {"sample_id": "S2", "methylation_file": "s2.bed"},
+        ]
+    ).to_csv(sheet, sep="\t", index=False)
+
+    df = _load_matched_table(sheet, modality="wgbs")
+    # After _normalize_chrom, all chromosomes have no prefix
+    assert set(df["chrom"]) == {"1"}
+    assert set(df["sample_id"]) == {"S1", "S2"}
+    # S1 row 0: 50% of 4 = 2 methylated
+    s1_row0 = df[(df["sample_id"] == "S1") & (df["start"] == 100)].iloc[0]
+    assert int(s1_row0["methylated_count"]) == 2
+
+
+def test_load_matched_table_sample_sheet_finaleme(tmp_path):
+    """Loading a FinaleMe sample sheet should concat per-sample tables."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    rows_s1 = [(1, 100, 101, 3, 4), (1, 200, 201, 2, 4)]
+    rows_s2 = [(1, 100, 101, 1, 4), (1, 200, 201, 4, 4)]
+    _write_finaleme_prediction(tmp_path / "s1.prediction.bed.gz", rows_s1)
+    _write_finaleme_prediction(tmp_path / "s2.prediction.bed.gz", rows_s2)
+
+    sheet = tmp_path / "fme_samples.tsv"
+    pd.DataFrame(
+        [
+            {"sample_id": "S1", "methylation_file": "s1.prediction.bed.gz"},
+            {"sample_id": "S2", "methylation_file": "s2.prediction.bed.gz"},
+        ]
+    ).to_csv(sheet, sep="\t", index=False)
+
+    df = _load_matched_table(sheet, modality="finaleme")
+    assert set(df["chrom"]) == {"1"}  # chr stripped
+    assert set(df["sample_id"]) == {"S1", "S2"}
+    assert len(df) == 4
+
+
+def test_train_calibration_with_raw_bissnp_and_finaleme(tmp_path):
+    """End-to-end: point --matched-wgbs at Bis-SNP files (no chr prefix) and
+    --matched-finaleme at FinaleMe files (with chr prefix). The join must
+    succeed after chromosome normalization."""
+    import pandas as pd
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rng = np.random.default_rng(42)
+    n_samples = 4
+    n_markers = 120
+
+    # Generate ground-truth betas, then derive miscalibrated FinaleMe betas
+    # via the known inverse: fme_logit = (wgbs_logit - c) / a
+    true_betas = rng.beta(2, 5, size=n_markers)
+    a_true, c_true = 0.8, 0.1
+
+    for s in range(n_samples):
+        sid = f"S{s}"
+        bissnp_rows = []
+        fme_rows = []
+        for m, b in enumerate(true_betas):
+            n_reads = 30
+            k_w = int(rng.binomial(n_reads, b))
+            pct = 100.0 * k_w / n_reads
+            # Bis-SNP uses GRCh37 style (no chr prefix)
+            bissnp_rows.append((1, m * 100, m * 100 + 1, pct, n_reads))
+
+            # FinaleMe: simulate miscalibration
+            fme_logit = (
+                logit(np.clip(b, 1e-6, 1 - 1e-6)) - c_true
+            ) / a_true + rng.normal(0, 0.1)
+            fme_b = float(expit(fme_logit))
+            k_f = int(rng.binomial(n_reads, fme_b))
+            fme_rows.append((1, m * 100, m * 100 + 1, k_f, n_reads))
+
+        _write_bissnp_6plus2(
+            tmp_path / f"{sid}.bissnp.bed", bissnp_rows, with_chr_prefix=False
+        )
+        _write_finaleme_prediction(
+            tmp_path / f"{sid}.prediction.bed.gz", fme_rows
+        )
+
+    wgbs_sheet = tmp_path / "wgbs_samples.tsv"
+    pd.DataFrame(
+        [
+            {"sample_id": f"S{s}", "methylation_file": f"S{s}.bissnp.bed"}
+            for s in range(n_samples)
+        ]
+    ).to_csv(wgbs_sheet, sep="\t", index=False)
+
+    fme_sheet = tmp_path / "fme_samples.tsv"
+    pd.DataFrame(
+        [
+            {"sample_id": f"S{s}", "methylation_file": f"S{s}.prediction.bed.gz"}
+            for s in range(n_samples)
+        ]
+    ).to_csv(fme_sheet, sep="\t", index=False)
+
+    # No region annotation (optional). Let density default to 0.
+    params = train_calibration(
+        matched_wgbs=wgbs_sheet,
+        matched_finaleme=fme_sheet,
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "cal.json",
+        out_report=tmp_path / "report.json",
+    )
+    assert params.n_bins in (2, 4)
+    assert (tmp_path / "cal.json").exists()
+    assert (tmp_path / "report.json").exists()
+    # Training should recover something in the ballpark of a_true=0.8
+    # on at least one bin
+    assert any(0.4 < a_val < 1.5 for a_val in params.a.tolist())
+
+
+def test_train_calibration_prefix_mismatch_joins_ok(tmp_path):
+    """Explicit regression for the 'chr1 vs 1' join issue."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    # WGBS: no chr prefix
+    _write_bissnp_6plus2(
+        tmp_path / "s1.bed",
+        [(1, 100, 101, 50.0, 4)],
+        with_chr_prefix=False,
+    )
+    # FinaleMe: chr prefix (always)
+    _write_finaleme_prediction(
+        tmp_path / "s1.prediction.bed.gz",
+        [(1, 100, 101, 2, 4)],
+    )
+
+    pd.DataFrame(
+        [{"sample_id": "S1", "methylation_file": "s1.bed"}]
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        [{"sample_id": "S1", "methylation_file": "s1.prediction.bed.gz"}]
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    wgbs_df = _load_matched_table(tmp_path / "wgbs.tsv", modality="wgbs")
+    fme_df = _load_matched_table(tmp_path / "fme.tsv", modality="finaleme")
+
+    # After loading, both sides must have chromosome '1' (no 'chr')
+    assert list(wgbs_df["chrom"]) == ["1"]
+    assert list(fme_df["chrom"]) == ["1"]
+
+    # Simulate the merge that train_calibration does
+    merged = wgbs_df.merge(
+        fme_df,
+        on=["sample_id", "chrom", "start", "end"],
+        suffixes=("_wgbs", "_fme"),
+    )
+    assert len(merged) == 1
+
+
+def test_load_matched_table_legacy_format_still_works(tmp_path):
+    """Backward compatibility: a pre-joined TSV still loads."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    p = tmp_path / "legacy.tsv"
+    pd.DataFrame(
+        {
+            "sample_id": ["S1", "S1"],
+            "chrom": ["chr1", "chr1"],
+            "start": [100, 200],
+            "end": [101, 201],
+            "methylated_count": [2, 3],
+            "total_count": [4, 4],
+        }
+    ).to_csv(p, sep="\t", index=False)
+
+    df = _load_matched_table(p, modality="wgbs")
+    # Legacy format still works AND chr prefix is stripped
+    assert set(df["chrom"]) == {"1"}
+    assert len(df) == 2
+
+
+def test_load_matched_table_rejects_malformed(tmp_path):
+    """A file that is neither legacy nor sample-sheet format should raise."""
+    import pandas as pd
+
+    from finaleme_too.exceptions import InvalidCalibrationError
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    p = tmp_path / "bogus.tsv"
+    pd.DataFrame({"foo": [1], "bar": [2]}).to_csv(p, sep="\t", index=False)
+    with pytest.raises(InvalidCalibrationError):
+        _load_matched_table(p, modality="wgbs")
