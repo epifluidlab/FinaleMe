@@ -428,6 +428,225 @@ def build_identity_placeholder_params(
 
 
 # ---------------------------------------------------------------------------
+# Phase D: training pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+
+def train_binarization(
+    matched_wgbs: str | Path,
+    matched_finaleme: str | Path,
+    region_annotation: str | Path | None,
+    n_bins_candidates: list[int],
+    out_params: str | Path,
+    out_report: str | Path,
+    cpg_index: str | Path | None = None,
+    region_annotation_window: int = 1000,
+    threads: int = 1,
+    max_error_rate: float = 0.15,
+    cv_method: str = "chromosome_blocked",
+    cv_n_folds: int = 10,
+    cv_seed: int | None = None,
+) -> BinarizationParams:
+    """Train per-bin binarization parameters from matched WGBS / FinaleMe samples.
+
+    v3 replacement for ``train_calibration``. The matched-data loading,
+    chromosome normalization, and CpG-density computation are reused from
+    ``_matched_sample_sheet`` (the shared parser module). The new
+    ``binarization_eval.tune_n_bins`` performs chromosome-blocked K-fold
+    CV to pick the best total bin count, and ``fit_binarization`` produces
+    the final per-bin (τ_low, τ_high, ε_U, ε_M, usable) parameters.
+
+    Inputs
+    ------
+    matched_wgbs, matched_finaleme
+        Paths to either legacy joined TSVs or sample-sheet TSVs (see
+        ``_load_matched_table`` for the auto-detected formats).
+    region_annotation
+        Optional pre-computed CpG-density + region_class TSV. If omitted
+        and ``cpg_index`` is provided, density + region_class are
+        auto-computed via ``compute_region_annotation`` over a
+        ``region_annotation_window``-bp window. If neither is provided,
+        all rows go to the open_sea / sub-bin 0 fallback (degenerate).
+    n_bins_candidates
+        List of total bin counts to evaluate. v3.0 rounds each value up
+        to the nearest multiple of n_region_classes (4) so the per-class
+        sub-bin count is uniform. Default candidates: ``[4, 8, 12, 16]``.
+    cv_method
+        Currently always ``"chromosome_blocked"``. Kept as a parameter
+        so future strategies can be added without changing the API.
+    cv_n_folds, cv_seed
+        Number of chromosome-blocked CV folds and the seed for the
+        chromosome shuffle. ``cv_seed`` makes the split reproducible.
+
+    Outputs
+    -------
+    Returns the trained ``BinarizationParams`` and writes them to
+    ``out_params``. Also writes a JSON training report to ``out_report``
+    with per-bin metrics, the chosen B, and CV summary.
+    """
+    from finaleme_too.io.output_writer import write_calibration_report
+    from finaleme_too.preprocessing._matched_sample_sheet import (
+        _load_matched_table,
+        _normalize_chrom,
+        compute_region_annotation,
+    )
+    from finaleme_too.preprocessing.binarization_eval import (
+        fit_binarization,
+        tune_n_bins,
+    )
+
+    threads = max(1, int(threads))
+    wgbs_df = _load_matched_table(matched_wgbs, modality="wgbs", threads=threads)
+    fme_df = _load_matched_table(matched_finaleme, modality="finaleme", threads=threads)
+
+    join_keys = ["sample_id", "chrom", "start", "end"]
+    merged = wgbs_df.merge(fme_df, on=join_keys, suffixes=("_wgbs", "_fme"))
+    if merged.empty:
+        raise InvalidBinarizationError(
+            "No overlapping (sample_id, chrom, start, end) between WGBS and "
+            "FinaleMe tables. Check sample IDs, genomic coordinates, and "
+            "chromosome naming — the loader already strips any 'chr' prefix."
+        )
+
+    # Resolve per-row CpG density + region_class
+    if region_annotation is not None:
+        ann = pd.read_csv(region_annotation, sep="\t", comment="#")
+        ann = _normalize_chrom(ann)
+        merged = merged.merge(
+            ann[
+                [c for c in ("chrom", "start", "end", "cpg_density", "region_class") if c in ann.columns]
+            ],
+            on=["chrom", "start", "end"],
+            how="left",
+        )
+    elif cpg_index is not None:
+        unique_regions = merged[["chrom", "start", "end"]].drop_duplicates()
+        ann = compute_region_annotation(
+            unique_regions,
+            cpg_index_path=cpg_index,
+            window=region_annotation_window,
+        )
+        merged = merged.merge(
+            ann[["chrom", "start", "end", "cpg_density", "region_class"]],
+            on=["chrom", "start", "end"],
+            how="left",
+        )
+    if "cpg_density" not in merged.columns:
+        merged["cpg_density"] = 0.0
+    merged["cpg_density"] = merged["cpg_density"].fillna(0.0)
+
+    # Drop zero-coverage rows on either side (matches the v2 fix from bug 2)
+    valid_rows = (
+        merged["total_count_wgbs"].fillna(0).to_numpy() > 0
+    ) & (
+        merged["total_count_fme"].fillna(0).to_numpy() > 0
+    ) & merged["methylated_count_wgbs"].notna().to_numpy() & merged[
+        "methylated_count_fme"
+    ].notna().to_numpy()
+    n_dropped = int(valid_rows.size - valid_rows.sum())
+    if n_dropped > 0:
+        log.info(
+            "train_binarization: dropped %d / %d rows with zero coverage on either side",
+            n_dropped,
+            int(valid_rows.size),
+        )
+    merged = merged.loc[valid_rows].reset_index(drop=True)
+    if merged.empty:
+        raise InvalidBinarizationError(
+            "No rows with non-zero coverage on both WGBS and FinaleMe sides "
+            "after the join. Check coverage and overlap of the input files."
+        )
+
+    # Compute beta values from k/n on each side
+    wgbs_k = merged["methylated_count_wgbs"].to_numpy(dtype=np.float64)
+    wgbs_n = merged["total_count_wgbs"].to_numpy(dtype=np.float64)
+    fme_k = merged["methylated_count_fme"].to_numpy(dtype=np.float64)
+    fme_n = merged["total_count_fme"].to_numpy(dtype=np.float64)
+    wgbs_beta = (wgbs_k / wgbs_n).astype(np.float64)
+    fme_beta = (fme_k / fme_n).astype(np.float64)
+    density = merged["cpg_density"].to_numpy(dtype=np.float64)
+    if "region_class" in merged.columns:
+        region_class = merged["region_class"].astype(object).to_numpy()
+    else:
+        region_class = None
+    chrom = merged["chrom"].astype(str).to_numpy()
+    sample_ids = merged["sample_id"].astype(str).to_numpy()
+
+    # Bin tuning via chromosome-blocked K-fold CV
+    tune_result = tune_n_bins(
+        predicted=fme_beta,
+        truth_beta=wgbs_beta,
+        cpg_density=density,
+        chrom=chrom,
+        n_bins_candidates=n_bins_candidates,
+        region_class=region_class,
+        n_folds=cv_n_folds,
+        seed=cv_seed,
+        max_error_rate=max_error_rate,
+        threads=threads,
+    )
+    best_B = int(tune_result["selected_n_bins"])
+
+    # Final fit at the chosen B (using the in_sample_fit from the chosen
+    # candidate so we don't redo the work)
+    final_candidate = next(
+        c for c in tune_result["candidates"] if c["n_bins"] == best_B
+    )
+    final_fit = final_candidate["in_sample_fit"]
+    params = final_fit.params
+
+    # Attach training provenance
+    params.training_metadata = {
+        "n_training_samples": int(len(np.unique(sample_ids))),
+        "n_observations": int(len(merged)),
+        "n_bins_candidates": list(n_bins_candidates),
+        "selected_n_bins": best_B,
+        "cv_method": cv_method,
+        "cv_n_folds": int(cv_n_folds),
+        "cv_seed": cv_seed,
+        "max_error_rate": float(max_error_rate),
+        "tune_result": {
+            "selected_n_bins": tune_result["selected_n_bins"],
+            "candidates": [
+                {
+                    "n_bins": c["n_bins"],
+                    "score": c.get("score"),
+                    "cv_accuracy": c.get("cv_accuracy"),
+                    "cv_accuracy_std": c.get("cv_accuracy_std"),
+                    "in_sample_accuracy": c.get("in_sample_accuracy"),
+                    "n_usable_markers": c.get("n_usable_markers"),
+                    "n_total_markers": c.get("n_total_markers"),
+                    "n_folds": c.get("n_folds"),
+                }
+                for c in tune_result["candidates"]
+            ],
+        },
+    }
+    params.save(out_params)
+
+    # Write a JSON training report. Reuse the calibration report writer —
+    # it's just a JSON file, no schema-specific behavior.
+    report = {
+        "binarization_version": "1.0",
+        "n_training_samples": int(len(np.unique(sample_ids))),
+        "n_observations": int(len(merged)),
+        "n_bins": best_B,
+        "n_bins_candidates": list(n_bins_candidates),
+        "cv_method": cv_method,
+        "cv_n_folds": int(cv_n_folds),
+        "cv_seed": cv_seed,
+        "max_error_rate": float(max_error_rate),
+        "selected_score": final_candidate.get("score"),
+        "selected_cv_accuracy": final_candidate.get("cv_accuracy"),
+        "overall_metrics": final_fit.overall,
+        "per_bin_metrics": final_fit.per_bin_metrics,
+        "candidates": params.training_metadata["tune_result"]["candidates"],
+    }
+    write_calibration_report(report, out_report)
+    return params
+
+
+# ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
 
@@ -459,4 +678,5 @@ __all__ = [
     "build_identity_placeholder_params",
     "load_default_binarization",
     "shipped_default_binarization_path",
+    "train_binarization",
 ]

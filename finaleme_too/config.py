@@ -62,6 +62,13 @@ class CoverageConfig:
 
 @dataclass
 class CalibrationConfig:
+    """v2 FinaleMe continuous calibration config.
+
+    DEPRECATED in v3: kept active during the migration so the v2 path
+    continues to work as a fallback when the new ``BinarizationConfig``
+    is not in use. Phase E will delete this dataclass entirely.
+    """
+
     mode: MeasurementMode = MeasurementMode.FINALEME
     calibration_file: str | None = None
     n_density_bins: int = 8
@@ -74,6 +81,34 @@ class CalibrationConfig:
     cv_strategy: str = "auto"
     cv_n_folds: int = 10  # K for region-level CV (ignored for sample mode)
     cv_seed: int | None = None  # reproducible region-level shuffle
+
+
+@dataclass
+class BinarizationConfig:
+    """v3 FinaleMe context-dependent binarization config.
+
+    Replaces ``CalibrationConfig`` for new pipelines. Carries the path to
+    the trained ``BinarizationParams`` JSON file plus tunable defaults
+    for the training-time bin search and inference-time QC.
+    """
+
+    mode: MeasurementMode = MeasurementMode.FINALEME
+    binarization_file: str | None = None
+    # Total bin count default for training (B = n_region_classes * sub_bins).
+    # With the v3 default of 4 region classes and 2 density sub-bins per
+    # class, this gives B=8 — matches arch §5.3.2 default.
+    n_context_bins: int = 8
+    # Bins with ε_U or ε_M ≥ this are marked unusable (arch §6.4).
+    max_error_rate: float = 0.15
+    # Cross-validation method during training. v3 specifies chromosome-blocked
+    # K-fold CV (math doc §6.5); kept as a config field so future strategies
+    # can be added without breaking the schema.
+    cv_method: str = "chromosome_blocked"
+    cv_n_folds: int = 10
+    cv_seed: int | None = None
+    # Use the shipped default_binarization.json when no explicit
+    # ``binarization_file`` is given.
+    use_default: bool = True
 
 
 @dataclass
@@ -155,6 +190,7 @@ class TOOConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    binarization: BinarizationConfig = field(default_factory=BinarizationConfig)
     markers: MarkersConfig = field(default_factory=MarkersConfig)
     uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
     batch_correction: BatchCorrectionConfig = field(default_factory=BatchCorrectionConfig)
@@ -176,8 +212,30 @@ class TOOConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TOOConfig:
-        """Build a TOOConfig from a nested dict (e.g. parsed YAML)."""
+        """Build a TOOConfig from a nested dict (e.g. parsed YAML).
+
+        v2 -> v3 backwards compatibility: an old YAML file using
+        ``calibration:`` continues to load (the v2 path is still active
+        during the migration). When BOTH ``calibration:`` and
+        ``binarization:`` are present, both subsections load independently
+        and the pipeline picks the v3 path because ``self.binarization`` is
+        truthy.
+        """
+        import warnings
+
         cfg = cls()
+        # If only the legacy ``calibration:`` section is present, emit a
+        # one-time deprecation hint pointing at the new section name. The
+        # value still loads correctly into ``cfg.calibration``.
+        if "calibration" in raw and "binarization" not in raw:
+            warnings.warn(
+                "TOOConfig: the YAML 'calibration:' section is deprecated in v3. "
+                "Use 'binarization:' for the new context-dependent binarization "
+                "model. The 'calibration:' section will be removed in a future "
+                "release; for now both sections are accepted.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         for f in fields(cls):
             if f.name not in raw:
                 continue
@@ -275,6 +333,7 @@ __all__ = [
     "ModelConfig",
     "CoverageConfig",
     "CalibrationConfig",
+    "BinarizationConfig",
     "MarkersConfig",
     "UncertaintyConfig",
     "BatchCorrectionConfig",

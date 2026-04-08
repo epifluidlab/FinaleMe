@@ -1163,3 +1163,212 @@ def test_load_optional_binarization_loads_from_explicit_path(tmp_path):
     assert loaded is not None
     assert loaded.n_bins == placeholder.n_bins
     np.testing.assert_array_equal(loaded.tau_low, placeholder.tau_low)
+
+
+# ---------------------------------------------------------------------------
+# Phase D integration tests: CLI + config migration
+# ---------------------------------------------------------------------------
+
+
+def test_tooconfig_has_binarization_section():
+    """TOOConfig gains a ``binarization`` subsection alongside the legacy
+    ``calibration`` subsection. Both default-construct without errors."""
+    from finaleme_too.config import BinarizationConfig, TOOConfig
+
+    cfg = TOOConfig()
+    assert isinstance(cfg.binarization, BinarizationConfig)
+    assert cfg.binarization.n_context_bins == 8
+    assert cfg.binarization.max_error_rate == 0.15
+    assert cfg.binarization.cv_method == "chromosome_blocked"
+    assert cfg.binarization.use_default is True
+
+
+def test_tooconfig_from_yaml_accepts_binarization_section(tmp_path):
+    """Loading a YAML file with a ``binarization:`` section populates the
+    new subsection."""
+    from finaleme_too.config import TOOConfig
+
+    yaml_path = tmp_path / "v3_config.yaml"
+    yaml_path.write_text(
+        "binarization:\n"
+        "  binarization_file: /tmp/custom_binarization.json\n"
+        "  n_context_bins: 12\n"
+        "  max_error_rate: 0.10\n"
+        "  cv_n_folds: 5\n"
+    )
+    cfg = TOOConfig.from_yaml(yaml_path)
+    assert cfg.binarization.binarization_file == "/tmp/custom_binarization.json"
+    assert cfg.binarization.n_context_bins == 12
+    assert cfg.binarization.max_error_rate == 0.10
+    assert cfg.binarization.cv_n_folds == 5
+
+
+def test_tooconfig_from_yaml_warns_on_legacy_calibration_section(tmp_path):
+    """Loading a YAML file with a legacy ``calibration:`` section emits a
+    DeprecationWarning but still loads the values into the old subsection."""
+    import warnings
+    from finaleme_too.config import TOOConfig
+
+    yaml_path = tmp_path / "v2_config.yaml"
+    yaml_path.write_text(
+        "calibration:\n"
+        "  calibration_file: /tmp/legacy_cal.json\n"
+        "  n_density_bins: 6\n"
+    )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        cfg = TOOConfig.from_yaml(yaml_path)
+        deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning)]
+        assert len(deprecations) == 1
+        assert "calibration" in str(deprecations[0].message).lower()
+    # Values still load into the legacy subsection
+    assert cfg.calibration.calibration_file == "/tmp/legacy_cal.json"
+    assert cfg.calibration.n_density_bins == 6
+
+
+def test_tooconfig_from_yaml_both_sections_no_warning(tmp_path):
+    """When a YAML file has BOTH sections, no deprecation warning fires
+    (the user has already migrated; the legacy section is intentional)."""
+    import warnings
+    from finaleme_too.config import TOOConfig
+
+    yaml_path = tmp_path / "mixed_config.yaml"
+    yaml_path.write_text(
+        "binarization:\n"
+        "  n_context_bins: 8\n"
+        "calibration:\n"
+        "  n_density_bins: 6\n"
+    )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        TOOConfig.from_yaml(yaml_path)
+        deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning)]
+        assert len(deprecations) == 0
+
+
+def test_cli_train_calibration_hard_breaks_with_exit_2():
+    """The v2 ``train-calibration`` CLI command must exit non-zero with a
+    migration error message pointing at the new train-binarization command."""
+    from click.testing import CliRunner
+    from finaleme_too.cli import main
+
+    runner = CliRunner()
+    # With mix_stderr=True (default), click.echo(..., err=True) lands in
+    # result.output alongside any stdout content.
+    result = runner.invoke(main, ["train-calibration"])
+    assert result.exit_code == 2
+    assert "train-binarization" in result.output
+    assert (
+        "binarization" in result.output.lower()
+        or "v3" in result.output
+    )
+
+
+def test_cli_train_binarization_has_help():
+    """The new ``train-binarization`` command exists and documents its flags."""
+    from click.testing import CliRunner
+    from finaleme_too.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["train-binarization", "--help"])
+    assert result.exit_code == 0
+    assert "--matched-wgbs" in result.output
+    assert "--matched-finaleme" in result.output
+    assert "--n-bins-candidates" in result.output
+    assert "--max-error-rate" in result.output
+    assert "--cv-method" in result.output
+    assert "--output" in result.output
+
+
+def test_cli_run_has_binarization_flag():
+    """The ``run`` command exposes the new ``--binarization`` flag alongside
+    the legacy ``--calibration`` flag."""
+    from click.testing import CliRunner
+    from finaleme_too.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["run", "--help"])
+    assert result.exit_code == 0
+    assert "--binarization" in result.output
+    assert "--calibration" in result.output
+
+
+def test_train_binarization_end_to_end(tmp_path):
+    """End-to-end smoke test of train_binarization() on a synthetic
+    single-sample matched dataset."""
+    from finaleme_too.preprocessing.binarization import (
+        BinarizationParams,
+        train_binarization,
+    )
+
+    # Build a tiny matched dataset: 100 markers across chr1..chr4, with
+    # predictably-aligned WGBS and FinaleMe calls.
+    rng = np.random.default_rng(42)
+    n_chroms = 4
+    n_per_chrom = 100
+    n_total = n_chroms * n_per_chrom
+
+    # Tile sample_id / chrom / start / end
+    rows = []
+    for ci in range(n_chroms):
+        for i in range(n_per_chrom):
+            start = 1000 + i * 200
+            # WGBS methylation: half near 0, half near 1 (clean U/M)
+            if i < 50:
+                wgbs_meth_ct = 1
+                fme_meth_ct = 1
+            else:
+                wgbs_meth_ct = 19
+                fme_meth_ct = 19
+            rows.append({
+                "sample_id": "S1",
+                "chrom": f"chr{ci + 1}",
+                "start": start,
+                "end": start + 100,
+                "wgbs_methylated_count": wgbs_meth_ct,
+                "wgbs_total_count": 20,
+                "fme_methylated_count": fme_meth_ct,
+                "fme_total_count": 20,
+            })
+    df = pd.DataFrame(rows)
+
+    # Write WGBS and FinaleMe matched tables in the legacy joined format
+    wgbs_path = tmp_path / "wgbs_matched.tsv"
+    wgbs_df = df[["sample_id", "chrom", "start", "end"]].copy()
+    wgbs_df["methylated_count"] = df["wgbs_methylated_count"]
+    wgbs_df["total_count"] = df["wgbs_total_count"]
+    wgbs_df.to_csv(wgbs_path, sep="\t", index=False)
+
+    fme_path = tmp_path / "fme_matched.tsv"
+    fme_df = df[["sample_id", "chrom", "start", "end"]].copy()
+    fme_df["methylated_count"] = df["fme_methylated_count"]
+    fme_df["total_count"] = df["fme_total_count"]
+    fme_df.to_csv(fme_path, sep="\t", index=False)
+
+    out_params = tmp_path / "bin_params.json"
+    out_report = tmp_path / "bin_report.json"
+
+    params = train_binarization(
+        matched_wgbs=wgbs_path,
+        matched_finaleme=fme_path,
+        region_annotation=None,  # no CpG index → single density bin per class
+        n_bins_candidates=[4, 8],  # 1 or 2 sub-bins per class
+        out_params=out_params,
+        out_report=out_report,
+        cv_n_folds=3,
+        cv_seed=0,
+    )
+    assert isinstance(params, BinarizationParams)
+    assert out_params.exists()
+    assert out_report.exists()
+
+    # Round-trip the saved params to confirm the file is valid JSON
+    loaded = BinarizationParams.load(out_params)
+    assert loaded.n_bins == params.n_bins
+    np.testing.assert_array_equal(loaded.tau_low, params.tau_low)
+
+    # Report contains training metadata
+    report = json.loads(out_report.read_text())
+    assert report["binarization_version"] == "1.0"
+    assert report["n_training_samples"] == 1
+    assert report["cv_method"] == "chromosome_blocked"
