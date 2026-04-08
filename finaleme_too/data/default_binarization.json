@@ -1,0 +1,132 @@
+{
+  "n_bins": 8,
+  "n_region_classes": 4,
+  "density_sub_bins_per_class": 2,
+  "region_class_order": [
+    "CGI",
+    "shore",
+    "shelf",
+    "open_sea"
+  ],
+  "region_class_thresholds": {
+    "CGI": 0.08,
+    "shore": 0.04,
+    "shelf": 0.015
+  },
+  "density_edges": [
+    [
+      -Infinity,
+      1.0,
+      Infinity
+    ],
+    [
+      -Infinity,
+      1.0,
+      Infinity
+    ],
+    [
+      -Infinity,
+      1.0,
+      Infinity
+    ],
+    [
+      -Infinity,
+      1.0,
+      Infinity
+    ]
+  ],
+  "tau_low": [
+    0.2,
+    0.2,
+    0.2,
+    0.2,
+    0.2,
+    0.2,
+    0.2,
+    0.2
+  ],
+  "tau_high": [
+    0.8,
+    0.8,
+    0.8,
+    0.8,
+    0.8,
+    0.8,
+    0.8,
+    0.8
+  ],
+  "eps_U": [
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1
+  ],
+  "eps_M": [
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1,
+    0.1
+  ],
+  "usable": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "n_markers_U": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "n_markers_M": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "train_fraction_U": [
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5
+  ],
+  "train_fraction_M": [
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5
+  ],
+  "training_metadata": {
+    "kind": "identity_placeholder",
+    "note": "Placeholder default shipped in v3 Phase A. Replace with a real trained binarization via `finaleme-too train-binarization`."
+  }
+}
