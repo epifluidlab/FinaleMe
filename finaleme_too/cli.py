@@ -234,6 +234,7 @@ def run_cmd(
         calibration=calibration_params,
         region_annotations=region_annotations,
         group_comparison_spec=effective_group_comparison,
+        cpg_index=cpg_idx,
     )
     pipeline.run(sample_sheet, reference, markers, output_dir, cpg_index=cpg_idx)
     click.echo(f"finaleme-too: wrote outputs to {output_dir}")

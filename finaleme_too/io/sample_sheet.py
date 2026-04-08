@@ -14,6 +14,7 @@ REQUIRED_COLUMNS = {"sample_id", "methylation_file", "mode"}
 OPTIONAL_COLUMNS = {
     "input_format",
     "group",
+    "pat_file",  # optional .pat.gz path for fragment-level (ULTRALOW) mode
     "extraction_batch",
     "library_date",
     "sequencing_date",
@@ -49,7 +50,27 @@ class Sample:
     group: str | None = None
     meth_col: int | None = None
     total_col: int | None = None
+    pat_file: Path | None = None
     metadata: dict = field(default_factory=dict)
+
+    def resolved_pat_file(self) -> Path | None:
+        """Return the .pat.gz companion path for this sample.
+
+        Prefers the explicit ``pat_file`` sample-sheet column; otherwise
+        falls back to the conventional naming where FinaleMe writes the
+        fragment patterns next to the prediction BED (swapping
+        ``.prediction.bed.gz`` → ``.prediction.pat.gz``).
+        """
+        if self.pat_file is not None:
+            return self.pat_file
+        p = self.methylation_file
+        name = p.name
+        for suffix in (".prediction.bed.gz", ".decode.prediction.bed.gz"):
+            if name.endswith(suffix):
+                candidate = p.with_name(name[: -len(suffix)] + suffix.replace(".bed.gz", ".pat.gz"))
+                if candidate.exists():
+                    return candidate
+        return None
 
     @property
     def technical_covariates(self) -> dict[str, str]:
@@ -132,6 +153,7 @@ class SampleSheet:
                     group=str(row["group"]) if "group" in df.columns and pd.notna(row.get("group")) else None,
                     meth_col=int(row["meth_col"]) if "meth_col" in df.columns and pd.notna(row.get("meth_col")) else None,
                     total_col=int(row["total_col"]) if "total_col" in df.columns and pd.notna(row.get("total_col")) else None,
+                    pat_file=Path(str(row["pat_file"])) if "pat_file" in df.columns and pd.notna(row.get("pat_file")) else None,
                     metadata=metadata,
                 )
             )
