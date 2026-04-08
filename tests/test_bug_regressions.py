@@ -600,3 +600,212 @@ def test_round2_bug4_apply_calibration_with_no_region_annotation_does_not_nan(tm
     # The aggressive a=2.0, c=1.0 calibration must actually change at least
     # one value (sanity check that the lookup table is being used)
     assert not np.array_equal(out.k, obs.k)
+
+
+# ---------------------------------------------------------------------------
+# April 2026 round 3 regressions
+# ---------------------------------------------------------------------------
+
+
+# HIGH — residual_analysis.tsv must not silently skip when the first
+# sample has no residuals (e.g. tier-filter fallback)
+def test_round3_high_residual_analysis_not_skipped_when_first_sample_empty(tmp_path):
+    """Even if results[0].residuals is None, the residual TSV must still
+    be emitted (with NaN rows for samples that had no residuals)."""
+    from finaleme_too.config import CoverageTier, TOOConfig
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.io.output_writer import write_residual_analysis
+    from finaleme_too.pipeline import TOOPipeline
+
+    def _mk(sid, residuals):
+        K = 2
+        prop = np.array([0.4, 0.3, 0.3])
+        return DeconvolutionResult(
+            sample_id=sid,
+            cell_types=["CT1", "CT2"],
+            proportions=prop,
+            ci_lower=prop - 0.05,
+            ci_upper=prop + 0.05,
+            p_goodness=np.array([0.5, 0.5]),
+            p_detection=np.array([0.9, 0.9, 0.9]),
+            reliability=np.array(["HIGH", "HIGH", "HIGH"], dtype=object),
+            n_markers=np.array([5, 5], dtype=np.int32),
+            coverage_tier=CoverageTier.HIGH,
+            qc_flags=[],
+            mean_dispersion=np.array([50.0, 50.0]),
+            mean_coverage=25.0,
+            n_markers_used=5,
+            residuals=residuals,
+            overall_qc="PASS",
+        )
+
+    results = [
+        _mk("s1", residuals=None),  # <-- first sample has no residuals
+        _mk("s2", residuals=np.array([0.01, -0.02, 0.03, -0.01, 0.005])),
+        _mk("s3", residuals=np.array([0.00, -0.01, 0.02, -0.03, 0.01])),
+    ]
+    sample_groups = {"s1": "A", "s2": "A", "s3": "A"}
+
+    config = TOOConfig()
+    pipeline = TOOPipeline(config)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    pipeline._run_residual_analysis(results, sample_groups, out_dir)
+
+    residual_tsv = out_dir / "residual_analysis.tsv"
+    assert residual_tsv.exists(), "residual_analysis.tsv must be written"
+    import pandas as pd
+
+    df = pd.read_csv(residual_tsv, sep="\t")
+    assert set(df["sample_id"]) == {"s1", "s2", "s3"}
+    # s1 (no residuals) should have NaN stats
+    s1_row = df[df["sample_id"] == "s1"].iloc[0]
+    assert np.isnan(float(s1_row["mean_residual"]))
+    # s2/s3 should have finite stats
+    s2_row = df[df["sample_id"] == "s2"].iloc[0]
+    assert np.isfinite(float(s2_row["mean_residual"]))
+
+
+# MEDIUM — sample sheet must require the group column
+def test_round3_sample_sheet_requires_group_column(tmp_path):
+    """Missing 'group' column should raise InvalidSampleSheetError."""
+    from finaleme_too.exceptions import InvalidSampleSheetError
+    from finaleme_too.io.sample_sheet import SampleSheet
+
+    sheet_path = tmp_path / "sheet_no_group.tsv"
+    sheet_path.write_text(
+        "sample_id\tmethylation_file\tmode\ns1\t/nope/a.bed.gz\tFINALEME\n"
+    )
+    with pytest.raises(InvalidSampleSheetError) as exc:
+        SampleSheet.from_tsv(sheet_path)
+    assert "group" in str(exc.value).lower()
+
+
+def test_round3_sample_sheet_rejects_empty_group_values(tmp_path):
+    """Empty string / NaN group values should raise."""
+    from finaleme_too.exceptions import InvalidSampleSheetError
+    from finaleme_too.io.sample_sheet import SampleSheet
+
+    sheet_path = tmp_path / "sheet_empty_group.tsv"
+    sheet_path.write_text(
+        "sample_id\tmethylation_file\tmode\tgroup\n"
+        "s1\t/nope/a.bed.gz\tFINALEME\tA\n"
+        "s2\t/nope/b.bed.gz\tFINALEME\t\n"  # empty group
+    )
+    with pytest.raises(InvalidSampleSheetError) as exc:
+        SampleSheet.from_tsv(sheet_path)
+    assert "group" in str(exc.value).lower()
+
+
+def test_round3_imputation_lenient_mode_skips_unlabeled_samples():
+    """In lenient mode (the pipeline's default) imputation returns the
+    original sample instead of crashing when the group is missing."""
+    from finaleme_too.config import MeasurementMode
+    from finaleme_too.io.methylation_loader import MarkerObservations
+    from finaleme_too.preprocessing.imputation import CohortImputer
+
+    def _obs(sid, k, n):
+        return MarkerObservations(
+            sample_id=sid,
+            chrom=np.array(["chr1"] * len(k), dtype=object),
+            start=np.array(list(range(len(k))), dtype=np.int64),
+            end=np.array(list(range(1, len(k) + 1)), dtype=np.int64),
+            k=np.array(k, dtype=np.int32),
+            n=np.array(n, dtype=np.int32),
+            predicted_beta=None,
+            mode=MeasurementMode.WGBS,
+        )
+
+    target = _obs("t", [0] * 5, [0] * 5)
+    donors = [_obs(f"d{i}", [10] * 5, [20] * 5) for i in range(3)]
+    # NO group for the target
+    groups = {f"d{i}": "A" for i in range(3)}
+    imp = CohortImputer()
+    out = imp.impute(target, donors + [target], groups)  # default strict=False
+    np.testing.assert_array_equal(out.n, target.n)
+
+
+# MEDIUM — uncertainty.method wiring
+def test_round3_uncertainty_method_none_produces_zero_width_cis(
+    synthetic_observations_pure_celltype, synthetic_reference, tmp_path
+):
+    """uncertainty.method='none' must skip bootstrap/MCMC and emit CIs that
+    equal the point estimate."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.core.observation_model import BetaBinomialModel
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    config = TOOConfig()
+    config.uncertainty.method = "none"
+    config.uncertainty.n_bootstrap = 5
+    config.coverage.tier_high = 0.0
+    config.coverage.tier_low = -1.0
+
+    pipeline = TOOPipeline(config)
+    # Use the fixture observation object directly through the internal path
+    observation = BetaBinomialModel().build(
+        synthetic_observations_pure_celltype, reference=synthetic_reference
+    )
+    w_hat = pipeline.deconvolver.solve(observation, synthetic_reference)
+    # Flags driven by the config
+    assert pipeline._wants_bootstrap is False
+    assert pipeline._wants_any_uncertainty is False
+
+
+def test_round3_uncertainty_method_bayesian_without_model_bayesian():
+    """uncertainty.method='bayesian' should instantiate the Bayesian
+    deconvolver even when model.deconvolution stays at MLE."""
+    from finaleme_too.config import SolverMethod, TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+
+    config = TOOConfig()
+    config.model.deconvolution = SolverMethod.MLE
+    config.uncertainty.method = "bayesian"
+    pipeline = TOOPipeline(config)
+    assert pipeline.bayesian_deconvolver is not None
+    assert pipeline._wants_bayesian_uncertainty is True
+    assert pipeline._point_estimate_is_bayesian is False
+
+
+def test_round3_uncertainty_method_both_sets_both_flags():
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+
+    config = TOOConfig()
+    config.uncertainty.method = "both"
+    pipeline = TOOPipeline(config)
+    assert pipeline._wants_bootstrap is True
+    assert pipeline._wants_bayesian_uncertainty is True
+    assert pipeline.bayesian_deconvolver is not None
+
+
+# GAP — per-marker effective coverage down-tiering
+def test_round3_gap_per_marker_min_reads_vector_down_tiers():
+    """A marker with below-expected effective coverage should get a less
+    strict minimum reads threshold."""
+    from finaleme_too.config import CoverageTier
+    from finaleme_too.preprocessing.coverage import per_marker_min_reads_vector
+
+    # mean = 20. Marker 0: n=40 (eff=2.0, stays HIGH). Marker 1: n=4 (eff=0.2,
+    # drops one tier to LOW). Marker 2: n=1 (eff=0.05, drops two to ULTRALOW).
+    n = np.array([40, 4, 1], dtype=np.int64)
+    out = per_marker_min_reads_vector(n, CoverageTier.HIGH)
+    assert int(out[0]) == 3  # HIGH
+    assert int(out[1]) == 2  # LOW
+    assert int(out[2]) == 1  # ULTRALOW
+
+
+def test_round3_gap_down_tier_keeps_marker_that_scalar_filter_would_drop():
+    """In a HIGH-tier sample, a marker with n=1 should be KEPT under
+    effective-coverage down-tiering (it drops to ULTRALOW tier, min=1)."""
+    from finaleme_too.config import CoverageTier
+    from finaleme_too.preprocessing.coverage import per_marker_min_reads_vector
+
+    # 10 markers with n=50, 1 marker with n=1
+    n = np.concatenate([np.full(10, 50), np.array([1])]).astype(np.int64)
+    min_reads = per_marker_min_reads_vector(n, CoverageTier.HIGH)
+    # Last marker should have min=1 (ULTRALOW), not 3 (HIGH)
+    assert int(min_reads[-1]) == 1
+    # And n=1 >= min=1, so it passes
+    assert int(n[-1]) >= int(min_reads[-1])

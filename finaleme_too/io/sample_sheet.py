@@ -10,10 +10,12 @@ import pandas as pd
 from finaleme_too.config import MeasurementMode
 from finaleme_too.exceptions import InvalidSampleSheetError
 
-REQUIRED_COLUMNS = {"sample_id", "methylation_file", "mode"}
+# ``group`` is required per architecture §3.1 — it drives cohort imputation
+# and cross-sample statistical testing. Use the literal string "default" in
+# the sample sheet if your cohort has no biological grouping.
+REQUIRED_COLUMNS = {"sample_id", "methylation_file", "mode", "group"}
 OPTIONAL_COLUMNS = {
     "input_format",
-    "group",
     "pat_file",  # optional .pat.gz path for fragment-level (ULTRALOW) mode
     "extraction_batch",
     "library_date",
@@ -122,12 +124,24 @@ class SampleSheet:
         missing = REQUIRED_COLUMNS - set(df.columns)
         if missing:
             raise InvalidSampleSheetError(
-                f"Sample sheet missing required columns: {sorted(missing)}"
+                f"Sample sheet missing required columns: {sorted(missing)}. "
+                "The 'group' column is required per architecture §3.1; use "
+                "'default' for cohorts with no biological grouping."
             )
         # Validate uniqueness of sample_id
         if df["sample_id"].duplicated().any():
             dups = df[df["sample_id"].duplicated()]["sample_id"].tolist()
             raise InvalidSampleSheetError(f"Duplicate sample_id values: {dups}")
+        # Validate no missing group values (null / empty string / whitespace)
+        group_series = df["group"].astype(str).str.strip()
+        null_group_ids = df.loc[
+            group_series.isin(("", "nan", "None", "NaN")), "sample_id"
+        ].tolist()
+        if null_group_ids:
+            raise InvalidSampleSheetError(
+                f"Samples with empty 'group' values: {null_group_ids}. "
+                "Use 'default' if the cohort has no biological grouping."
+            )
 
         samples: list[Sample] = []
         for _, row in df.iterrows():

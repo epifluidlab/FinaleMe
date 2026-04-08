@@ -73,6 +73,13 @@ def main() -> None:
 @click.option("--n-bootstrap", default=200, type=int, help="Bootstrap iterations (default: 200).")
 @click.option("--bayesian", is_flag=True, default=False, help="(P3) Use Bayesian deconvolution.")
 @click.option("--bayesian-n-samples", default=5000, type=int)
+@click.option(
+    "--uncertainty-method",
+    default="bootstrap",
+    type=click.Choice(["bootstrap", "bayesian", "both", "none"]),
+    help="Uncertainty source: bootstrap (default), bayesian (MCMC posterior), "
+    "both (bootstrap is primary, posterior stored alongside), or none (CIs = point).",
+)
 # Covariates (P2)
 @click.option("--batch-correct", default=None, help="(P2) comma-separated batch covariates.")
 @click.option("--adjust-covariates", default=None, help="(P2) comma-separated biological covariates.")
@@ -112,6 +119,7 @@ def run_cmd(
     n_bootstrap: int,
     bayesian: bool,
     bayesian_n_samples: int,
+    uncertainty_method: str,
     batch_correct: str | None,
     adjust_covariates: str | None,
     configurable_covariates: str | None,
@@ -158,8 +166,14 @@ def run_cmd(
         config.uncertainty.n_bootstrap = n_bootstrap
     if _was_provided("bayesian_n_samples"):
         config.uncertainty.bayesian_n_samples = bayesian_n_samples
+    if _was_provided("uncertainty_method"):
+        config.uncertainty.method = uncertainty_method
     if bayesian:  # is_flag — only True when explicitly set
         config.model.deconvolution = SolverMethod.BAYESIAN
+        # --bayesian implies Bayesian uncertainty unless the user picked
+        # something different via --uncertainty-method
+        if not _was_provided("uncertainty_method"):
+            config.uncertainty.method = "bayesian"
     if _was_provided("test_method"):
         config.testing.method = TestMethod(test_method)
     if _was_provided("fdr_alpha"):

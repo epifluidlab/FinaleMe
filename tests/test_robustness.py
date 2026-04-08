@@ -68,10 +68,22 @@ def test_combat_skips_when_too_few_levels():
 
 
 def test_imputer_refuses_when_no_group():
+    """In strict mode the imputer must raise when the sample has no group."""
     sample = _mk_obs("s1", [1] * 5, [1] * 5)
     cohort = [_mk_obs(f"c{i}", [10] * 5, [20] * 5) for i in range(3)]
     with pytest.raises(IllegalImputationError):
-        CohortImputer().impute(sample, cohort, sample_groups={})
+        CohortImputer().impute(sample, cohort, sample_groups={}, strict=True)
+
+
+def test_imputer_lenient_returns_sample_when_no_group():
+    """In lenient mode (pipeline default) the imputer returns the input
+    unchanged instead of raising, so LOW/ULTRALOW runs do not crash on
+    unlabeled samples."""
+    sample = _mk_obs("s1", [1] * 5, [1] * 5)
+    cohort = [_mk_obs(f"c{i}", [10] * 5, [20] * 5) for i in range(3)]
+    out = CohortImputer().impute(sample, cohort, sample_groups={}, strict=False)
+    np.testing.assert_array_equal(out.k, sample.k)
+    np.testing.assert_array_equal(out.n, sample.n)
 
 
 def test_imputer_only_uses_same_group_donors():

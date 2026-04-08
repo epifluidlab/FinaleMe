@@ -32,12 +32,23 @@ class CohortImputer:
         sample: MarkerObservations,
         cohort: list[MarkerObservations],
         sample_groups: dict[str, str | None],
+        strict: bool = False,
     ) -> MarkerObservations:
+        """Impute missing-coverage markers in ``sample`` from same-group cohort.
+
+        When ``strict`` is True (library use), missing group labels raise
+        ``IllegalImputationError``. When False (pipeline use, the default),
+        the sample is returned unchanged so LOW/ULTRALOW runs do not crash
+        on unlabeled samples. The sample sheet parser enforces non-empty
+        groups at the entry point, so this is defense-in-depth.
+        """
         sample_group = sample_groups.get(sample.sample_id)
         if sample_group is None:
-            raise IllegalImputationError(
-                f"Sample {sample.sample_id} has no group label; cannot impute"
-            )
+            if strict:
+                raise IllegalImputationError(
+                    f"Sample {sample.sample_id} has no group label; cannot impute"
+                )
+            return sample
 
         donors = [
             obs
