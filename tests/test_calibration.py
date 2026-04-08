@@ -635,6 +635,176 @@ def test_make_region_annotation_from_headered_tsv(tmp_path):
     assert df.iloc[0]["cpg_density"] == pytest.approx(5 / 1000)
 
 
+# ---------------------------------------------------------------------------
+# Parallel execution of train-calibration
+# ---------------------------------------------------------------------------
+
+
+def test_cross_validate_calibration_threads_match_serial():
+    """Running CV with threads=4 must give the same per-fold result as serial."""
+    from finaleme_too.preprocessing.calibration_eval import cross_validate_calibration
+
+    rng = np.random.default_rng(0)
+    n = 600
+    sample_ids = np.array([f"S{i // 150}" for i in range(n)])  # 4 samples
+    truth = rng.beta(2, 5, size=n)
+    fme = np.clip(truth + rng.normal(0, 0.05, size=n), 0.01, 0.99)
+    density = rng.uniform(0, 0.1, size=n)
+
+    serial = cross_validate_calibration(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins=4,
+        threads=1,
+    )
+    parallel = cross_validate_calibration(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins=4,
+        threads=4,
+    )
+    # cv_rmse, in-sample rmse, and fold counts must all match
+    assert serial["n_folds"] == parallel["n_folds"]
+    assert abs(serial["cv_rmse"] - parallel["cv_rmse"]) < 1e-12
+    assert abs(serial["in_sample_rmse"] - parallel["in_sample_rmse"]) < 1e-12
+
+
+def test_tune_n_bins_threads_match_serial():
+    """tune_n_bins with threads must match the serial result."""
+    from finaleme_too.preprocessing.calibration_eval import tune_n_bins
+
+    rng = np.random.default_rng(1)
+    n = 800
+    sample_ids = np.array([f"S{i // 200}" for i in range(n)])  # 4 samples
+    truth = rng.beta(2, 5, size=n)
+    fme = np.clip(truth + rng.normal(0, 0.03, size=n), 0.01, 0.99)
+    density = rng.uniform(0, 0.1, size=n)
+
+    serial = tune_n_bins(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 6],
+        threads=1,
+    )
+    parallel = tune_n_bins(
+        finaleme_beta=fme,
+        wgbs_beta=truth,
+        cpg_density=density,
+        sample_ids=sample_ids,
+        n_bins_candidates=[2, 4, 6],
+        threads=4,
+    )
+    # Same selected B
+    assert serial["selected_n_bins"] == parallel["selected_n_bins"]
+    # Same number of candidates
+    assert len(serial["candidates"]) == len(parallel["candidates"])
+    # Same cv_rmse per candidate (identical numerics with threading backend)
+    for s, p in zip(serial["candidates"], parallel["candidates"]):
+        assert s["n_bins"] == p["n_bins"]
+        assert abs(s["cv_rmse"] - p["cv_rmse"]) < 1e-12
+        assert abs(s["in_sample_rmse"] - p["in_sample_rmse"]) < 1e-12
+
+
+def test_load_sample_sheet_threaded_parsing(tmp_path):
+    """Loading a 4-sample Bis-SNP sample sheet with threads must produce
+    the same DataFrame as the serial loader."""
+    import pandas as pd
+
+    from finaleme_too.preprocessing.calibration import _load_matched_table
+
+    rows_per_sample = [
+        (1, 100, 101, 50.0, 4),
+        (1, 200, 201, 25.0, 4),
+        (2, 5000, 5001, 100.0, 10),
+        (2, 6000, 6001, 0.0, 10),
+    ]
+    for s in range(4):
+        _write_bissnp_6plus2(tmp_path / f"s{s}.bed", rows_per_sample, with_chr_prefix=False)
+
+    sheet = tmp_path / "wgbs.tsv"
+    pd.DataFrame(
+        [
+            {"sample_id": f"S{s}", "methylation_file": f"s{s}.bed"}
+            for s in range(4)
+        ]
+    ).to_csv(sheet, sep="\t", index=False)
+
+    serial = _load_matched_table(sheet, modality="wgbs", threads=1)
+    parallel = _load_matched_table(sheet, modality="wgbs", threads=4)
+    # Same content (row order may differ because joblib doesn't guarantee
+    # order across threads; use set comparison on a canonical key)
+    def _key(df):
+        return sorted(
+            (r["sample_id"], r["chrom"], int(r["start"]), int(r["methylated_count"]), int(r["total_count"]))
+            for _, r in df.iterrows()
+        )
+    assert _key(serial) == _key(parallel)
+    assert len(parallel) == 4 * len(rows_per_sample)
+
+
+def test_train_calibration_threaded_end_to_end(tmp_path):
+    """End-to-end train_calibration with threads=4. Must produce a result
+    indistinguishable from the serial run up to floating-point noise."""
+    from scipy.special import expit, logit
+
+    from finaleme_too.preprocessing.calibration import train_calibration
+
+    rng = np.random.default_rng(42)
+    n_samples = 4
+    n_markers = 100
+    rows_w, rows_f = [], []
+    for s in range(n_samples):
+        for m in range(n_markers):
+            b = float(rng.beta(2, 5))
+            k_w = int(rng.binomial(30, b))
+            fme_b = float(
+                expit((logit(np.clip(b, 1e-6, 1 - 1e-6)) - 0.1) / 0.8 + rng.normal(0, 0.1))
+            )
+            k_f = int(rng.binomial(30, fme_b))
+            rows_w.append((f"S{s}", "chr1", m * 100, m * 100 + 1, k_w, 30))
+            rows_f.append((f"S{s}", "chr1", m * 100, m * 100 + 1, k_f, 30))
+
+    import pandas as pd
+
+    pd.DataFrame(
+        rows_w,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "wgbs.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        rows_f,
+        columns=["sample_id", "chrom", "start", "end", "methylated_count", "total_count"],
+    ).to_csv(tmp_path / "fme.tsv", sep="\t", index=False)
+
+    params_serial = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "serial.json",
+        out_report=tmp_path / "serial_report.json",
+        threads=1,
+    )
+    params_threaded = train_calibration(
+        matched_wgbs=tmp_path / "wgbs.tsv",
+        matched_finaleme=tmp_path / "fme.tsv",
+        region_annotation=None,
+        n_bins_candidates=[2, 4],
+        out_params=tmp_path / "threaded.json",
+        out_report=tmp_path / "threaded_report.json",
+        threads=4,
+    )
+    # Both runs must pick the same B and produce the same parameters
+    assert params_serial.n_bins == params_threaded.n_bins
+    np.testing.assert_allclose(params_serial.a, params_threaded.a, rtol=1e-12)
+    np.testing.assert_allclose(params_serial.c, params_threaded.c, rtol=1e-12)
+
+
 def test_train_calibration_auto_generates_region_annotation_from_cpg_index(tmp_path):
     """When --region-annotation is omitted but --cpg-index is provided,
     train_calibration must auto-compute density per row and use it."""
