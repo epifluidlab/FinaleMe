@@ -86,6 +86,10 @@ class UncertaintyConfig:
     noise_floor: float = 0.001
     bayesian_prior_alpha: float = 1.0
     bayesian_n_samples: int = 5000
+    # Optional integer seed for the bootstrap rng. ``None`` (the default)
+    # uses fresh entropy on every run; setting this enables reproducible
+    # bootstrap CIs across both serial and threaded executions.
+    seed: int | None = None
 
 
 @dataclass

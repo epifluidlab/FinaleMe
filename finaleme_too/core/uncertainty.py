@@ -40,17 +40,44 @@ class BootstrapCI:
         model: ObservationModel,
         reference: "ReferencePanel",
         deconvolver: MLEDeconvolver,
+        n_jobs: int = 1,
     ) -> BootstrapResult:
+        """Run the marker-resampling bootstrap.
+
+        ``n_jobs`` controls inner parallelism over bootstrap iterations.
+        scipy's SLSQP releases the GIL, so the threading backend lets the
+        pipeline saturate cores when there are fewer samples than threads
+        (e.g., one sample with ``--threads 8``). When the outer pipeline
+        already saturates cores via per-sample parallelism, callers should
+        leave ``n_jobs=1`` to avoid oversubscribing the CPU.
+        """
         rng = np.random.default_rng(self.seed)
         n_markers = model.n_markers
         # K_total includes the unknown component
         K_total = reference.n_cell_types + 1
-        samples = np.empty((self.n_iterations, K_total), dtype=np.float64)
 
-        for b in range(self.n_iterations):
-            idx = rng.integers(0, n_markers, size=n_markers)
-            w_b = deconvolver.solve(model, reference, marker_subset=idx)
-            samples[b] = w_b
+        # Pre-generate ALL bootstrap indices up front so the parallel inner
+        # loop is deterministic regardless of which thread picks which task
+        # (the rng state would otherwise depend on completion order).
+        all_idx = rng.integers(0, n_markers, size=(self.n_iterations, n_markers))
+
+        def _one(b: int) -> np.ndarray:
+            return deconvolver.solve(model, reference, marker_subset=all_idx[b])
+
+        if n_jobs <= 1 or self.n_iterations <= 1:
+            samples = np.empty((self.n_iterations, K_total), dtype=np.float64)
+            for b in range(self.n_iterations):
+                samples[b] = _one(b)
+        else:
+            from finaleme_too.utils.parallel import parallel_map
+
+            results = parallel_map(
+                _one,
+                range(self.n_iterations),
+                n_jobs=n_jobs,
+                backend="threading",
+            )
+            samples = np.stack(results, axis=0)
 
         alpha = (1.0 - self.ci_level) / 2.0
         ci_lower = np.quantile(samples, alpha, axis=0)

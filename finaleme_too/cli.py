@@ -251,6 +251,7 @@ def run_cmd(
         explicit_ref_groups=ref_groups,
         explicit_cpg_index=cpg_index,
         explicit_marker_format=effective_marker_format,
+        threads=config.threads,
     )
 
     # Phase B: load calibration + region annotations (FinaleMe mode)

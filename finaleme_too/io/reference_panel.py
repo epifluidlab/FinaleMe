@@ -151,6 +151,7 @@ class ReferencePanelLoader:
         cpg_index_path: str | Path,
         marker_regions: MarkerRegions,
         replicate_mode: str = "aggregate",
+        threads: int = 1,
     ) -> ReferencePanel:
         """Load reference panel from a list of .beta files + groups CSV.
 
@@ -162,7 +163,15 @@ class ReferencePanelLoader:
         Groups CSV must have a header with at least ``name`` and ``group``
         columns. ``name`` is matched to beta file basenames (stripping the
         ``.beta`` extension and any ``.pat.gz`` artifact).
+
+        ``threads`` controls parallel parsing of the per-sample .beta files.
+        Parsing is dominated by binary file I/O + np.searchsorted, both of
+        which release the GIL, so the threading backend wins over loky here
+        and avoids re-pickling the (potentially large) marker_regions and
+        cpg_index for every task.
         """
+        from finaleme_too.utils.parallel import parallel_map
+
         beta_paths = _parse_ref_betas_arg(ref_betas_arg)
         groups_df = _load_groups_file(groups_file)
         cpg_index = load_cpg_index(cpg_index_path)
@@ -179,6 +188,29 @@ class ReferencePanelLoader:
         n_markers = marker_regions.n_markers
         n_ct = len(cell_types)
 
+        # Filter to beta paths whose group is known up front, then parse in
+        # parallel. Each task returns its own (mk, mn, ci) so threads never
+        # touch the same memory until the (cheap, in-process) accumulation.
+        tasks: list[tuple[Path, int]] = []
+        for beta_path in beta_paths:
+            sample_name = _beta_basename_to_sample_name(beta_path)
+            group = sample_to_group.get(sample_name)
+            if group is None:
+                continue
+            tasks.append((beta_path, ct_to_index[group]))
+
+        def _parse_one(task: tuple[Path, int]) -> tuple[np.ndarray, np.ndarray, int]:
+            beta_path, ci = task
+            counts = _load_beta_file_to_markers(beta_path, marker_regions, cpg_index)
+            return counts[:, 0], counts[:, 1], ci
+
+        parsed = parallel_map(
+            _parse_one,
+            tasks,
+            n_jobs=threads,
+            backend="threading",
+        )
+
         # For aggregate mode we sum methylated and total counts per group
         agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
         agg_total = np.zeros((n_markers, n_ct), dtype=np.int64)
@@ -186,16 +218,7 @@ class ReferencePanelLoader:
         ratio_sum = np.zeros((n_markers, n_ct), dtype=np.float64)
         ratio_count = np.zeros((n_markers, n_ct), dtype=np.int64)
 
-        for beta_path in beta_paths:
-            sample_name = _beta_basename_to_sample_name(beta_path)
-            group = sample_to_group.get(sample_name)
-            if group is None:
-                # Try without _ to - replacement etc — fall back: skip silently
-                continue
-            ci = ct_to_index[group]
-            counts = _load_beta_file_to_markers(beta_path, marker_regions, cpg_index)
-            mk = counts[:, 0]
-            mn = counts[:, 1]
+        for mk, mn, ci in parsed:
             if replicate_mode == "aggregate":
                 agg_methy[:, ci] += mk
                 agg_total[:, ci] += mn
