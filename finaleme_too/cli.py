@@ -304,6 +304,24 @@ def run_cmd(
               help="Window size in bp for the auto-computed density (default: 1000).")
 @click.option("--n-bins-candidates", default="4,6,8,10,12,16",
               help="Comma-separated list of bin counts to evaluate via CV.")
+@click.option("--cv-strategy", type=click.Choice(["auto", "sample", "region", "none"]),
+              default="auto",
+              help="Cross-validation strategy for bin tuning. 'auto' (default) "
+                   "uses leave-one-sample-out when >=2 matched samples are "
+                   "available, otherwise random K-fold on rows. 'sample' forces "
+                   "leave-one-sample-out (cv_rmse=NaN with <2 samples). 'region' "
+                   "forces random K-fold on row indices — use this to get a "
+                   "finite CV estimate from a 1-sample run, but note the test "
+                   "folds share sample-level batch effects with training, so "
+                   "cv_rmse is biased low vs. true held-out-sample error. "
+                   "'none' skips CV and selects by AIC.")
+@click.option("--cv-folds", "cv_n_folds", default=10, type=int,
+              help="Number of folds for --cv-strategy=region (default 10 → "
+                   "each fold holds out ~10%% of the rows). Ignored for "
+                   "sample-level CV.")
+@click.option("--cv-seed", default=None, type=int,
+              help="Integer seed for the region-level CV shuffle. Omit for "
+                   "fresh entropy each run.")
 @click.option("--output", required=True, type=click.Path(),
               help="Output JSON path for the trained CalibrationParams.")
 @click.option("--report", required=True, type=click.Path(),
@@ -317,6 +335,9 @@ def train_calibration_cmd(
     cpg_index_path: str | None,
     region_annotation_window: int,
     n_bins_candidates: str,
+    cv_strategy: str,
+    cv_n_folds: int,
+    cv_seed: int | None,
     output: str,
     report: str,
     threads: int,
@@ -337,6 +358,9 @@ def train_calibration_cmd(
         cpg_index=cpg_index_path,
         region_annotation_window=region_annotation_window,
         threads=threads,
+        cv_strategy=cv_strategy,
+        cv_n_folds=cv_n_folds,
+        cv_seed=cv_seed,
     )
     click.echo(
         f"finaleme-too: trained calibration with B={params.n_bins} → {output} (report: {report})"

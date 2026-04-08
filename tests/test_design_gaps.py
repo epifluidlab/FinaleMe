@@ -277,7 +277,10 @@ def test_gap7_per_sample_tsv_has_mean_dispersion(tmp_path: Path):
     r = _mk_decon_result("s1", unknown=0.05, residuals=np.zeros(5))
     out = tmp_path / "s1.too.tsv"
     write_per_sample_too(r, out)
-    df = pd.read_csv(out, sep="\t")
+    # .too.tsv files now ship with a ``#``-prefixed header block documenting
+    # the counter-intuitive p_goodness / p_detection semantics, so parsing
+    # requires ``comment='#'``.
+    df = pd.read_csv(out, sep="\t", comment="#")
     # mean_dispersion must be present AND populated with real values for
     # the real cell types (NaN is fine for the Unknown row)
     assert "mean_dispersion" in df.columns

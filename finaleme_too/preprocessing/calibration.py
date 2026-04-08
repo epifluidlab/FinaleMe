@@ -13,6 +13,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ import pandas as pd
 
 from finaleme_too.exceptions import InvalidCalibrationError
 from finaleme_too.io.methylation_loader import MarkerObservations
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -411,6 +414,12 @@ def _parse_finaleme_prediction(path: Path, sample_id: str) -> pd.DataFrame:
     Expected header:
         #chr start end methy_perc_predict methy_count_predict total_count_predict
             methy_perc_obs methy_count_obs total_count_obs
+
+    Rows where ``methy_count_predict`` exceeds ``total_count_predict`` (which
+    can happen with floating-point rounding of fractional counts or with
+    malformed files) are clamped so that ``0 <= methy <= total``. This
+    matches the defensive clamp the Bis-SNP parser applies and prevents
+    downstream ``beta > 1`` values that would poison the calibration.
     """
     with _open_text(path) as fh:
         df = pd.read_csv(
@@ -431,14 +440,20 @@ def _parse_finaleme_prediction(path: Path, sample_id: str) -> pd.DataFrame:
                 "total_count_predict": np.float64,
             },
         )
+    methy = df["methy_count_predict"].round().astype(np.int64).to_numpy()
+    total = df["total_count_predict"].round().astype(np.int64).to_numpy()
+    # Enforce 0 <= methy <= total.  Negative totals should never occur but
+    # defensively clamp them to zero along with the upper bound.
+    total = np.maximum(total, 0)
+    methy = np.clip(methy, 0, total)
     out = pd.DataFrame(
         {
             "sample_id": sample_id,
             "chrom": df["chrom"],
             "start": df["start"],
             "end": df["end"],
-            "methylated_count": df["methy_count_predict"].round().astype(np.int64),
-            "total_count": df["total_count_predict"].round().astype(np.int64),
+            "methylated_count": methy,
+            "total_count": total,
         }
     )
     return out
@@ -618,8 +633,30 @@ def train_calibration(
     cpg_index: str | Path | None = None,
     region_annotation_window: int = 1000,
     threads: int = 1,
+    cv_strategy: str = "auto",
+    cv_n_folds: int = 10,
+    cv_seed: int | None = None,
 ) -> CalibrationParams:
     """Train per-bin calibration parameters from matched WGBS / FinaleMe samples.
+
+    ``cv_strategy`` controls how bin tuning (``tune_n_bins``) performs
+    cross-validation:
+
+      * ``"auto"`` (default) — leave-one-sample-out when the matched set
+        contains ``>=2`` samples, otherwise random region K-fold. This
+        gives a finite ``cv_rmse`` even for 1-sample runs so the best
+        ``n_bins`` can be chosen on actual CV error instead of AIC.
+      * ``"sample"`` — always leave-one-sample-out; ``cv_rmse`` is NaN
+        when fewer than 2 samples are available.
+      * ``"region"`` — always random K-fold on row indices. Works with
+        any number of samples but estimates generalization to *new
+        regions within the same samples*, not to a new sample, so the
+        reported ``cv_rmse`` is optimistically biased compared to true
+        leave-one-sample-out CV.
+      * ``"none"`` — skip CV; ``tune_n_bins`` falls back to AIC.
+
+    ``cv_n_folds`` is the K for region-level CV (default 10). ``cv_seed``
+    makes the region shuffle reproducible between runs.
 
     Each of ``matched_wgbs`` / ``matched_finaleme`` can be:
       * a **legacy joined TSV** with columns ``sample_id chrom start end
@@ -697,12 +734,40 @@ def train_calibration(
         merged["cpg_density"] = 0.0
     merged["cpg_density"] = merged["cpg_density"].fillna(0.0)
 
-    wgbs_beta = (
-        merged["methylated_count_wgbs"] / merged["total_count_wgbs"].clip(lower=1)
-    ).to_numpy(dtype=np.float64)
-    fme_beta = (
-        merged["methylated_count_fme"] / merged["total_count_fme"].clip(lower=1)
-    ).to_numpy(dtype=np.float64)
+    # Drop rows where either side has zero coverage or any NaN count.
+    # The previous implementation used `total_count.clip(lower=1)` which
+    # silently turned `k/0` into `k/1` — a mathematically invalid beta
+    # that poisoned the regression, RMSE, AIC, and bin tuning. Per math
+    # doc §6, calibration should only train on markers where both WGBS
+    # and FinaleMe have non-zero coverage.
+    valid_rows = (
+        merged["total_count_wgbs"].fillna(0).to_numpy() > 0
+    ) & (
+        merged["total_count_fme"].fillna(0).to_numpy() > 0
+    ) & merged["methylated_count_wgbs"].notna().to_numpy() & merged[
+        "methylated_count_fme"
+    ].notna().to_numpy()
+    n_dropped = int(valid_rows.size - valid_rows.sum())
+    if n_dropped > 0:
+        log.info(
+            "Dropped %d / %d rows with zero coverage on either side before "
+            "calibration training",
+            n_dropped,
+            int(valid_rows.size),
+        )
+    merged = merged.loc[valid_rows].reset_index(drop=True)
+    if merged.empty:
+        raise InvalidCalibrationError(
+            "No rows with non-zero coverage on both WGBS and FinaleMe sides "
+            "after the join. Check coverage and overlap of the input files."
+        )
+
+    wgbs_k = merged["methylated_count_wgbs"].to_numpy(dtype=np.float64)
+    wgbs_n = merged["total_count_wgbs"].to_numpy(dtype=np.float64)
+    fme_k = merged["methylated_count_fme"].to_numpy(dtype=np.float64)
+    fme_n = merged["total_count_fme"].to_numpy(dtype=np.float64)
+    wgbs_beta = (wgbs_k / wgbs_n).astype(np.float64)
+    fme_beta = (fme_k / fme_n).astype(np.float64)
     density = merged["cpg_density"].to_numpy(dtype=np.float64)
     sample_ids = merged["sample_id"].astype(str).to_numpy()
 
@@ -713,14 +778,28 @@ def train_calibration(
         sample_ids=sample_ids,
         n_bins_candidates=n_bins_candidates,
         threads=threads,
+        wgbs_k=wgbs_k,
+        wgbs_n=wgbs_n,
+        cv_strategy=cv_strategy,
+        cv_n_folds=cv_n_folds,
+        cv_seed=cv_seed,
     )
     best_B = int(tune_result["selected_n_bins"])
+    # Record which CV strategy actually drove selection — "auto" will have
+    # been resolved to "sample" or "region" by now; look at the first
+    # candidate's recorded strategy (they're all the same).
+    effective_strategy = (
+        tune_result["candidates"][0].get("cv_strategy", cv_strategy)
+        if tune_result.get("candidates") else cv_strategy
+    )
 
     final = fit_calibration(
         finaleme_beta=fme_beta,
         wgbs_beta=wgbs_beta,
         cpg_density=density,
         n_bins=best_B,
+        wgbs_k=wgbs_k,
+        wgbs_n=wgbs_n,
     )
 
     params = CalibrationParams(
@@ -733,17 +812,72 @@ def train_calibration(
             "n_training_samples": int(len(np.unique(sample_ids))),
             "n_observations": int(len(merged)),
             "n_bins_candidates": list(n_bins_candidates),
+            "cv_strategy_requested": cv_strategy,
+            "cv_strategy_effective": effective_strategy,
+            "cv_n_folds": int(cv_n_folds),
+            "cv_seed": cv_seed,
             "tune_result": tune_result,
         },
     )
     params.save(out_params)
 
+    # Pull the selected candidate's CV-aggregated metrics into a top-level
+    # block so readers of the report can see the full/test-set correlation
+    # comparison without digging through the candidate list.
+    selected_candidate: dict | None = None
+    for cand in tune_result.get("candidates", []):
+        if int(cand.get("n_bins", -1)) == best_B:
+            selected_candidate = cand
+            break
+
+    correlation_summary = {
+        "full_dataset": {
+            "pearson_raw": final.overall.get("pearson_raw"),
+            "pearson_calibrated": final.overall.get("pearson_calibrated"),
+            "spearman_raw": final.overall.get("spearman_raw"),
+            "spearman_calibrated": final.overall.get("spearman_calibrated"),
+            "n_markers": final.overall.get("n_markers"),
+        },
+        "cv_test_set": {
+            "pearson_raw": (
+                selected_candidate.get("cv_pearson_raw")
+                if selected_candidate else float("nan")
+            ),
+            "pearson_calibrated": (
+                selected_candidate.get("cv_pearson_calibrated")
+                if selected_candidate else float("nan")
+            ),
+            "spearman_raw": (
+                selected_candidate.get("cv_spearman_raw")
+                if selected_candidate else float("nan")
+            ),
+            "spearman_calibrated": (
+                selected_candidate.get("cv_spearman_calibrated")
+                if selected_candidate else float("nan")
+            ),
+            "cv_rmse": (
+                selected_candidate.get("cv_rmse")
+                if selected_candidate else float("nan")
+            ),
+            "n_folds": (
+                selected_candidate.get("n_folds")
+                if selected_candidate else 0
+            ),
+            "cv_strategy": effective_strategy,
+        },
+    }
+
     report = {
         "calibration_version": "1.0",
         "n_training_samples": int(len(np.unique(sample_ids))),
         "n_bins": best_B,
+        "cv_strategy_requested": cv_strategy,
+        "cv_strategy_effective": effective_strategy,
+        "cv_n_folds": int(cv_n_folds),
+        "cv_seed": cv_seed,
         "overall_metrics": final.overall,
         "per_bin_metrics": final.per_bin_metrics,
+        "correlation_summary": correlation_summary,
         "candidates": tune_result["candidates"],
     }
     write_calibration_report(report, out_report)

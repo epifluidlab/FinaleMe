@@ -1607,3 +1607,93 @@ def test_pipeline_writes_consistent_qc_summary_for_high_coverage_sample(tmp_path
         # Allow ±5% slack for the tier-filter and bootstrap noise.
         assert abs(float(mc) - expected_cov) < 2.0, \
             f"mean_coverage {mc} not close to expected {expected_cov}"
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — .too.tsv header comment documenting p_goodness / p_detection
+# ---------------------------------------------------------------------------
+# User feedback: p_goodness=1.0 with reliability=HIGH is confusing because
+# the naming implies "low p-value = significant". Added a #-prefixed header
+# block at the top of every .too.tsv explaining that HIGH = GOOD for both
+# columns. These tests pin (a) that the header exists, (b) that it actually
+# names both fields and the "high = good" convention, and (c) that pandas
+# can still parse the body when comment='#' is passed.
+
+
+def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
+    """The .too.tsv file must carry a ``#``-prefixed header block that
+    explicitly documents the counter-intuitive p_goodness / p_detection
+    interpretation. Regression guard so future refactors don't silently
+    drop the explainer."""
+    from finaleme_too.config import CoverageTier
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.io.output_writer import write_per_sample_too
+
+    result = DeconvolutionResult(
+        sample_id="hdr_probe",
+        cell_types=["CT1", "CT2"],
+        proportions=np.array([0.5, 0.3, 0.2]),
+        ci_lower=np.array([0.45, 0.25, 0.15]),
+        ci_upper=np.array([0.55, 0.35, 0.25]),
+        p_goodness=np.array([1.0, 0.98]),
+        p_detection=np.array([1.0, 0.97, 0.9]),
+        reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
+        n_markers=np.array([10, 10], dtype=np.int32),
+        coverage_tier=CoverageTier.HIGH,
+        qc_flags=[],
+        mean_dispersion=np.array([50.0, 50.0]),
+        mean_coverage=40.0,
+        n_markers_used=10,
+        overall_qc="PASS",
+    )
+    out = tmp_path / "hdr_probe.too.tsv"
+    write_per_sample_too(result, out)
+
+    text = out.read_text()
+    head_lines = [line for line in text.splitlines() if line.startswith("#")]
+    assert head_lines, "Expected a #-prefixed header block at the top of .too.tsv"
+
+    head_text = "\n".join(head_lines)
+    # The header must mention both p-value fields and the "high = good"
+    # convention so readers don't mis-interpret the output.
+    assert "p_goodness" in head_text
+    assert "p_detection" in head_text
+    # Some variant of "HIGH = GOOD" must appear (case-insensitive).
+    assert "HIGH = GOOD" in head_text or "high = good" in head_text.lower()
+
+
+def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
+    """pandas.read_csv with ``comment='#'`` must produce the same data
+    columns as before the header block was added."""
+    from finaleme_too.config import CoverageTier
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.io.output_writer import write_per_sample_too
+
+    result = DeconvolutionResult(
+        sample_id="parse_probe",
+        cell_types=["Neutrophil", "Adipocyte"],
+        proportions=np.array([0.6, 0.3, 0.1]),
+        ci_lower=np.array([0.55, 0.25, 0.05]),
+        ci_upper=np.array([0.65, 0.35, 0.15]),
+        p_goodness=np.array([0.87, 0.91]),
+        p_detection=np.array([0.99, 0.97, 0.85]),
+        reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
+        n_markers=np.array([42, 37], dtype=np.int32),
+        coverage_tier=CoverageTier.HIGH,
+        qc_flags=[],
+        mean_dispersion=np.array([50.0, 60.0]),
+        mean_coverage=30.0,
+        n_markers_used=79,
+        overall_qc="PASS",
+    )
+    out = tmp_path / "parse_probe.too.tsv"
+    write_per_sample_too(result, out)
+
+    df = pd.read_csv(out, sep="\t", comment="#")
+    assert list(df["cell_type"]) == ["Neutrophil", "Adipocyte", "Unknown"]
+    # Body values must match the values we just wrote.
+    assert abs(float(df["proportion"].iloc[0]) - 0.6) < 1e-4
+    assert abs(float(df["p_goodness"].iloc[0]) - 0.87) < 1e-4
+    assert abs(float(df["p_detection"].iloc[0]) - 0.99) < 1e-4
+    # Unknown row must have NaN p_goodness (no goodness-of-fit for unknown).
+    assert np.isnan(float(df["p_goodness"].iloc[-1]))

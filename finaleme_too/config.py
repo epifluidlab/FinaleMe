@@ -66,6 +66,14 @@ class CalibrationConfig:
     calibration_file: str | None = None
     n_density_bins: int = 8
     use_default: bool = True  # use shipped default if calibration_file is None
+    # CV strategy used during bin tuning (train-calibration only).
+    #   "auto"   — leave-one-sample-out when >=2 samples, else random region K-fold
+    #   "sample" — always leave-one-sample-out (returns NaN cv_rmse if <2 samples)
+    #   "region" — always random K-fold on row indices (works with 1 sample)
+    #   "none"   — skip CV, select by AIC / in-sample RMSE only
+    cv_strategy: str = "auto"
+    cv_n_folds: int = 10  # K for region-level CV (ignored for sample mode)
+    cv_seed: int | None = None  # reproducible region-level shuffle
 
 
 @dataclass
