@@ -280,6 +280,7 @@ def fit_calibration(
     n_bins: int,
     wgbs_k: np.ndarray | None = None,
     wgbs_n: np.ndarray | None = None,
+    compute_correlations: bool = True,
 ) -> CalibrationFitResult:
     """Fit a per-bin calibration model. Math doc §6.1-§6.3.
 
@@ -287,6 +288,14 @@ def fit_calibration(
     are provided, per-bin dispersion is estimated by beta-binomial MLE on
     the calibration residuals (math doc §6.2). When they are omitted, the
     old residual-variance moment estimate is used for backward compatibility.
+
+    ``compute_correlations`` toggles the per-bin and overall Pearson /
+    Spearman computation. Set to ``False`` when the fit is a throwaway CV
+    training-fold fit — the per-bin correlations aren't used downstream in
+    that case (the fold's reported test-set correlations come from
+    ``_cv_fold_task``, not from here) and ``spearmanr`` alone was ~25% of
+    total runtime. The final ``train_calibration`` call keeps the default
+    ``True`` so the report still carries the per-bin correlations.
     """
     edges = _quantile_bin_edges(cpg_density, n_bins)
     bin_idx = _bin_indices(cpg_density, edges)
@@ -331,18 +340,29 @@ def fit_calibration(
         # Goodness metrics
         pred = _expit(a_b * _logit(np.clip(finaleme_beta[mask], 1e-6, 1 - 1e-6)) + c_b)
         truth = wgbs_beta[mask]
-        raw_in_bin = finaleme_beta[mask]
         ss_res = float(np.sum((truth - pred) ** 2))
         ss_tot = float(np.sum((truth - truth.mean()) ** 2))
         r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
         mae = float(np.mean(np.abs(pred - truth)))
-        hl_p = compute_hosmer_lemeshow(truth, pred, n_groups=10)
-        # Per-bin correlations before/after calibration. Note: within a
-        # single bin, Spearman is invariant to the transform when a_b > 0
-        # (monotonic maps preserve ranks), so spearman_raw ≈ spearman_calibrated
-        # is expected per-bin; it's the across-bin Spearman that can change.
-        pearson_raw_b, spearman_raw_b = _pearson_spearman(truth, raw_in_bin)
-        pearson_cal_b, spearman_cal_b = _pearson_spearman(truth, pred)
+        # Per-bin correlations + Hosmer-Lemeshow are only worth computing for
+        # the final user-facing fit — spearmanr alone was ~25% of CV fold
+        # runtime and the output isn't consumed during CV.
+        if compute_correlations:
+            raw_in_bin = finaleme_beta[mask]
+            hl_p = compute_hosmer_lemeshow(truth, pred, n_groups=10)
+            # Per-bin correlations before/after calibration. Note: within a
+            # single bin, Spearman is invariant to the transform when
+            # a_b > 0 (monotonic maps preserve ranks), so spearman_raw ≈
+            # spearman_calibrated per-bin; it's the across-bin Spearman
+            # that can change.
+            pearson_raw_b, spearman_raw_b = _pearson_spearman(truth, raw_in_bin)
+            pearson_cal_b, spearman_cal_b = _pearson_spearman(truth, pred)
+        else:
+            hl_p = float("nan")
+            pearson_raw_b = float("nan")
+            pearson_cal_b = float("nan")
+            spearman_raw_b = float("nan")
+            spearman_cal_b = float("nan")
         per_bin.append(
             {
                 "bin_id": b,
@@ -389,12 +409,18 @@ def fit_calibration(
     # Pearson captures linear agreement (changes noticeably after the
     # logit-space transform), Spearman captures rank/monotonic agreement
     # (can change across bins because different bins apply different maps).
-    pearson_raw, spearman_raw = _pearson_spearman(
-        wgbs_beta[valid], finaleme_beta[valid]
-    )
-    pearson_cal, spearman_cal = _pearson_spearman(
-        wgbs_beta[valid], overall_pred[valid]
-    )
+    if compute_correlations:
+        pearson_raw, spearman_raw = _pearson_spearman(
+            wgbs_beta[valid], finaleme_beta[valid]
+        )
+        pearson_cal, spearman_cal = _pearson_spearman(
+            wgbs_beta[valid], overall_pred[valid]
+        )
+    else:
+        pearson_raw = float("nan")
+        pearson_cal = float("nan")
+        spearman_raw = float("nan")
+        spearman_cal = float("nan")
     overall = {
         "rmse": rmse,
         "mae": mae_all,
@@ -446,6 +472,9 @@ def _cv_fold_task(
     """
     if int(np.sum(train_mask)) < 10 or int(np.sum(test_mask)) < 5:
         return None
+    # Skip the training-fold's own per-bin/overall correlations — they're
+    # discarded. The only test-set correlations that make it into the
+    # report are computed below on ``fme_test`` / ``wgbs_test`` / ``pred``.
     fit = fit_calibration(
         finaleme_beta[train_mask],
         wgbs_beta[train_mask],
@@ -453,6 +482,7 @@ def _cv_fold_task(
         n_bins=n_bins,
         wgbs_k=wgbs_k[train_mask] if wgbs_k is not None else None,
         wgbs_n=wgbs_n[train_mask] if wgbs_n is not None else None,
+        compute_correlations=False,
     )
     bin_idx = _bin_indices(cpg_density[test_mask], fit.bin_edges)
     fme_test = finaleme_beta[test_mask]
