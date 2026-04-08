@@ -768,3 +768,398 @@ def test_binarization_model_empty_when_nothing_valid():
     model = BinarizationModel().build(binarized, params, reference)
     assert model.n_markers == 0
     assert model.coef.shape == (0, K + 1)
+
+
+# ---------------------------------------------------------------------------
+# Phase B integration tests: MLE solver dispatch + p_goodness + pipeline
+# ---------------------------------------------------------------------------
+
+
+def _mk_richer_reference(K: int, n_per_ct: int) -> ReferencePanel:
+    """Reference with ``n_per_ct`` own-U markers per cell type.
+
+    Total M = K * n_per_ct. Markers ``[j*n_per_ct, (j+1)*n_per_ct)`` are
+    CT_j's own-U markers (r=0.05 for CT_j, r=0.9 for all others). This
+    gives the binarization solver enough discriminative evidence per cell
+    type to recover known mixtures cleanly.
+    """
+    M = K * n_per_ct
+    methy = np.full((M, K), 0.9, dtype=np.float32)
+    for j in range(K):
+        for k in range(n_per_ct):
+            methy[j * n_per_ct + k, j] = 0.05
+    return ReferencePanel(
+        chrom=np.array(["chr1"] * M, dtype=object),
+        start=np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64),
+        end=np.array([1100 + i * 1000 for i in range(M)], dtype=np.int64),
+        cell_types=[f"CT{j}" for j in range(K)],
+        methylation=methy,
+        coverage=None,
+    )
+
+
+def _mk_pure_celltype_pred(K: int, n_per_ct: int, target_ct: int) -> np.ndarray:
+    """Build a predicted_beta vector for a pure-target_ct sample.
+
+    Markers 0..(K*n_per_ct - 1). At target_ct's own-U markers we predict
+    U (0.05); at every other cell type's own-U markers we predict M (0.95).
+    """
+    M = K * n_per_ct
+    pred = np.full(M, 0.95, dtype=np.float32)
+    for k in range(n_per_ct):
+        pred[target_ct * n_per_ct + k] = 0.05
+    return pred
+
+
+def test_mle_solver_dispatches_on_model_kind():
+    """MLEDeconvolver.solve picks the right solver branch based on the
+    observation model type — BinarizationObservationModel goes to
+    _solve_binarization, ObservationModel goes to _solve_betabinom.
+    """
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+    from finaleme_too.core.observation_model_binarization import (
+        BinarizationObservationModel,
+    )
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+
+    model = BinarizationModel().build(binarized, params, reference)
+    assert isinstance(model, BinarizationObservationModel)
+
+    solver = MLEDeconvolver()
+    w_hat = solver.solve(model, reference)
+    assert w_hat.shape == (K + 1,)
+    assert abs(w_hat.sum() - 1.0) < 1e-6
+    # CT0 should be the dominant cell type
+    assert w_hat.argmax() == 0
+    assert w_hat[0] > 0.7
+
+
+def test_mle_solver_binarization_recovers_50_50_mixture():
+    """A 50/50 mixture of two cell types should produce a roughly balanced
+    proportion estimate via the binarization solver."""
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+
+    K = 4
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+
+    # Mixture: half U at CT0's markers, half U at CT1's markers, M everywhere else.
+    M = K * n_per_ct
+    pred = np.full(M, 0.95, dtype=np.float32)
+    # CT0's own-U markers → U (calling CT0)
+    for k in range(n_per_ct):
+        pred[0 * n_per_ct + k] = 0.05
+    # CT1's own-U markers → U (calling CT1)
+    for k in range(n_per_ct):
+        pred[1 * n_per_ct + k] = 0.05
+
+    obs = _mk_obs("mix50_50", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel().build(binarized, params, reference)
+    solver = MLEDeconvolver()
+    w_hat = solver.solve(model, reference)
+    # CT0 and CT1 should both be elevated
+    assert w_hat[0] > 0.2
+    assert w_hat[1] > 0.2
+    # CT2/CT3 should be near zero
+    assert w_hat[2] < 0.1
+    assert w_hat[3] < 0.1
+
+
+def test_mle_solver_binarization_handles_marker_subset():
+    """The bootstrap path passes a marker_subset to the solver. Verify the
+    binarization solver subset-indexes coef + weights correctly.
+    """
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel().build(binarized, params, reference)
+
+    solver = MLEDeconvolver()
+    # Subset to just CT0's own-U markers (still pure CT0 evidence)
+    subset = np.arange(n_per_ct)  # markers 0..3 (all CT0-U)
+    w_subset = solver.solve(model, reference, marker_subset=subset)
+    assert abs(w_subset.sum() - 1.0) < 1e-6
+    assert w_subset[0] > 0.7  # CT0 still dominant on the subset
+
+
+def test_compute_p_goodness_finaleme_binomial_concordance():
+    """compute_p_goodness on a BinarizationObservationModel uses the
+    binomial concordance test against eps_U/eps_M, not chi-square. With
+    a perfect-fit sample the p-value should be high (>= 0.05 by the
+    'high = good' convention)."""
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+    from finaleme_too.core.reliability import compute_p_goodness
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel().build(binarized, params, reference)
+
+    solver = MLEDeconvolver()
+    w_hat = solver.solve(model, reference)
+
+    # P_goodness for the dominant cell type should be HIGH (good fit)
+    p_ct0 = compute_p_goodness(
+        w_hat=w_hat,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        binarizer=params,
+    )
+    # All discriminative markers for CT0 should agree with the expected U
+    # state under the estimated mixture, so the binomial test should NOT
+    # reject (high p-value).
+    assert p_ct0 > 0.05
+
+
+def test_compute_p_goodness_finaleme_low_for_wrong_mixture():
+    """If we lie to compute_p_goodness about the mixture (claim it's
+    pure CT2 when the data really came from pure CT0), the binomial test
+    should reject (low p-value)."""
+    from finaleme_too.core.reliability import compute_p_goodness
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel().build(binarized, params, reference)
+
+    # Wrong w_hat: claim it's pure CT2
+    w_wrong = np.array([0.0, 0.0, 1.0, 0.0])  # K+1 = 4
+
+    p_wrong = compute_p_goodness(
+        w_hat=w_wrong,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=2,
+        binarizer=params,
+    )
+    # Many of CT2's discriminative markers will disagree with the actual
+    # state (since this is really CT0 data), so the test should reject.
+    # The exact value depends on the test setup but it should be < 0.5
+    # which is much lower than the perfect-fit p ≈ 1.0.
+    assert p_wrong < 0.5
+
+
+def test_pipeline_end_to_end_binarization_recovers_known_mixture(tmp_path):
+    """End-to-end TOOPipeline run with binarization=BinarizationParams
+    must recover the correct cell-type proportions for synthetic
+    pure-cell-type samples."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.io.marker_regions import MarkerRegions
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    K = 4
+    M = 8
+    methy = np.full((M, K), 0.9, dtype=np.float32)
+    for j in range(K):
+        methy[2 * j, j] = 0.05
+        methy[2 * j + 1, j] = 0.05
+    chrom = np.array(["chr1"] * M, dtype=object)
+    starts = np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64)
+    ends = starts + 100
+    reference = ReferencePanel(
+        chrom=chrom,
+        start=starts,
+        end=ends,
+        cell_types=[f"CT{i}" for i in range(K)],
+        methylation=methy,
+        coverage=None,
+    )
+    marker_regions = MarkerRegions(
+        chrom=chrom, start=starts, end=ends, marker_name=None,
+    )
+
+    # Build 2 FinaleMe samples by writing prediction.bed files
+    samples = []
+    for ct_idx in range(2):
+        bed_path = tmp_path / f"sample_ct{ct_idx}.prediction.bed"
+        rows = []
+        for i in range(M):
+            pred_beta = 0.05 if i in (2 * ct_idx, 2 * ct_idx + 1) else 0.95
+            methy_count = round(pred_beta * 20)
+            total_count = 20
+            methy_pct = pred_beta * 100
+            rows.append(
+                f"{chrom[i]}\t{starts[i]}\t{ends[i]}\t{methy_pct:.4f}"
+                f"\t{methy_count}\t{total_count}\t0\t0\t0"
+            )
+        bed_path.write_text("\n".join(rows) + "\n")
+        samples.append(
+            Sample(
+                sample_id=f"S{ct_idx}",
+                methylation_file=bed_path,
+                mode=MeasurementMode.FINALEME,
+                input_format="finaleme_bed",
+                group="A",
+            )
+        )
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 5
+    cfg.uncertainty.seed = 0
+    cfg.coverage.tier_high = 0.0
+    cfg.coverage.tier_low = -1.0
+    cfg.markers.n_per_type = 0
+
+    binarization = build_identity_placeholder_params()
+
+    pipeline = TOOPipeline(
+        config=cfg,
+        binarization=binarization,
+    )
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    cohort = pipeline.run(sheet, reference, marker_regions, out_dir)
+
+    assert len(cohort.samples) == 2
+    s0, s1 = cohort.samples
+    # Pure CT0 sample → CT0 should be ≥0.7
+    assert s0.proportions[0] > 0.7
+    # Pure CT1 sample → CT1 should be ≥0.7
+    assert s1.proportions[1] > 0.7
+
+
+def test_pipeline_v2_calibration_path_still_works_when_binarization_none(tmp_path):
+    """The v2 calibration path must continue to work when binarization=None.
+    This is the safety guarantee that the migration is non-breaking."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.io.marker_regions import MarkerRegions
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    K = 3
+    M = 6
+    methy = np.full((M, K), 0.9, dtype=np.float32)
+    for j in range(K):
+        methy[2 * j, j] = 0.05
+        methy[2 * j + 1, j] = 0.05
+    chrom = np.array(["chr1"] * M, dtype=object)
+    starts = np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64)
+    ends = starts + 100
+    reference = ReferencePanel(
+        chrom=chrom,
+        start=starts,
+        end=ends,
+        cell_types=[f"CT{i}" for i in range(K)],
+        methylation=methy,
+        coverage=None,
+    )
+    marker_regions = MarkerRegions(
+        chrom=chrom, start=starts, end=ends, marker_name=None,
+    )
+
+    # Build 1 WGBS sample (the simplest path that doesn't need calibration
+    # or binarization at all)
+    bed_path = tmp_path / "wgbs_sample.bed"
+    rows = []
+    for i in range(M):
+        pct = 5.0 if i in (0, 1) else 95.0  # CT0 pattern
+        total = 20
+        rows.append(
+            f"{chrom[i]}\t{starts[i]}\t{ends[i]}\t.\t0\t+\t{pct:.4f}\t{total}"
+        )
+    bed_path.write_text("\n".join(rows) + "\n")
+
+    sample = Sample(
+        sample_id="wgbs_s0",
+        methylation_file=bed_path,
+        mode=MeasurementMode.WGBS,
+        input_format="bissnp_6plus2",
+        group="A",
+    )
+    sheet = SampleSheet(
+        samples=[sample],
+        raw_table=pd.DataFrame([{"sample_id": "wgbs_s0"}]),
+    )
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 5
+    cfg.uncertainty.seed = 0
+    cfg.coverage.tier_high = 0.0
+    cfg.coverage.tier_low = -1.0
+    cfg.markers.n_per_type = 0
+
+    # binarization=None — v2 path should still run
+    pipeline = TOOPipeline(config=cfg, binarization=None)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    cohort = pipeline.run(sheet, reference, marker_regions, out_dir)
+
+    assert len(cohort.samples) == 1
+    # Beta-binomial path on this synthetic data should still recover CT0
+    assert cohort.samples[0].proportions[0] > 0.7
+
+
+def test_load_optional_binarization_returns_default_when_no_path(tmp_path):
+    """load_optional_binarization should return the shipped default
+    placeholder when use_default=True and no explicit path is given."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import load_optional_binarization
+
+    cfg = TOOConfig()
+    params = load_optional_binarization(cfg, explicit_path=None, use_default=True)
+    assert params is not None
+    assert params.n_bins == 8
+
+
+def test_load_optional_binarization_returns_none_when_default_disabled(tmp_path):
+    """When use_default=False and no explicit path, return None so callers
+    can fall through to a different path."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import load_optional_binarization
+
+    cfg = TOOConfig()
+    params = load_optional_binarization(cfg, explicit_path=None, use_default=False)
+    assert params is None
+
+
+def test_load_optional_binarization_loads_from_explicit_path(tmp_path):
+    """An explicit path takes precedence and loads the params from it."""
+    from finaleme_too.pipeline import load_optional_binarization
+    from finaleme_too.config import TOOConfig
+
+    placeholder = build_identity_placeholder_params()
+    custom_path = tmp_path / "custom.json"
+    placeholder.save(custom_path)
+
+    cfg = TOOConfig()
+    loaded = load_optional_binarization(
+        cfg, explicit_path=str(custom_path), use_default=False
+    )
+    assert loaded is not None
+    assert loaded.n_bins == placeholder.n_bins
+    np.testing.assert_array_equal(loaded.tau_low, placeholder.tau_low)

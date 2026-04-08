@@ -88,7 +88,25 @@ class CohortResult:
 
 
 class TOOPipeline:
-    """End-to-end TOO pipeline (Phase A + B scope: P0 + P1)."""
+    """End-to-end TOO pipeline (Phase A + B scope: P0 + P1).
+
+    The FinaleMe path supports two coexisting observation models:
+
+    * **v2 (continuous calibration)** — kept for backward compatibility.
+      Pass ``calibration=CalibrationParams(...)`` and the pipeline runs
+      ``apply_calibration`` then ``BetaBinomialModel.build`` on the
+      calibrated counts.
+    * **v3 (context-dependent binarization)** — preferred. Pass
+      ``binarization=BinarizationParams(...)`` and the pipeline runs
+      ``apply_binarization`` then ``BinarizationModel.build`` and
+      dispatches to the binomial-with-error-rates SLSQP path inside
+      ``MLEDeconvolver.solve``.
+
+    When both ``calibration`` and ``binarization`` are passed, the v3
+    path takes precedence and ``calibration`` is ignored. WGBS-mode
+    samples always use the beta-binomial path regardless of which
+    FinaleMe params are present.
+    """
 
     def __init__(
         self,
@@ -97,16 +115,23 @@ class TOOPipeline:
         region_annotations: pd.DataFrame | None = None,
         group_comparison_spec: str | None = None,
         cpg_index: dict | None = None,
+        binarization=None,  # BinarizationParams | None — v3 FinaleMe path
     ):
         from finaleme_too.config import SolverMethod
+        from finaleme_too.core.observation_model_binarization import BinarizationModel
 
         self.config = config
         self.calibration = calibration
+        self.binarization = binarization
         self.region_annotations = region_annotations
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
         self.deconvolver = MLEDeconvolver()
         self.fragment_deconvolver = FragmentLevelDeconvolver()
+        # v3 binarization observation-model builder. Cheap to construct
+        # whether or not binarization is provided; the actual dispatch in
+        # _deconvolve_sample only uses it when self.binarization is not None.
+        self._binarization_builder = BinarizationModel()
 
         # Decouple uncertainty source from the point-estimate solver.
         # ``uncertainty.method`` selects bootstrap / bayesian / both / none;
@@ -461,8 +486,19 @@ class TOOPipeline:
         marker_regions: MarkerRegions,
         cpg_index: dict | None,
     ) -> MarkerObservations:
-        """Phase D: load methylation data and apply FinaleMe calibration only.
+        """Phase D: load methylation data and apply FinaleMe preprocessing.
 
+        FinaleMe-mode samples take one of two preprocessing paths:
+
+        * **v3 binarization** (preferred) when ``self.binarization`` is set —
+          calls ``apply_binarization`` which classifies each marker into
+          U / M / Ambiguous / Excluded and writes ``called_state`` and
+          ``context_bin`` onto the returned ``MarkerObservations``.
+        * **v2 calibration** (fallback) when only ``self.calibration`` is set
+          — calls ``apply_calibration`` which rewrites ``k`` and ``n`` from
+          the calibrated beta values.
+
+        WGBS-mode samples are returned as loaded (no preprocessing).
         Coverage tier assignment, observation model construction, and
         deconvolution are deferred to ``_deconvolve_sample`` so that batch
         correction and imputation can run in between.
@@ -478,8 +514,23 @@ class TOOPipeline:
             total_col=sample.total_col,
             cpg_index=cpg_index,
         )
-        if sample.mode == MeasurementMode.FINALEME and self.calibration is not None:
-            obs = apply_calibration(obs, self.calibration, self.region_annotations)
+        if sample.mode == MeasurementMode.FINALEME:
+            if self.binarization is not None:
+                # v3 path: classify each marker via the trained binarization
+                # model. apply_binarization writes called_state + context_bin
+                # to the returned obs but leaves k / n / predicted_beta intact,
+                # so any downstream code that still reads k/n (e.g. coverage
+                # tier assignment) keeps working.
+                from finaleme_too.preprocessing.binarization import apply_binarization
+
+                obs = apply_binarization(
+                    obs,
+                    params=self.binarization,
+                    region_annotations=self.region_annotations,
+                )
+            elif self.calibration is not None:
+                # v2 path: rewrite k from the calibrated beta value.
+                obs = apply_calibration(obs, self.calibration, self.region_annotations)
         return obs
 
     def _deconvolve_sample(
@@ -503,12 +554,35 @@ class TOOPipeline:
         """
         log.info("Deconvolving sample %s", sample.sample_id)
 
+        # Whether the v3 binarization path is active for THIS sample. Both
+        # ``self.binarization`` must be set AND the sample must be FinaleMe
+        # mode AND apply_binarization must already have run on the obs (which
+        # populates called_state). The v2 path is the fallback otherwise.
+        use_binarization = (
+            sample.mode == MeasurementMode.FINALEME
+            and self.binarization is not None
+            and obs.called_state is not None
+            and obs.context_bin is not None
+        )
+
         calibration_flag: str | None = None
-        if (
+        if use_binarization:
+            # v3 inference QC
+            from finaleme_too.preprocessing.binarization_eval import (
+                compute_inference_qc as _binarization_inference_qc,
+            )
+            qc = _binarization_inference_qc(
+                called_state=obs.called_state,
+                context_bin=obs.context_bin,
+                params=self.binarization,
+            )
+            calibration_flag = qc.get("flag")
+        elif (
             sample.mode == MeasurementMode.FINALEME
             and self.calibration is not None
             and obs.predicted_beta is not None
         ):
+            # v2 inference QC
             density_vec = self._marker_cpg_density(obs)
             qc = compute_inference_qc(
                 obs.predicted_beta,
@@ -548,14 +622,27 @@ class TOOPipeline:
         else:
             pre_impute_n_filtered = None
 
-        observation = self.observation_builder.build(
-            obs=obs_filtered,
-            reference=reference_filtered,
-            calibration=self.calibration,
-            region_annotations=self.region_annotations,
-            tier=tier,
-            coverage_cap=self.config.coverage.coverage_cap,
-        )
+        if use_binarization:
+            # v3 path: build a BinarizationObservationModel from the filtered
+            # MarkerObservations + the filtered reference. The builder
+            # internally drops Ambiguous / Excluded markers and precomputes
+            # the per-marker linear coefficient matrix the SLSQP solver needs.
+            observation = self._binarization_builder.build(
+                obs=obs_filtered,
+                binarization=self.binarization,
+                reference=reference_filtered,
+                tier=tier,
+                coverage_cap=self.config.coverage.coverage_cap,
+            )
+        else:
+            observation = self.observation_builder.build(
+                obs=obs_filtered,
+                reference=reference_filtered,
+                calibration=self.calibration,
+                region_annotations=self.region_annotations,
+                tier=tier,
+                coverage_cap=self.config.coverage.coverage_cap,
+            )
         reference = reference_filtered  # downstream code operates on the filtered reference
 
         # -------- Gap 6a: fragment-level dispatch for ULTRALOW tier --------
@@ -676,7 +763,10 @@ class TOOPipeline:
                 observation, reference, self.deconvolver, n_jobs=bootstrap_jobs
             )
 
-        # Reliability p-values per cell type
+        # Reliability p-values per cell type. compute_p_goodness dispatches
+        # internally on the observation model type — WGBS / v2 paths use
+        # chi-square, v3 binarization uses a binomial concordance test
+        # against the per-bin error rates ε_U / ε_M.
         K = reference.n_cell_types
         p_goodness = np.full(K, np.nan, dtype=np.float64)
         p_detection = np.zeros(K + 1, dtype=np.float64)
@@ -686,6 +776,7 @@ class TOOPipeline:
                 reference_methylation=reference.methylation,
                 observation=observation,
                 cell_type_index=j,
+                binarizer=self.binarization if use_binarization else None,
             )
             p_detection[j] = compute_p_detection(
                 boot.proportions_samples[:, j],
@@ -702,30 +793,50 @@ class TOOPipeline:
             reliability[j] = assign_reliability(p_goodness[j], p_detection[j])
         reliability[K] = assign_reliability(np.nan, p_detection[K])
 
-        # n_markers per cell type — count valid markers contributing to that cell type
-        valid_n = int(np.sum(observation.n > 0))
+        # n_markers per cell type — count valid markers contributing to that
+        # cell type. For WGBS / v2 paths "valid" means n > 0; for v3
+        # binarization paths it means the marker survived binarization (i.e.
+        # was called U or M and is in a usable bin).
+        if use_binarization:
+            valid_n = int(observation.n_markers)
+        else:
+            valid_n = int(np.sum(observation.n > 0))
         n_markers = np.full(K, valid_n, dtype=np.int32)
 
-        # Enriched output fields (Gap 7)
-        mean_dispersion = _per_celltype_mean_dispersion(
-            observation=observation,
-            reference_methylation=reference.methylation,
-            top_n=50,
-        )
+        # Enriched output fields (Gap 7). For the v3 binarization path
+        # "mean_dispersion" doesn't exist as such — the analogous quantity
+        # is the per-bin error rate. We report the mean ε across the cell
+        # type's discriminative markers as a stand-in so the qc_summary
+        # column stays populated.
+        if use_binarization:
+            mean_dispersion = _per_celltype_mean_error_rate(
+                observation=observation,
+                reference_methylation=reference.methylation,
+                binarizer=self.binarization,
+                top_n=50,
+            )
+        else:
+            mean_dispersion = _per_celltype_mean_dispersion(
+                observation=observation,
+                reference_methylation=reference.methylation,
+                top_n=50,
+            )
         # Mean coverage = effective depth of coverage in marker regions
         # (Σ reads * fragment_length / Σ marker_widths). Same scale as the
         # tier classification thresholds, so qc_summary.tsv's coverage_tier
-        # and mean_coverage columns are always self-consistent.
+        # and mean_coverage columns are always self-consistent. Both paths
+        # compute this from obs_filtered which always has k/n.
         mean_coverage = effective_coverage_in_markers(obs_filtered)
 
         # pct_imputed: fraction of markers where the pre-imputation n was below
         # the per-marker tier threshold but the post-imputation n is at or
-        # above it.
+        # above it. Always computed from obs_filtered (the raw counts) so the
+        # binarization path produces the same value.
         if pre_impute_n_filtered is not None and pre_impute_n_filtered.size:
-            post = np.asarray(observation.n, dtype=np.int64)
+            post = np.asarray(obs_filtered.n, dtype=np.int64)
             # Recompute the per-marker threshold vector on the filtered subset
             post_min_reads = per_marker_min_reads_vector(
-                np.asarray(observation.n, dtype=np.int64), tier
+                np.asarray(obs_filtered.n, dtype=np.int64), tier
             )
             was_low = pre_impute_n_filtered < post_min_reads
             was_lifted = was_low & (post >= post_min_reads)
@@ -733,11 +844,13 @@ class TOOPipeline:
         else:
             pct_imputed = 0.0
 
-        # Per-marker residual (mu_obs - mu_predicted) for NMF later
+        # Per-marker residual (mu_obs - mu_predicted) for NMF later. Computed
+        # from obs_filtered.k / obs_filtered.n so the residual array is
+        # the same shape regardless of which observation model is in use.
         with np.errstate(invalid="ignore", divide="ignore"):
             mu_obs = np.where(
-                observation.n > 0,
-                observation.k / np.maximum(observation.n, 1),
+                obs_filtered.n > 0,
+                obs_filtered.k / np.maximum(obs_filtered.n, 1),
                 np.nan,
             )
         mu_pred = reference.methylation @ w_hat[:K]
@@ -871,7 +984,12 @@ def _subset_marker_regions(mr: MarkerRegions, indices: np.ndarray) -> MarkerRegi
 def _subset_observations(
     obs: MarkerObservations, mask: np.ndarray
 ) -> MarkerObservations:
-    """Return a new MarkerObservations keeping only the masked markers."""
+    """Return a new MarkerObservations keeping only the masked markers.
+
+    Preserves the v3 binarization fields (``called_state`` and
+    ``context_bin``) when present so the per-marker tier filter doesn't
+    silently drop the FinaleMe binarization output.
+    """
     return MarkerObservations(
         sample_id=obs.sample_id,
         chrom=obs.chrom[mask],
@@ -883,6 +1001,16 @@ def _subset_observations(
             obs.predicted_beta[mask] if obs.predicted_beta is not None else None
         ),
         mode=obs.mode,
+        called_state=(
+            np.asarray(obs.called_state, dtype=np.uint8)[mask]
+            if obs.called_state is not None
+            else None
+        ),
+        context_bin=(
+            np.asarray(obs.context_bin, dtype=np.int32)[mask]
+            if obs.context_bin is not None
+            else None
+        ),
     )
 
 
@@ -927,6 +1055,63 @@ def _per_celltype_mean_dispersion(
         take = min(top_n, int(np.sum(valid)))
         top_idx = np.argpartition(-score, take - 1)[:take]
         out[j] = float(np.mean(observation.dispersion[top_idx]))
+    return out
+
+
+def _per_celltype_mean_error_rate(
+    observation,
+    reference_methylation: np.ndarray,
+    binarizer,
+    top_n: int = 50,
+) -> np.ndarray:
+    """Per-cell-type mean ε over the cell type's top discriminative markers.
+
+    Analog of ``_per_celltype_mean_dispersion`` for the v3 binarization
+    path. Reports the average bin error rate ``mean(ε_U_b, ε_M_b)`` over
+    the top-N discriminative markers for each cell type — small values
+    mean low classification noise at this cell type's most informative
+    markers, larger values mean noisy bins. Reported in the
+    ``mean_dispersion`` column of the per-sample TSV so the column has a
+    consistent meaning regardless of mode (smaller = better).
+    """
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    M_orig, K = R.shape
+    out = np.zeros(K, dtype=np.float64)
+
+    # Soft-binarized reference for the discrimination score (matches
+    # what compute_p_goodness uses).
+    R_binary = R.copy()
+    R_binary[R < 0.2] = 0.0
+    R_binary[R > 0.8] = 1.0
+
+    # observation.valid_mask maps the original M markers to the filtered
+    # observation arrays. We score discriminativeness over the original
+    # markers but only consider those that survived binarization.
+    if observation.n_markers == 0:
+        return out
+    valid_mask = observation.valid_mask
+    valid_to_filtered = np.cumsum(valid_mask) - 1
+
+    bin_idx_per_marker = np.asarray(observation.context_bin, dtype=np.int64)
+    eps_U_arr = np.asarray(binarizer.eps_U, dtype=np.float64)
+    eps_M_arr = np.asarray(binarizer.eps_M, dtype=np.float64)
+    mean_eps_per_marker = 0.5 * (
+        eps_U_arr[bin_idx_per_marker] + eps_M_arr[bin_idx_per_marker]
+    )
+
+    for j in range(K):
+        target = R_binary[:, j]
+        others = np.delete(R_binary, j, axis=1)
+        bg_mean = np.mean(others, axis=1)
+        score = np.where(valid_mask, np.abs(target - bg_mean), -np.inf)
+        if np.all(np.isneginf(score)):
+            out[j] = float(np.mean(mean_eps_per_marker)) if mean_eps_per_marker.size else 0.0
+            continue
+        take = min(top_n, int(np.sum(valid_mask)))
+        top_idx_orig = np.argpartition(-score, take - 1)[:take]
+        # Translate to filtered indices
+        top_idx_filtered = valid_to_filtered[top_idx_orig]
+        out[j] = float(np.mean(mean_eps_per_marker[top_idx_filtered]))
     return out
 
 
@@ -1005,7 +1190,7 @@ def load_optional_calibration(
     explicit_path: str | None,
     use_default: bool = True,
 ) -> CalibrationParams | None:
-    """Load calibration parameters JSON if available, else default, else None."""
+    """Load v2 calibration parameters JSON if available, else default, else None."""
     path = explicit_path or config.calibration.calibration_file
     if path is not None:
         return CalibrationParams.load(path)
@@ -1014,6 +1199,42 @@ def load_optional_calibration(
             return load_default_calibration()
         except Exception as exc:  # pragma: no cover
             log.warning("Could not load default calibration: %s", exc)
+            return None
+    return None
+
+
+def load_optional_binarization(
+    config: TOOConfig,
+    explicit_path: str | None,
+    use_default: bool = True,
+):
+    """Load v3 binarization parameters JSON if available, else default, else None.
+
+    Mirrors ``load_optional_calibration`` for the v3 path. Reads from
+    ``config.calibration.binarization_file`` (Phase D will rename this) when
+    no explicit path is given. Falls back to the shipped default placeholder
+    if ``use_default`` is True. Returns ``None`` when neither is available so
+    callers can branch on its absence and use the v2 path instead.
+    """
+    from finaleme_too.preprocessing.binarization import (
+        BinarizationParams,
+        load_default_binarization,
+    )
+
+    # The Phase D config rename moves binarization params to its own
+    # subsection. For Phase B we read from a getattr with fallback to keep
+    # the field name change deferrable.
+    path = explicit_path
+    if path is None:
+        cal_cfg = getattr(config, "binarization", None) or config.calibration
+        path = getattr(cal_cfg, "binarization_file", None)
+    if path is not None:
+        return BinarizationParams.load(path)
+    if use_default:
+        try:
+            return load_default_binarization()
+        except Exception as exc:  # pragma: no cover
+            log.warning("Could not load default binarization: %s", exc)
             return None
     return None
 
@@ -1031,6 +1252,7 @@ __all__ = [
     "CohortResult",
     "TOOPipeline",
     "build_reference_and_markers",
+    "load_optional_binarization",
     "load_optional_calibration",
     "load_optional_region_annotations",
 ]

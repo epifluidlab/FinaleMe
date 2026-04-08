@@ -86,11 +86,43 @@ class MLEDeconvolver:
 
     def solve(
         self,
+        model,
+        reference: "ReferencePanel",
+        marker_subset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return ŵ of length K+1 (with unknown last).
+
+        Dispatches on the observation model type:
+
+        * ``ObservationModel`` (beta-binomial, WGBS or v2 FinaleMe path)
+          → ``_solve_betabinom`` with the per-marker counts + dispersion.
+        * ``BinarizationObservationModel`` (v3 FinaleMe path) →
+          ``_solve_binarization`` with the precomputed per-marker linear
+          coefficient matrix.
+
+        The simplex constraint, bounds, SLSQP options, failure-fallback
+        scaffolding, and result post-processing are mode-independent and
+        live in ``_run_slsqp`` so both branches share them.
+        """
+        # Local import to avoid a top-level circular import (the
+        # binarization module imports MarkerObservations from io which
+        # depends on config, while deconvolution.py is imported by
+        # observation_model.py which is imported by binarization).
+        from finaleme_too.core.observation_model_binarization import (
+            BinarizationObservationModel,
+        )
+
+        if isinstance(model, BinarizationObservationModel):
+            return self._solve_binarization(model, marker_subset)
+        return self._solve_betabinom(model, reference, marker_subset)
+
+    def _solve_betabinom(
+        self,
         model: ObservationModel,
         reference: "ReferencePanel",
         marker_subset: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Return ŵ of length K+1 (with unknown last)."""
+        """Beta-binomial MLE solver (WGBS mode and v2 FinaleMe fallback)."""
         R_full = self._augmented_reference(reference)
         k_arr = model.k
         n_arr = model.n
@@ -134,6 +166,78 @@ class MLEDeconvolver:
             mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
             return -gradient_w(k, n, mu, phi_v, R, weights=w_obj)
 
+        return self._run_slsqp(
+            neg_ll, neg_grad, K_total, sample_id=model.sample_id
+        )
+
+    def _solve_binarization(
+        self,
+        model,  # BinarizationObservationModel
+        marker_subset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """v3 FinaleMe MLE solver: binomial likelihood with error rates.
+
+        The per-marker likelihood is
+
+            P(observed_state_i | w) = coef[i] @ w
+
+        which is linear in ``w``. The negative log-likelihood and gradient
+        are therefore much cheaper than the beta-binomial path (no digamma):
+
+            neg_ll(w)   = -Σ_i ω_i · log(coef[i] @ w)
+            neg_grad(w) = -(ω_i / (coef[i] @ w)) @ coef
+        """
+        coef = model.coef          # (M_valid, K+1) — already augmented with unknown
+        weights = model.weights    # (M_valid,)
+
+        if marker_subset is not None:
+            coef = coef[marker_subset]
+            weights = weights[marker_subset]
+
+        # Filter rows with NaN coefficients defensively (shouldn't happen
+        # under normal binarization but matches the betabinom guard).
+        valid = np.all(np.isfinite(coef), axis=1)
+        if int(np.sum(valid)) < coef.shape[1]:
+            uniform = np.zeros(coef.shape[1], dtype=np.float64)
+            uniform[-1] = 1.0
+            return uniform
+
+        coef_v = coef[valid]
+        w_obj = weights[valid]
+        K_total = coef_v.shape[1]
+
+        def neg_ll(w: np.ndarray) -> float:
+            p_obs = coef_v @ w
+            p_obs = np.clip(p_obs, 1e-15, 1.0)
+            return -float(np.sum(w_obj * np.log(p_obs)))
+
+        def neg_grad(w: np.ndarray) -> np.ndarray:
+            p_obs = coef_v @ w
+            p_obs = np.clip(p_obs, 1e-15, 1.0)
+            # ∂(-log p_i)/∂w_j = -coef[i,j] / p_i
+            # weighted: -ω_i · coef[i,j] / p_i
+            # sum over i: -((ω/p) @ coef)
+            return -((w_obj / p_obs) @ coef_v)
+
+        return self._run_slsqp(
+            neg_ll, neg_grad, K_total, sample_id=model.sample_id
+        )
+
+    def _run_slsqp(
+        self,
+        neg_ll,
+        neg_grad,
+        K_total: int,
+        sample_id: str,
+    ) -> np.ndarray:
+        """Mode-independent SLSQP runner used by both solver paths.
+
+        Encapsulates the simplex constraint, bounds, initial guess,
+        scipy.optimize.minimize call with failure handling, and the
+        post-processing (clip to [0, 1], renormalize). Both
+        ``_solve_betabinom`` and ``_solve_binarization`` reuse this so
+        the simplex / convergence behavior is identical.
+        """
         # Initial guess: uniform over all components
         w0 = np.full(K_total, 1.0 / K_total, dtype=np.float64)
         constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0,
@@ -152,7 +256,7 @@ class MLEDeconvolver:
             )
         except Exception as exc:  # noqa: BLE001
             raise DeconvolutionFailedError(
-                f"SLSQP failed for sample {model.sample_id}: {exc}"
+                f"SLSQP failed for sample {sample_id}: {exc}"
             ) from exc
 
         if not res.success:
