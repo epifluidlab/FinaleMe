@@ -10,6 +10,8 @@ default). Phase C implements the training pipeline that produces such files.
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -190,18 +192,220 @@ def load_default_calibration() -> CalibrationParams:
 # ----------------------------------------------------------------------------
 
 
-def _load_matched_table(path: str | Path) -> pd.DataFrame:
-    """Load a matched WGBS or FinaleMe table for training.
+_CANONICAL_COLUMNS = [
+    "sample_id", "chrom", "start", "end", "methylated_count", "total_count",
+]
 
-    Expected columns: sample_id, chrom, start, end, methylated_count, total_count
-    Optional: cpg_density (joined from region_annotation if absent).
+
+def _normalize_chrom(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip any leading ``chr`` from the chromosome column.
+
+    Bis-SNP often writes chromosomes in the GRCh37 convention without a
+    ``chr`` prefix (``1``, ``2``, ``X``), while FinaleMe output always has
+    the prefix (``chr1``, ``chr2``, ``chrX``). Strip it on both sides so
+    the (sample_id, chrom, start, end) join across modalities works.
+    """
+    df = df.copy()
+    df["chrom"] = (
+        df["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
+    )
+    return df
+
+
+def _load_matched_table(
+    path: str | Path,
+    modality: str = "wgbs",
+) -> pd.DataFrame:
+    """Load a matched WGBS or FinaleMe table for calibration training.
+
+    Three formats are supported (auto-detected from the header row):
+
+    1. **Legacy joined TSV** — columns ``sample_id chrom start end
+       methylated_count total_count``. Used when the caller has already
+       joined per-sample records into one table.
+
+    2. **Sample sheet → Bis-SNP 6+2 BEDs** — columns ``sample_id
+       methylation_file [format]``. Each row points at a Bis-SNP
+       ``*.6plus2.bed`` (optionally gzipped) file, format defaults to
+       ``bissnp_6plus2``. Used for ``--matched-wgbs``.
+
+    3. **Sample sheet → FinaleMe prediction BEDs** — same columns, but
+       ``format`` defaults to ``finaleme_bed`` and each file is a
+       ``*.prediction.bed.gz`` from the FinaleMe decode step. Used for
+       ``--matched-finaleme``.
+
+    Chromosome prefixes are always stripped before returning so downstream
+    join keys are uniform.
     """
     df = pd.read_csv(path, sep="\t", comment="#")
-    required = {"sample_id", "chrom", "start", "end", "methylated_count", "total_count"}
-    missing = required - set(df.columns)
-    if missing:
-        raise InvalidCalibrationError(f"Matched table missing columns: {sorted(missing)}")
-    return df
+    cols = set(df.columns)
+
+    # Legacy format
+    legacy_required = set(_CANONICAL_COLUMNS)
+    if legacy_required.issubset(cols):
+        return _normalize_chrom(df)
+
+    # Sample sheet format
+    sheet_required = {"sample_id", "methylation_file"}
+    if sheet_required.issubset(cols):
+        return _load_sample_sheet(df, Path(path).parent, modality)
+
+    raise InvalidCalibrationError(
+        f"{path}: table has neither legacy columns {sorted(legacy_required)} "
+        f"nor sample sheet columns {sorted(sheet_required)}; got {sorted(cols)}"
+    )
+
+
+def _load_sample_sheet(
+    df: pd.DataFrame,
+    base_dir: Path,
+    modality: str,
+) -> pd.DataFrame:
+    """Iterate a sample sheet and concatenate per-sample parsed tables."""
+    parts: list[pd.DataFrame] = []
+    for _, row in df.iterrows():
+        sample_id = str(row["sample_id"])
+        file_path = Path(str(row["methylation_file"]))
+        if not file_path.is_absolute():
+            file_path = base_dir / file_path
+        if not file_path.exists():
+            raise InvalidCalibrationError(
+                f"Sample {sample_id}: file not found: {file_path}"
+            )
+
+        file_format = None
+        if "format" in df.columns:
+            raw_fmt = row.get("format")
+            if pd.notna(raw_fmt) and str(raw_fmt).strip():
+                file_format = str(raw_fmt).strip().lower()
+        if file_format is None:
+            file_format = _default_format_for_modality(modality)
+
+        if file_format == "bissnp_6plus2":
+            parts.append(_parse_bissnp_6plus2(file_path, sample_id))
+        elif file_format == "finaleme_bed":
+            parts.append(_parse_finaleme_prediction(file_path, sample_id))
+        else:
+            raise InvalidCalibrationError(
+                f"Sample {sample_id}: unknown file format '{file_format}'. "
+                "Supported: bissnp_6plus2, finaleme_bed"
+            )
+
+    if not parts:
+        raise InvalidCalibrationError("Sample sheet had no rows")
+    combined = pd.concat(parts, ignore_index=True)
+    return _normalize_chrom(combined)
+
+
+def _default_format_for_modality(modality: str) -> str:
+    mod = (modality or "").lower()
+    if mod == "finaleme":
+        return "finaleme_bed"
+    return "bissnp_6plus2"
+
+
+def _open_text(path: Path):
+    """Open a file for text reading, decompressing on-the-fly if gzipped."""
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path, "rt")
+
+
+def _parse_bissnp_6plus2(path: Path, sample_id: str) -> pd.DataFrame:
+    """Parse a Bis-SNP 6+2 BED file into the canonical six-column layout.
+
+    Bis-SNP 6+2 format:
+        chrom  start  end  name  score  strand  methylation_pct  total_count
+
+    Example lines (note that a ``track name=...`` header line is valid):
+        track name=HD_45 ...
+        1  10469  10470  .  500  -  50.00  4
+        1  10471  10472  .  750  -  75.00  4
+
+    ``methylated_count`` is derived as ``round(methylation_pct/100 * total_count)``.
+    """
+    data_lines: list[str] = []
+    with _open_text(path) as fh:
+        for line in fh:
+            if (
+                not line.strip()
+                or line.startswith("track")
+                or line.startswith("browser")
+                or line.startswith("#")
+            ):
+                continue
+            data_lines.append(line)
+    if not data_lines:
+        return pd.DataFrame(columns=_CANONICAL_COLUMNS)
+
+    df = pd.read_csv(
+        io.StringIO("".join(data_lines)),
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2, 6, 7],
+        names=["chrom", "start", "end", "methy_pct", "total_count"],
+        dtype={
+            "chrom": str,
+            "start": np.int64,
+            "end": np.int64,
+            "methy_pct": np.float64,
+            "total_count": np.int64,
+        },
+    )
+    methy_count = np.round(
+        df["methy_pct"].to_numpy() / 100.0 * df["total_count"].to_numpy()
+    ).astype(np.int64)
+    methy_count = np.clip(methy_count, 0, df["total_count"].to_numpy())
+    out = pd.DataFrame(
+        {
+            "sample_id": sample_id,
+            "chrom": df["chrom"],
+            "start": df["start"],
+            "end": df["end"],
+            "methylated_count": methy_count,
+            "total_count": df["total_count"],
+        }
+    )
+    return out
+
+
+def _parse_finaleme_prediction(path: Path, sample_id: str) -> pd.DataFrame:
+    """Parse a FinaleMe ``prediction.bed.gz`` file into the canonical layout.
+
+    Expected header:
+        #chr start end methy_perc_predict methy_count_predict total_count_predict
+            methy_perc_obs methy_count_obs total_count_obs
+    """
+    with _open_text(path) as fh:
+        df = pd.read_csv(
+            fh,
+            sep="\t",
+            comment="#",
+            header=None,
+            usecols=[0, 1, 2, 4, 5],
+            names=[
+                "chrom", "start", "end",
+                "methy_count_predict", "total_count_predict",
+            ],
+            dtype={
+                "chrom": str,
+                "start": np.int64,
+                "end": np.int64,
+                "methy_count_predict": np.float64,
+                "total_count_predict": np.float64,
+            },
+        )
+    out = pd.DataFrame(
+        {
+            "sample_id": sample_id,
+            "chrom": df["chrom"],
+            "start": df["start"],
+            "end": df["end"],
+            "methylated_count": df["methy_count_predict"].round().astype(np.int64),
+            "total_count": df["total_count_predict"].round().astype(np.int64),
+        }
+    )
+    return out
 
 
 def train_calibration(
@@ -214,19 +418,32 @@ def train_calibration(
 ) -> CalibrationParams:
     """Train per-bin calibration parameters from matched WGBS / FinaleMe samples.
 
+    Each of ``matched_wgbs`` / ``matched_finaleme`` can be:
+      * a **legacy joined TSV** with columns ``sample_id chrom start end
+        methylated_count total_count`` (pre-joined by the caller), or
+      * a **sample sheet** with columns ``sample_id methylation_file [format]``
+        pointing at one file per sample — Bis-SNP 6+2 BEDs for the WGBS
+        side (``format=bissnp_6plus2``, the default for this modality) or
+        FinaleMe ``prediction.bed.gz`` files for the FinaleMe side
+        (``format=finaleme_bed``, the default for this modality).
+
+    Chromosome-name prefixes (``chr``) are normalized across both tables
+    and the optional region annotation so that GRCh37-style WGBS data
+    (``1``, ``2``) joins cleanly with FinaleMe output (``chr1``, ``chr2``).
+
     Workflow (math doc §6.4):
-        1. Join WGBS + FinaleMe per-marker observations on (sample_id, chrom, start, end)
-        2. Compute beta = methylated / total for each
-        3. Join CpG density from region_annotation (or fall back to bin index 0)
-        4. tune_n_bins() over the candidate B values via leave-one-sample-out CV
-        5. Fit final calibration on all data with the selected B
-        6. Write JSON params + JSON report
+        1. Load + normalize WGBS and FinaleMe tables
+        2. Join on (sample_id, chrom, start, end)
+        3. Compute beta = methylated / total on each side
+        4. Join CpG density from region_annotation (if provided)
+        5. tune_n_bins via leave-one-sample-out CV
+        6. Fit final calibration and write JSON params + report
     """
     from finaleme_too.preprocessing.calibration_eval import fit_calibration, tune_n_bins
     from finaleme_too.io.output_writer import write_calibration_report
 
-    wgbs_df = _load_matched_table(matched_wgbs)
-    fme_df = _load_matched_table(matched_finaleme)
+    wgbs_df = _load_matched_table(matched_wgbs, modality="wgbs")
+    fme_df = _load_matched_table(matched_finaleme, modality="finaleme")
 
     join_keys = ["sample_id", "chrom", "start", "end"]
     merged = wgbs_df.merge(
@@ -234,12 +451,16 @@ def train_calibration(
     )
     if merged.empty:
         raise InvalidCalibrationError(
-            "No overlapping (sample_id, chrom, start, end) between WGBS and FinaleMe tables"
+            "No overlapping (sample_id, chrom, start, end) between WGBS and "
+            "FinaleMe tables. Check sample IDs, genomic coordinates, and "
+            "chromosome naming — the loader already strips any 'chr' prefix."
         )
 
     # CpG density: join from region_annotation if available
     if region_annotation is not None:
         ann = pd.read_csv(region_annotation, sep="\t", comment="#")
+        # Normalize chromosome prefix on the annotation side too
+        ann = _normalize_chrom(ann)
         merged = merged.merge(
             ann[["chrom", "start", "end", "cpg_density"]],
             on=["chrom", "start", "end"],

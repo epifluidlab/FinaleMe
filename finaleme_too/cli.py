@@ -279,10 +279,16 @@ def run_cmd(
 
 @main.command("train-calibration")
 @click.option("--matched-wgbs", required=True, type=click.Path(exists=True),
-              help="Matched WGBS counts table (TSV). Columns: sample_id, chrom, start, "
-                   "end, methylated_count, total_count.")
+              help="WGBS side of the matched training data. Accepts either a "
+                   "legacy joined TSV (sample_id, chrom, start, end, "
+                   "methylated_count, total_count) OR a sample-sheet TSV with "
+                   "'sample_id' and 'methylation_file' columns pointing at "
+                   "Bis-SNP 6+2 BED files (one per sample). The loader strips "
+                   "any 'chr' prefix so GRCh37-style contigs still join.")
 @click.option("--matched-finaleme", required=True, type=click.Path(exists=True),
-              help="Matched FinaleMe counts table (TSV). Same schema as --matched-wgbs.")
+              help="FinaleMe side of the matched training data. Same two-format "
+                   "accept list as --matched-wgbs, but sample-sheet rows point "
+                   "at FinaleMe 'prediction.bed.gz' outputs.")
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Per-marker CpG density annotation TSV (chrom, start, end, cpg_density). "
                    "If omitted, all markers are placed in bin 0.")
