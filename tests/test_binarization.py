@@ -1205,7 +1205,8 @@ def test_tooconfig_from_yaml_accepts_binarization_section(tmp_path):
 
 def test_tooconfig_from_yaml_warns_on_legacy_calibration_section(tmp_path):
     """Loading a YAML file with a legacy ``calibration:`` section emits a
-    DeprecationWarning but still loads the values into the old subsection."""
+    DeprecationWarning and maps the known v2 keys into the new
+    ``binarization:`` subsection."""
     import warnings
     from finaleme_too.config import TOOConfig
 
@@ -1221,14 +1222,16 @@ def test_tooconfig_from_yaml_warns_on_legacy_calibration_section(tmp_path):
         deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning)]
         assert len(deprecations) == 1
         assert "calibration" in str(deprecations[0].message).lower()
-    # Values still load into the legacy subsection
-    assert cfg.calibration.calibration_file == "/tmp/legacy_cal.json"
-    assert cfg.calibration.n_density_bins == 6
+    # The v2 calibration_file is remapped to binarization_file;
+    # n_density_bins -> n_context_bins.
+    assert cfg.binarization.binarization_file == "/tmp/legacy_cal.json"
+    assert cfg.binarization.n_context_bins == 6
 
 
-def test_tooconfig_from_yaml_both_sections_no_warning(tmp_path):
-    """When a YAML file has BOTH sections, no deprecation warning fires
-    (the user has already migrated; the legacy section is intentional)."""
+def test_tooconfig_from_yaml_both_sections_binarization_wins(tmp_path):
+    """When a YAML file has BOTH sections, the explicit ``binarization:``
+    section wins and the legacy ``calibration:`` section is silently
+    dropped (the user has already migrated; no need to remap)."""
     import warnings
     from finaleme_too.config import TOOConfig
 
@@ -1236,14 +1239,21 @@ def test_tooconfig_from_yaml_both_sections_no_warning(tmp_path):
     yaml_path.write_text(
         "binarization:\n"
         "  n_context_bins: 8\n"
+        "  max_error_rate: 0.12\n"
         "calibration:\n"
-        "  n_density_bins: 6\n"
+        "  n_density_bins: 999  # ignored because binarization: wins\n"
     )
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
-        TOOConfig.from_yaml(yaml_path)
-        deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecations) == 0
+        cfg = TOOConfig.from_yaml(yaml_path)
+    # A DeprecationWarning still fires because ``calibration:`` is a
+    # v2-only key; the migration notice is useful even when the user
+    # already has a ``binarization:`` section alongside it.
+    deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning)]
+    assert len(deprecations) == 1
+    # The explicit binarization: section takes precedence for the values
+    assert cfg.binarization.n_context_bins == 8
+    assert cfg.binarization.max_error_rate == 0.12
 
 
 def test_cli_train_calibration_hard_breaks_with_exit_2():
@@ -1281,8 +1291,8 @@ def test_cli_train_binarization_has_help():
 
 
 def test_cli_run_has_binarization_flag():
-    """The ``run`` command exposes the new ``--binarization`` flag alongside
-    the legacy ``--calibration`` flag."""
+    """The ``run`` command exposes the ``--binarization`` flag (Phase E
+    removed the legacy ``--calibration`` flag entirely)."""
     from click.testing import CliRunner
     from finaleme_too.cli import main
 
@@ -1290,7 +1300,8 @@ def test_cli_run_has_binarization_flag():
     result = runner.invoke(main, ["run", "--help"])
     assert result.exit_code == 0
     assert "--binarization" in result.output
-    assert "--calibration" in result.output
+    # The legacy v2 --calibration flag should be gone by Phase E
+    assert "--calibration" not in result.output
 
 
 def test_train_binarization_end_to_end(tmp_path):

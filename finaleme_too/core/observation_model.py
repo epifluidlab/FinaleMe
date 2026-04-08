@@ -62,13 +62,12 @@ _DEFAULT_DISPERSION = {
 
 
 class BetaBinomialModel:
-    """Build an ObservationModel from raw MarkerObservations."""
+    """Build an ObservationModel from raw MarkerObservations (WGBS mode)."""
 
     def build(
         self,
         obs: MarkerObservations,
         reference: "ReferencePanel | None" = None,
-        calibration: object | None = None,  # CalibrationParams (P1)
         region_annotations: pd.DataFrame | None = None,
         tier: CoverageTier = CoverageTier.HIGH,
         coverage_cap: int = 50,
@@ -85,8 +84,6 @@ class BetaBinomialModel:
             obs=obs,
             mode=obs.mode,
             tier=tier,
-            calibration=calibration,
-            region_annotations=region_annotations,
             mu_obs=mu_obs,
         )
 
@@ -122,36 +119,18 @@ class BetaBinomialModel:
         obs: MarkerObservations,
         mode: MeasurementMode,
         tier: CoverageTier,
-        calibration,
-        region_annotations: pd.DataFrame | None,
         mu_obs: np.ndarray,
     ) -> np.ndarray:
+        """Per-marker beta-binomial dispersion φ.
+
+        WGBS HIGH tier estimates a single shared φ via MLE on the data.
+        All other (mode, tier) combinations use the static default table.
+        The v2 FinaleMe calibration branch that read per-bin log-dispersion
+        from a ``CalibrationParams`` object was removed in v3 — FinaleMe
+        samples go through the binarization observation model, not this
+        beta-binomial model.
+        """
         n_markers = obs.n_markers
-        # FinaleMe mode + calibration: use per-bin log-dispersion when available.
-        if mode == MeasurementMode.FINALEME and calibration is not None and region_annotations is not None:
-            try:
-                # Lazy attribute access to avoid hard import here
-                bin_edges = np.asarray(calibration.bin_edges, dtype=np.float64)
-                log_phi = np.asarray(calibration.log_dispersion, dtype=np.float64)
-                # Map each marker to a bin via cpg_density
-                density = region_annotations.set_index(["chrom", "start", "end"])["cpg_density"]
-                key = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
-                marker_density = np.asarray(
-                    [float(density.get(k, np.nan)) for k in key], dtype=np.float64
-                )
-                bin_idx = np.clip(
-                    np.searchsorted(bin_edges, marker_density, side="right") - 1,
-                    0,
-                    len(log_phi) - 1,
-                )
-                phi = np.exp(log_phi[bin_idx])
-                # §2.4: scale by g(n_i) = min(n_i, n_cap)/n_cap with n_cap = 50
-                cap = 50.0
-                g_n = np.minimum(np.asarray(obs.n, dtype=np.float64), cap) / cap
-                phi = phi * np.where(g_n > 0, g_n, 1e-3)
-                return phi.astype(np.float64)
-            except Exception:
-                pass
 
         # WGBS HIGH tier: estimate a single shared phi via MLE on the data.
         if mode == MeasurementMode.WGBS and tier == CoverageTier.HIGH:

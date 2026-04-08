@@ -55,12 +55,6 @@ from finaleme_too.io.reference_panel import (
 )
 from finaleme_too.io.sample_sheet import Sample, SampleSheet
 from finaleme_too.preprocessing.batch_correction import combat_correct
-from finaleme_too.preprocessing.calibration import (
-    CalibrationParams,
-    apply_calibration,
-    load_default_calibration,
-)
-from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
 from finaleme_too.preprocessing.coverage import (
     CoverageTierAssigner,
     effective_coverage_in_markers,
@@ -88,30 +82,26 @@ class CohortResult:
 
 
 class TOOPipeline:
-    """End-to-end TOO pipeline (Phase A + B scope: P0 + P1).
+    """End-to-end TOO pipeline.
 
-    The FinaleMe path supports two coexisting observation models:
+    FinaleMe-mode samples are processed through the v3 context-dependent
+    binarization model: ``apply_binarization`` classifies markers into
+    U / M / Ambiguous / Excluded, then ``BinarizationModel.build`` produces
+    the observation model that ``MLEDeconvolver.solve`` consumes via its
+    binomial-with-error-rates SLSQP path.
 
-    * **v2 (continuous calibration)** — kept for backward compatibility.
-      Pass ``calibration=CalibrationParams(...)`` and the pipeline runs
-      ``apply_calibration`` then ``BetaBinomialModel.build`` on the
-      calibrated counts.
-    * **v3 (context-dependent binarization)** — preferred. Pass
-      ``binarization=BinarizationParams(...)`` and the pipeline runs
-      ``apply_binarization`` then ``BinarizationModel.build`` and
-      dispatches to the binomial-with-error-rates SLSQP path inside
-      ``MLEDeconvolver.solve``.
+    WGBS-mode samples continue to use the beta-binomial path regardless of
+    whether a ``binarization`` object is provided.
 
-    When both ``calibration`` and ``binarization`` are passed, the v3
-    path takes precedence and ``calibration`` is ignored. WGBS-mode
-    samples always use the beta-binomial path regardless of which
-    FinaleMe params are present.
+    The legacy ``calibration`` parameter was removed in v3. The old v2
+    continuous-calibration pipeline is no longer available; use
+    ``finaleme-too train-binarization`` to produce a ``BinarizationParams``
+    JSON and pass it via ``binarization=`` or ``--binarization``.
     """
 
     def __init__(
         self,
         config: TOOConfig,
-        calibration: CalibrationParams | None = None,
         region_annotations: pd.DataFrame | None = None,
         group_comparison_spec: str | None = None,
         cpg_index: dict | None = None,
@@ -121,7 +111,6 @@ class TOOPipeline:
         from finaleme_too.core.observation_model_binarization import BinarizationModel
 
         self.config = config
-        self.calibration = calibration
         self.binarization = binarization
         self.region_annotations = region_annotations
         self.group_comparison_spec = group_comparison_spec
@@ -480,28 +469,23 @@ class TOOPipeline:
         keys = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
         return np.array([float(ann.get(k, np.nan)) for k in keys], dtype=np.float64)
 
-    def _load_and_calibrate(
+    def _load_and_preprocess_sample(
         self,
         sample: Sample,
         marker_regions: MarkerRegions,
         cpg_index: dict | None,
     ) -> MarkerObservations:
-        """Phase D: load methylation data and apply FinaleMe preprocessing.
+        """Load methylation data and apply FinaleMe binarization.
 
-        FinaleMe-mode samples take one of two preprocessing paths:
-
-        * **v3 binarization** (preferred) when ``self.binarization`` is set —
-          calls ``apply_binarization`` which classifies each marker into
-          U / M / Ambiguous / Excluded and writes ``called_state`` and
-          ``context_bin`` onto the returned ``MarkerObservations``.
-        * **v2 calibration** (fallback) when only ``self.calibration`` is set
-          — calls ``apply_calibration`` which rewrites ``k`` and ``n`` from
-          the calibrated beta values.
+        FinaleMe-mode samples with ``self.binarization`` set run
+        ``apply_binarization`` which classifies each marker into
+        U / M / Ambiguous / Excluded and writes ``called_state`` and
+        ``context_bin`` onto the returned ``MarkerObservations``.
 
         WGBS-mode samples are returned as loaded (no preprocessing).
         Coverage tier assignment, observation model construction, and
-        deconvolution are deferred to ``_deconvolve_sample`` so that batch
-        correction and imputation can run in between.
+        deconvolution are deferred to ``_deconvolve_sample`` so that
+        batch correction and imputation can run in between.
         """
         log.info("Loading sample %s (%s)", sample.sample_id, sample.mode.value)
         obs = MethylationLoader.load(
@@ -514,24 +498,22 @@ class TOOPipeline:
             total_col=sample.total_col,
             cpg_index=cpg_index,
         )
-        if sample.mode == MeasurementMode.FINALEME:
-            if self.binarization is not None:
-                # v3 path: classify each marker via the trained binarization
-                # model. apply_binarization writes called_state + context_bin
-                # to the returned obs but leaves k / n / predicted_beta intact,
-                # so any downstream code that still reads k/n (e.g. coverage
-                # tier assignment) keeps working.
-                from finaleme_too.preprocessing.binarization import apply_binarization
+        if (
+            sample.mode == MeasurementMode.FINALEME
+            and self.binarization is not None
+        ):
+            from finaleme_too.preprocessing.binarization import apply_binarization
 
-                obs = apply_binarization(
-                    obs,
-                    params=self.binarization,
-                    region_annotations=self.region_annotations,
-                )
-            elif self.calibration is not None:
-                # v2 path: rewrite k from the calibrated beta value.
-                obs = apply_calibration(obs, self.calibration, self.region_annotations)
+            obs = apply_binarization(
+                obs,
+                params=self.binarization,
+                region_annotations=self.region_annotations,
+            )
         return obs
+
+    # Backwards-compat alias so any stale caller finding
+    # ``pipeline._load_and_calibrate`` still works during the migration.
+    _load_and_calibrate = _load_and_preprocess_sample
 
     def _deconvolve_sample(
         self,
@@ -557,7 +539,7 @@ class TOOPipeline:
         # Whether the v3 binarization path is active for THIS sample. Both
         # ``self.binarization`` must be set AND the sample must be FinaleMe
         # mode AND apply_binarization must already have run on the obs (which
-        # populates called_state). The v2 path is the fallback otherwise.
+        # populates called_state).
         use_binarization = (
             sample.mode == MeasurementMode.FINALEME
             and self.binarization is not None
@@ -567,7 +549,6 @@ class TOOPipeline:
 
         binarization_flag: str | None = None
         if use_binarization:
-            # v3 inference QC
             from finaleme_too.preprocessing.binarization_eval import (
                 compute_inference_qc as _binarization_inference_qc,
             )
@@ -575,19 +556,6 @@ class TOOPipeline:
                 called_state=obs.called_state,
                 context_bin=obs.context_bin,
                 params=self.binarization,
-            )
-            binarization_flag = qc.get("flag")
-        elif (
-            sample.mode == MeasurementMode.FINALEME
-            and self.calibration is not None
-            and obs.predicted_beta is not None
-        ):
-            # v2 inference QC
-            density_vec = self._marker_cpg_density(obs)
-            qc = compute_inference_qc(
-                obs.predicted_beta,
-                self.calibration,
-                cpg_density=density_vec,
             )
             binarization_flag = qc.get("flag")
 
@@ -638,7 +606,6 @@ class TOOPipeline:
             observation = self.observation_builder.build(
                 obs=obs_filtered,
                 reference=reference_filtered,
-                calibration=self.calibration,
                 region_annotations=self.region_annotations,
                 tier=tier,
                 coverage_cap=self.config.coverage.coverage_cap,
@@ -1185,24 +1152,6 @@ def build_reference_and_markers(
     return reference, marker_regions, cpg_index
 
 
-def load_optional_calibration(
-    config: TOOConfig,
-    explicit_path: str | None,
-    use_default: bool = True,
-) -> CalibrationParams | None:
-    """Load v2 calibration parameters JSON if available, else default, else None."""
-    path = explicit_path or config.calibration.calibration_file
-    if path is not None:
-        return CalibrationParams.load(path)
-    if use_default and config.calibration.use_default:
-        try:
-            return load_default_calibration()
-        except Exception as exc:  # pragma: no cover
-            log.warning("Could not load default calibration: %s", exc)
-            return None
-    return None
-
-
 def load_optional_binarization(
     config: TOOConfig,
     explicit_path: str | None,
@@ -1210,27 +1159,19 @@ def load_optional_binarization(
 ):
     """Load v3 binarization parameters JSON if available, else default, else None.
 
-    Mirrors ``load_optional_calibration`` for the v3 path. Reads from
-    ``config.calibration.binarization_file`` (Phase D will rename this) when
-    no explicit path is given. Falls back to the shipped default placeholder
-    if ``use_default`` is True. Returns ``None`` when neither is available so
-    callers can branch on its absence and use the v2 path instead.
+    Reads from ``config.binarization.binarization_file`` when no explicit
+    path is given. Falls back to the shipped default placeholder if
+    ``use_default`` is True. Returns ``None`` when neither is available.
     """
     from finaleme_too.preprocessing.binarization import (
         BinarizationParams,
         load_default_binarization,
     )
 
-    # The Phase D config rename moves binarization params to its own
-    # subsection. For Phase B we read from a getattr with fallback to keep
-    # the field name change deferrable.
-    path = explicit_path
-    if path is None:
-        cal_cfg = getattr(config, "binarization", None) or config.calibration
-        path = getattr(cal_cfg, "binarization_file", None)
+    path = explicit_path or config.binarization.binarization_file
     if path is not None:
         return BinarizationParams.load(path)
-    if use_default:
+    if use_default and config.binarization.use_default:
         try:
             return load_default_binarization()
         except Exception as exc:  # pragma: no cover
@@ -1253,6 +1194,5 @@ __all__ = [
     "TOOPipeline",
     "build_reference_and_markers",
     "load_optional_binarization",
-    "load_optional_calibration",
     "load_optional_region_annotations",
 ]
