@@ -31,6 +31,23 @@ class DeconvolutionResult:
     proportions has length K+1 where index K is the unknown component.
     cell_types is the K cell-type names (without unknown). The unknown
     component is named "Unknown" in output writers.
+
+    Enriched output fields (architecture §10.1 / §10.2 / §10.6):
+        mean_dispersion   — (K,) per-cell-type mean phi over that cell type's
+                            discriminative markers (for the per-sample TSV)
+        mean_coverage     — mean total reads per marker actually used
+        n_markers_used    — total markers passing the tier coverage filter
+        pct_imputed       — fraction of markers filled in by CohortImputer
+        calibration_flag  — PASS / WARN / FAIL from calibration inference QC
+                            (FinaleMe mode only; None otherwise)
+        hemolysis_flag    — from sample metadata (None if missing)
+        overall_qc        — PASS / WARN / FAIL derived from qc_flags
+        residuals         — (M_used,) per-marker residual (mu_obs - mu_pred)
+                            with marker coordinates; populated only when the
+                            cohort-level NMF residual analysis is enabled
+        marker_chrom      — (M_used,) chromosome per marker actually used
+        marker_start      — (M_used,) start position per marker actually used
+        marker_end        — (M_used,) end position per marker actually used
     """
 
     sample_id: str
@@ -46,6 +63,18 @@ class DeconvolutionResult:
     posterior_samples: np.ndarray | None = None  # (T, K+1)
     coverage_tier: CoverageTier = CoverageTier.HIGH
     qc_flags: list[str] = field(default_factory=list)
+    # ---- enriched output fields ----
+    mean_dispersion: np.ndarray | None = None
+    mean_coverage: float = 0.0
+    n_markers_used: int = 0
+    pct_imputed: float = 0.0
+    calibration_flag: str | None = None
+    hemolysis_flag: bool | None = None
+    overall_qc: str = "PASS"
+    residuals: np.ndarray | None = None
+    marker_chrom: np.ndarray | None = None
+    marker_start: np.ndarray | None = None
+    marker_end: np.ndarray | None = None
 
 
 class MLEDeconvolver:

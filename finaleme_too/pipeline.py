@@ -30,6 +30,7 @@ from finaleme_too.core.deconvolution import (
     DeconvolutionResult,
     MLEDeconvolver,
 )
+from finaleme_too.core.fragment_likelihood import FragmentLevelDeconvolver
 from finaleme_too.core.observation_model import BetaBinomialModel, ObservationModel
 from finaleme_too.core.reliability import (
     assign_reliability,
@@ -37,6 +38,7 @@ from finaleme_too.core.reliability import (
     compute_p_goodness,
 )
 from finaleme_too.core.uncertainty import BootstrapCI
+from finaleme_too.io.pat_loader import load_fragments_from_pat
 from finaleme_too.io.marker_regions import MarkerRegions, MarkerRegionsLoader
 from finaleme_too.io.methylation_loader import MarkerObservations, MethylationLoader
 from finaleme_too.io.output_writer import (
@@ -44,6 +46,7 @@ from finaleme_too.io.output_writer import (
     write_group_comparison,
     write_per_sample_too,
     write_qc_summary,
+    write_residual_analysis,
 )
 from finaleme_too.io.reference_panel import (
     ReferencePanel,
@@ -58,12 +61,19 @@ from finaleme_too.preprocessing.calibration import (
     load_default_calibration,
 )
 from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
-from finaleme_too.preprocessing.coverage import CoverageTierAssigner
+from finaleme_too.preprocessing.coverage import (
+    CoverageTierAssigner,
+    per_marker_min_reads,
+)
 from finaleme_too.preprocessing.imputation import CohortImputer
 from finaleme_too.preprocessing.marker_selection import BalancedMarkerSelector
 from finaleme_too.postprocessing.covariate_adjustment import adjust_covariates
 from finaleme_too.postprocessing.group_comparison import run_group_comparisons
 from finaleme_too.postprocessing.qc import compute_qc_flags
+from finaleme_too.postprocessing.residual_analysis import (
+    compute_residuals_per_sample,
+    discover_residual_components,
+)
 from finaleme_too.utils.parallel import parallel_map
 
 log = logging.getLogger(__name__)
@@ -84,6 +94,7 @@ class TOOPipeline:
         calibration: CalibrationParams | None = None,
         region_annotations: pd.DataFrame | None = None,
         group_comparison_spec: str | None = None,
+        cpg_index: dict | None = None,
     ):
         from finaleme_too.config import SolverMethod
 
@@ -91,7 +102,9 @@ class TOOPipeline:
         self.calibration = calibration
         self.region_annotations = region_annotations
         self.group_comparison_spec = group_comparison_spec
+        self.cpg_index = cpg_index
         self.deconvolver = MLEDeconvolver()
+        self.fragment_deconvolver = FragmentLevelDeconvolver()
         self.bayesian_deconvolver = (
             BayesianDeconvolver(
                 n_walkers=64,
@@ -133,6 +146,10 @@ class TOOPipeline:
         """Run the full pipeline and write outputs to ``output_dir``."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Cache for fragment-level path (ULTRALOW tier) + residual analysis
+        if cpg_index is not None:
+            self.cpg_index = cpg_index
+        self._final_marker_regions = marker_regions
 
         # Cell-type-balanced marker selection (P1)
         marker_subset_indices: np.ndarray | None = None
@@ -173,7 +190,11 @@ class TOOPipeline:
                 min_per_level=self.config.batch_correction.min_samples_per_level,
             )
 
-        # Optional: cohort imputation for low-coverage markers (LOW/ULTRALOW)
+        # Optional: cohort imputation for low-coverage markers (LOW/ULTRALOW).
+        # Snapshot pre-imputation counts so we can compute pct_imputed later.
+        pre_impute_n: list[np.ndarray] = [
+            np.asarray(obs.n, dtype=np.int64).copy() for obs in loaded_obs
+        ]
         sample_groups_map = {s.sample_id: s.group for s in sample_sheet.samples}
         if self._should_impute(loaded_obs):
             imputer = CohortImputer(coverage_threshold=self.config.coverage.min_reads)
@@ -182,13 +203,15 @@ class TOOPipeline:
             ]
 
         # Per-sample deconvolution (parallel)
-        def _decon(args: tuple[Sample, MarkerObservations]) -> DeconvolutionResult:
-            sample, obs = args
-            return self._deconvolve_sample(sample, obs, reference, out_dir)
+        def _decon(
+            args: tuple[Sample, MarkerObservations, np.ndarray],
+        ) -> DeconvolutionResult:
+            sample, obs, pre_n = args
+            return self._deconvolve_sample(sample, obs, reference, out_dir, pre_n)
 
         results = parallel_map(
             _decon,
-            list(zip(sample_sheet.samples, loaded_obs)),
+            list(zip(sample_sheet.samples, loaded_obs, pre_impute_n)),
             n_jobs=self.config.threads,
         )
 
@@ -208,7 +231,61 @@ class TOOPipeline:
             if test_results:
                 write_group_comparison(test_results, out_dir / "group_comparison.tsv")
 
+        # Residual analysis + NMF discovery (Gap 6b, architecture §9.4)
+        self._run_residual_analysis(adjusted_results, sample_groups, out_dir)
+
         return CohortResult(samples=adjusted_results, sample_groups=sample_groups)
+
+    def _run_residual_analysis(
+        self,
+        results: list[DeconvolutionResult],
+        sample_groups: dict[str, str | None],
+        out_dir: Path,
+    ) -> None:
+        """Cohort-level NMF residual discovery + per-sample residual TSV."""
+        if not results:
+            return
+        # Collect per-sample residual vectors aligned on (chrom, start, end).
+        # Use a stable key set from the first sample; samples that don't
+        # share the same marker layout contribute zeros.
+        base = results[0]
+        if base.residuals is None or base.residuals.size == 0:
+            return
+        key_len = base.residuals.size
+        residual_matrix = np.zeros((len(results), key_len), dtype=np.float64)
+        sample_order: list[str] = []
+        for i, r in enumerate(results):
+            sample_order.append(r.sample_id)
+            if r.residuals is not None and r.residuals.size == key_len:
+                vec = r.residuals.copy()
+                vec[~np.isfinite(vec)] = 0.0
+                residual_matrix[i] = vec
+
+        # Only run NMF if at least 3 samples have a "high-unknown" signal —
+        # otherwise residuals are near-zero and NMF adds no value.
+        high_unknown = sum(
+            1 for r in results if r.proportions[-1] > self.config.qc.max_unknown_fraction
+        )
+        nmf_summary: dict | None = None
+        if high_unknown >= 3 and residual_matrix.shape[0] >= 3:
+            try:
+                nmf = discover_residual_components(residual_matrix, n_components=3)
+                nmf["sample_order"] = sample_order
+                nmf_summary = nmf
+                log.info(
+                    "NMF residual discovery: %d components, explained variance %s",
+                    nmf["components"].shape[0],
+                    np.round(nmf["explained_variance_ratio"], 3).tolist(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("NMF residual discovery failed: %s", exc)
+
+        write_residual_analysis(
+            results,
+            sample_groups,
+            out_dir / "residual_analysis.tsv",
+            nmf_summary=nmf_summary,
+        )
 
     def _should_impute(self, observations: list[MarkerObservations]) -> bool:
         """Phase D: enable imputation if any sample is in LOW/ULTRALOW tier."""
@@ -346,8 +423,13 @@ class TOOPipeline:
         obs: MarkerObservations,
         reference: ReferencePanel,
         out_dir: Path,
+        pre_impute_n: np.ndarray | None = None,
     ) -> DeconvolutionResult:
-        """Build observation model, deconvolve, bootstrap, write per-sample TSV."""
+        """Build observation model, deconvolve, bootstrap, write per-sample TSV.
+
+        ``pre_impute_n`` is the pre-imputation per-marker read count (n) for
+        this sample. It is used to compute ``pct_imputed`` in the result.
+        """
         log.info("Deconvolving sample %s", sample.sample_id)
 
         calibration_flag: str | None = None
@@ -365,17 +447,87 @@ class TOOPipeline:
             calibration_flag = qc.get("flag")
 
         tier = self.tier_assigner.assign(obs)
+
+        # -------- Gap 5: per-tier min-read filtering --------
+        # Apply the tier-specific minimum reads-per-marker threshold BEFORE
+        # building the observation model so the solver, bootstrap, and
+        # reliability computations all see the filtered marker set uniformly.
+        min_reads = per_marker_min_reads(tier)
+        valid_mask = np.asarray(obs.n, dtype=np.int64) >= min_reads
+        if not np.any(valid_mask):
+            # No usable markers at this tier — return an all-unknown result
+            return self._emit_fallback_result(
+                sample=sample,
+                reference=reference,
+                tier=tier,
+                calibration_flag=calibration_flag,
+                pre_impute_n=pre_impute_n,
+                post_impute_n=np.asarray(obs.n, dtype=np.int64),
+                out_dir=out_dir,
+            )
+        obs_filtered = _subset_observations(obs, valid_mask)
+        reference_filtered = _subset_reference_rows(reference, valid_mask)
+        if pre_impute_n is not None:
+            pre_impute_n_filtered = pre_impute_n[valid_mask]
+        else:
+            pre_impute_n_filtered = None
+
         observation = self.observation_builder.build(
-            obs=obs,
-            reference=reference,
+            obs=obs_filtered,
+            reference=reference_filtered,
             calibration=self.calibration,
             region_annotations=self.region_annotations,
             tier=tier,
             coverage_cap=self.config.coverage.coverage_cap,
         )
+        reference = reference_filtered  # downstream code operates on the filtered reference
 
-        # Point-estimate proportions (always run MLE for the point estimate)
+        # -------- Gap 6a: fragment-level dispatch for ULTRALOW tier --------
+        # When the sample is ULTRALOW, attempt to load a .pat.gz companion
+        # and run the fragment-level EM. Falls back silently to MLE if the
+        # prerequisites are missing.
+        w_hat_fragment: np.ndarray | None = None
+        fragment_mode = (self.config.model.fragment_level or "auto").lower()
+        should_try_fragment = (
+            fragment_mode == "always"
+            or (fragment_mode == "auto" and tier == CoverageTier.ULTRALOW)
+        )
+        if should_try_fragment and self.cpg_index is not None:
+            pat_path = sample.resolved_pat_file() if hasattr(sample, "resolved_pat_file") else None
+            if pat_path is not None and Path(pat_path).exists():
+                try:
+                    frag_marker_regions = MarkerRegions(
+                        chrom=reference.chrom,
+                        start=reference.start,
+                        end=reference.end,
+                        marker_name=None,
+                    )
+                    fragments = load_fragments_from_pat(
+                        pat_path,
+                        marker_regions=frag_marker_regions,
+                        cpg_index=self.cpg_index,
+                    )
+                    if fragments:
+                        w_hat_fragment = self.fragment_deconvolver.solve(
+                            fragments, reference.methylation
+                        )
+                        log.info(
+                            "Sample %s: used fragment-level EM on %d fragments (tier=%s)",
+                            sample.sample_id, len(fragments), tier.value,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "Fragment-level EM failed for %s (%s); falling back to MLE",
+                        sample.sample_id, exc,
+                    )
+
+        # Point-estimate proportions (always run MLE for the point estimate).
+        # For ULTRALOW + fragment path, we use the fragment w as the point
+        # estimate but still run MLE on the marker-aggregated data as a
+        # reference comparison (the bootstrap needs something to iterate over).
         w_hat = self.deconvolver.solve(observation, reference)
+        if w_hat_fragment is not None:
+            w_hat = w_hat_fragment
 
         # Uncertainty: Bayesian posterior overrides bootstrap when configured
         posterior_samples = None
@@ -443,8 +595,42 @@ class TOOPipeline:
         reliability[K] = assign_reliability(np.nan, p_detection[K])
 
         # n_markers per cell type — count valid markers contributing to that cell type
-        valid_n = np.sum(observation.n > 0)
-        n_markers = np.full(K, int(valid_n), dtype=np.int32)
+        valid_n = int(np.sum(observation.n > 0))
+        n_markers = np.full(K, valid_n, dtype=np.int32)
+
+        # Enriched output fields (Gap 7)
+        mean_dispersion = _per_celltype_mean_dispersion(
+            observation=observation,
+            reference_methylation=reference.methylation,
+            top_n=50,
+        )
+        mean_coverage = float(np.mean(observation.n)) if observation.n.size > 0 else 0.0
+
+        # pct_imputed: fraction of markers where the pre-imputation n was below
+        # the tier threshold but the post-imputation n is at or above it.
+        if pre_impute_n_filtered is not None and pre_impute_n_filtered.size:
+            post = np.asarray(observation.n, dtype=np.int64)
+            was_low = pre_impute_n_filtered < min_reads
+            was_lifted = was_low & (post >= min_reads)
+            pct_imputed = float(np.mean(was_lifted))
+        else:
+            pct_imputed = 0.0
+
+        # Per-marker residual (mu_obs - mu_predicted) for NMF later
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mu_obs = np.where(
+                observation.n > 0,
+                observation.k / np.maximum(observation.n, 1),
+                np.nan,
+            )
+        mu_pred = reference.methylation @ w_hat[:K]
+        residuals = mu_obs - mu_pred
+
+        hemolysis_flag = None
+        if hasattr(sample, "metadata"):
+            hv = sample.metadata.get("hemolysis_flag")
+            if hv is not None:
+                hemolysis_flag = bool(hv) if not isinstance(hv, str) else hv.lower() in ("true", "1", "yes")
 
         result = DeconvolutionResult(
             sample_id=sample.sample_id,
@@ -460,16 +646,70 @@ class TOOPipeline:
             posterior_samples=posterior_samples,
             coverage_tier=tier,
             qc_flags=[],  # filled below
+            mean_dispersion=mean_dispersion,
+            mean_coverage=mean_coverage,
+            n_markers_used=valid_n,
+            pct_imputed=pct_imputed,
+            calibration_flag=calibration_flag,
+            hemolysis_flag=hemolysis_flag,
+            residuals=residuals,
+            marker_chrom=np.asarray(obs_filtered.chrom, dtype=object),
+            marker_start=np.asarray(obs_filtered.start, dtype=np.int64),
+            marker_end=np.asarray(obs_filtered.end, dtype=np.int64),
         )
         result.qc_flags = compute_qc_flags(
             result=result,
             observation=observation,
             qc_config=self.config.qc,
             calibration_flag=calibration_flag,
-            hemolysis=sample.metadata.get("hemolysis_flag")
-            if hasattr(sample, "metadata") else None,
+            hemolysis=hemolysis_flag,
         )
+        # overall_qc derived from qc_flags
+        if any(f.endswith("_FAIL") for f in result.qc_flags):
+            result.overall_qc = "FAIL"
+        elif result.qc_flags:
+            result.overall_qc = "WARN"
+        else:
+            result.overall_qc = "PASS"
 
+        write_per_sample_too(result, out_dir / f"{sample.sample_id}.too.tsv")
+        return result
+
+    def _emit_fallback_result(
+        self,
+        sample: Sample,
+        reference: ReferencePanel,
+        tier: CoverageTier,
+        calibration_flag: str | None,
+        pre_impute_n: np.ndarray | None,
+        post_impute_n: np.ndarray,
+        out_dir: Path,
+    ) -> DeconvolutionResult:
+        """Return an all-unknown result when no markers pass the tier filter."""
+        K = reference.n_cell_types
+        w = np.zeros(K + 1, dtype=np.float64)
+        w[-1] = 1.0
+        reliability = np.array(["UNRELIABLE"] * (K + 1), dtype=object)
+        result = DeconvolutionResult(
+            sample_id=sample.sample_id,
+            cell_types=list(reference.cell_types),
+            proportions=w,
+            ci_lower=w.copy(),
+            ci_upper=w.copy(),
+            p_goodness=np.full(K, np.nan, dtype=np.float64),
+            p_detection=np.zeros(K + 1, dtype=np.float64),
+            reliability=reliability,
+            n_markers=np.zeros(K, dtype=np.int32),
+            coverage_tier=tier,
+            qc_flags=["NO_MARKERS_PASS_TIER_FILTER"],
+            mean_dispersion=np.zeros(K, dtype=np.float64),
+            mean_coverage=float(np.mean(post_impute_n)) if post_impute_n.size else 0.0,
+            n_markers_used=0,
+            pct_imputed=0.0,
+            calibration_flag=calibration_flag,
+            hemolysis_flag=None,
+            overall_qc="FAIL",
+        )
         write_per_sample_too(result, out_dir / f"{sample.sample_id}.too.tsv")
         return result
 
@@ -498,6 +738,68 @@ def _subset_marker_regions(mr: MarkerRegions, indices: np.ndarray) -> MarkerRegi
         end=mr.end[indices],
         marker_name=mr.marker_name[indices] if mr.marker_name is not None else None,
     )
+
+
+def _subset_observations(
+    obs: MarkerObservations, mask: np.ndarray
+) -> MarkerObservations:
+    """Return a new MarkerObservations keeping only the masked markers."""
+    return MarkerObservations(
+        sample_id=obs.sample_id,
+        chrom=obs.chrom[mask],
+        start=obs.start[mask],
+        end=obs.end[mask],
+        k=np.asarray(obs.k, dtype=np.int32)[mask],
+        n=np.asarray(obs.n, dtype=np.int32)[mask],
+        predicted_beta=(
+            obs.predicted_beta[mask] if obs.predicted_beta is not None else None
+        ),
+        mode=obs.mode,
+    )
+
+
+def _subset_reference_rows(
+    reference: ReferencePanel, mask: np.ndarray
+) -> ReferencePanel:
+    """Return a new ReferencePanel keeping only the masked rows (markers)."""
+    return ReferencePanel(
+        chrom=reference.chrom[mask],
+        start=reference.start[mask],
+        end=reference.end[mask],
+        cell_types=list(reference.cell_types),
+        methylation=reference.methylation[mask],
+        coverage=reference.coverage[mask] if reference.coverage is not None else None,
+    )
+
+
+def _per_celltype_mean_dispersion(
+    observation,
+    reference_methylation: np.ndarray,
+    top_n: int = 50,
+) -> np.ndarray:
+    """Per-cell-type mean dispersion phi over the cell type's top discriminative markers.
+
+    The dispersion scalar reported in the per-sample TSV (architecture §10.1)
+    summarizes the model uncertainty attached to each cell type's best markers.
+    """
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    K = R.shape[1]
+    out = np.zeros(K, dtype=np.float64)
+    if observation.dispersion.size == 0:
+        return out
+    valid = observation.n > 0
+    for j in range(K):
+        target = R[:, j]
+        others = np.delete(R, j, axis=1)
+        bg_mean = np.mean(others, axis=1)
+        score = np.where(valid, np.abs(target - bg_mean), -np.inf)
+        if np.all(np.isneginf(score)):
+            out[j] = float(np.mean(observation.dispersion)) if observation.dispersion.size else 0.0
+            continue
+        take = min(top_n, int(np.sum(valid)))
+        top_idx = np.argpartition(-score, take - 1)[:take]
+        out[j] = float(np.mean(observation.dispersion[top_idx]))
+    return out
 
 
 # ---------------------------------------------------------------------------
