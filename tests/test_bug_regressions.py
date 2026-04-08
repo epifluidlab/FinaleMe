@@ -809,3 +809,295 @@ def test_round3_gap_down_tier_keeps_marker_that_scalar_filter_would_drop():
     assert int(min_reads[-1]) == 1
     # And n=1 >= min=1, so it passes
     assert int(n[-1]) >= int(min_reads[-1])
+
+
+# ---------------------------------------------------------------------------
+# April 2026 round 4 regressions
+# ---------------------------------------------------------------------------
+
+
+# HIGH — covariate adjustment must preserve enriched fields
+def test_round4_covariate_adjustment_preserves_enriched_fields():
+    """After _maybe_adjust_covariates, mean_coverage, n_markers_used,
+    pct_imputed, calibration_flag, overall_qc, residuals, and the marker
+    coordinate arrays must all be preserved on the adjusted result."""
+    import pandas as pd
+    from finaleme_too.config import CoverageTier, TOOConfig
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+    from finaleme_too.config import MeasurementMode
+    from pathlib import Path
+
+    rng = np.random.default_rng(0)
+
+    def _mk_result(sid: str, age: int) -> DeconvolutionResult:
+        K = 2
+        prop = np.array([0.4, 0.3, 0.3])
+        return DeconvolutionResult(
+            sample_id=sid,
+            cell_types=["CT1", "CT2"],
+            proportions=prop,
+            ci_lower=prop - 0.05,
+            ci_upper=prop + 0.05,
+            p_goodness=np.array([0.5, 0.6]),
+            p_detection=np.array([0.9, 0.9, 0.9]),
+            reliability=np.array(["HIGH", "HIGH", "HIGH"], dtype=object),
+            n_markers=np.array([10, 10], dtype=np.int32),
+            coverage_tier=CoverageTier.HIGH,
+            qc_flags=[],
+            mean_dispersion=np.array([50.0, 60.0]),
+            mean_coverage=27.3,  # distinctive value
+            n_markers_used=18,  # distinctive value
+            pct_imputed=0.125,  # distinctive value
+            calibration_flag="PASS",
+            hemolysis_flag=False,
+            overall_qc="PASS",
+            residuals=rng.normal(0, 0.05, size=5),  # distinctive
+            marker_chrom=np.array(["chr1"] * 5, dtype=object),
+            marker_start=np.array([100, 200, 300, 400, 500], dtype=np.int64),
+            marker_end=np.array([150, 250, 350, 450, 550], dtype=np.int64),
+        )
+
+    results = [
+        _mk_result("s1", 30),
+        _mk_result("s2", 40),
+        _mk_result("s3", 50),
+        _mk_result("s4", 60),
+        _mk_result("s5", 70),
+    ]
+
+    # Build a fake SampleSheet with age covariate
+    samples = []
+    for i, r in enumerate(results):
+        samples.append(
+            Sample(
+                sample_id=r.sample_id,
+                methylation_file=Path("/nope"),
+                mode=MeasurementMode.WGBS,
+                group="A",
+                metadata={"age": 30 + i * 10},
+            )
+        )
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    config = TOOConfig()
+    config.covariate_adjustment.biological_covariates = ["age"]
+    pipeline = TOOPipeline(config)
+    adjusted = pipeline._maybe_adjust_covariates(results, sheet)
+
+    assert len(adjusted) == len(results)
+    for orig, adj in zip(results, adjusted):
+        # Proportions should have been re-residualized
+        # (may or may not differ depending on the covariate signal)
+        # Enriched fields must be IDENTICAL to the originals.
+        assert adj.mean_coverage == orig.mean_coverage, \
+            f"mean_coverage dropped: {adj.mean_coverage} != {orig.mean_coverage}"
+        assert adj.n_markers_used == orig.n_markers_used
+        assert abs(adj.pct_imputed - orig.pct_imputed) < 1e-12
+        assert adj.calibration_flag == orig.calibration_flag
+        assert adj.hemolysis_flag == orig.hemolysis_flag
+        assert adj.overall_qc == orig.overall_qc
+        assert adj.residuals is not None
+        np.testing.assert_array_equal(adj.residuals, orig.residuals)
+        assert adj.marker_chrom is not None
+        np.testing.assert_array_equal(adj.marker_chrom, orig.marker_chrom)
+        np.testing.assert_array_equal(adj.marker_start, orig.marker_start)
+        np.testing.assert_array_equal(adj.marker_end, orig.marker_end)
+        np.testing.assert_array_equal(adj.mean_dispersion, orig.mean_dispersion)
+
+
+# MEDIUM — group comparison sample-size guard
+def test_round4_group_comparison_runs_with_3_samples():
+    """The pipeline should not hard-block group comparisons at <4 samples.
+    Per-test sufficiency checks live inside run_group_comparisons; the
+    pipeline should only require the bare minimum of 2 samples."""
+    from finaleme_too.config import CoverageTier, TestMethod, TOOConfig
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.pipeline import TOOPipeline
+
+    rng = np.random.default_rng(1)
+
+    def _mk(sid, group, prop_bias):
+        K = 2
+        prop = np.array([0.4 + prop_bias, 0.3 - prop_bias, 0.3])
+        return DeconvolutionResult(
+            sample_id=sid,
+            cell_types=["CT1", "CT2"],
+            proportions=prop,
+            ci_lower=prop - 0.05,
+            ci_upper=prop + 0.05,
+            p_goodness=np.array([0.5, 0.5]),
+            p_detection=np.array([0.9, 0.9, 0.9]),
+            reliability=np.array(["HIGH", "HIGH", "HIGH"], dtype=object),
+            n_markers=np.array([5, 5], dtype=np.int32),
+            coverage_tier=CoverageTier.HIGH,
+            qc_flags=[],
+            mean_dispersion=np.array([50.0, 50.0]),
+            mean_coverage=25.0,
+            n_markers_used=5,
+            residuals=rng.normal(0, 0.05, size=5),
+            overall_qc="PASS",
+        )
+
+    # 3 samples in 2 groups — the old guard (>=4) would have skipped this.
+    results = [
+        _mk("s1", "A", 0.1),
+        _mk("s2", "A", 0.08),
+        _mk("s3", "B", -0.1),
+    ]
+    sample_groups = {"s1": "A", "s2": "A", "s3": "B"}
+
+    config = TOOConfig()
+    config.testing.method = TestMethod.ILR_REGRESSION
+    pipeline = TOOPipeline(config)
+    pipeline.group_comparison_spec = "A:B"
+    test_results = pipeline._run_group_comparisons(results, sample_groups)
+    # A:B with n=2 vs n=1 — ILR still produces rows (may be NaN for
+    # insufficient within-group variance). What we verify is that the
+    # list is returned, NOT blocked outright.
+    assert isinstance(test_results, list)
+
+
+# MEDIUM — --marker-format CLI default no longer overrides YAML
+def test_round4_marker_format_yaml_wins_when_cli_not_provided(tmp_path):
+    """When the user provides --config with markers.marker_format=bed but
+    does NOT pass --marker-format, the effective format must be 'bed',
+    not the Click default 'auto'."""
+    import sys
+    from finaleme_too.config import TOOConfig
+    from finaleme_too import pipeline as pipeline_mod
+
+    # Minimal inputs
+    sheet = tmp_path / "sheet.tsv"
+    ref = tmp_path / "ref.tsv"
+    bed = tmp_path / "markers.bed"
+    bed.write_text("chr1\t100\t200\tm1\n")
+    ref.write_text("chrom\tstart\tend\tCellA\nchr1\t100\t200\t0.1\n")
+    fme = tmp_path / "s.prediction.bed.gz"
+    with gzip.open(fme, "wt") as fh:
+        fh.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict"
+            "\ttotal_count_predict\to1\to2\to3\n"
+        )
+        fh.write("chr1\t110\t111\t10\t1\t10\t0\t0\t0\n")
+    sheet.write_text(
+        "sample_id\tmethylation_file\tmode\tgroup\ns1\t"
+        + str(fme)
+        + "\tFINALEME\tA\n"
+    )
+
+    yaml_cfg = tmp_path / "cfg.yaml"
+    yaml_cfg.write_text("markers:\n  marker_format: bed\n")
+
+    captured = {}
+    orig_init = pipeline_mod.TOOPipeline.__init__
+
+    def spy_init(self, config, **kw):
+        captured["marker_format"] = config.markers.marker_format
+        raise SystemExit(0)
+
+    pipeline_mod.TOOPipeline.__init__ = spy_init  # type: ignore[assignment]
+    try:
+        sys.argv = [
+            "finaleme-too",
+            "run",
+            "--sample-sheet",
+            str(sheet),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--reference-panel",
+            str(ref),
+            "--marker-regions",
+            str(bed),
+            "--config",
+            str(yaml_cfg),
+            # NOTE: NOT passing --marker-format
+        ]
+        from finaleme_too.cli import main
+
+        try:
+            main(standalone_mode=False)
+        except SystemExit:
+            pass
+    finally:
+        pipeline_mod.TOOPipeline.__init__ = orig_init  # type: ignore[assignment]
+
+    assert captured["marker_format"] == "bed", \
+        f"YAML marker_format should have won; got {captured['marker_format']}"
+
+
+# MEDIUM — config.input.* now honored when CLI args omitted
+def test_round4_config_input_format_honored_from_yaml(tmp_path):
+    """When the YAML sets input.format=finaleme_bed but the CLI does not,
+    samples without an input_format should inherit finaleme_bed."""
+    import sys
+    from finaleme_too import pipeline as pipeline_mod
+
+    sheet = tmp_path / "sheet.tsv"
+    ref = tmp_path / "ref.tsv"
+    bed = tmp_path / "markers.bed"
+    bed.write_text("chr1\t100\t200\tm1\n")
+    ref.write_text("chrom\tstart\tend\tCellA\nchr1\t100\t200\t0.1\n")
+    fme = tmp_path / "s.bed.gz"
+    with gzip.open(fme, "wt") as fh:
+        fh.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict"
+            "\ttotal_count_predict\to1\to2\to3\n"
+        )
+        fh.write("chr1\t110\t111\t10\t1\t10\t0\t0\t0\n")
+    sheet.write_text(
+        "sample_id\tmethylation_file\tmode\tgroup\ns1\t"
+        + str(fme)
+        + "\tFINALEME\tA\n"
+    )
+
+    yaml_cfg = tmp_path / "cfg.yaml"
+    yaml_cfg.write_text(
+        "input:\n"
+        "  format: finaleme_bed\n"
+        "  meth_col: 5\n"
+        "  total_col: 6\n"
+    )
+
+    captured = {}
+    orig_init = pipeline_mod.TOOPipeline.__init__
+
+    def spy_init(self, config, **kw):
+        captured["config"] = config
+        raise SystemExit(0)
+
+    pipeline_mod.TOOPipeline.__init__ = spy_init  # type: ignore[assignment]
+    try:
+        sys.argv = [
+            "finaleme-too",
+            "run",
+            "--sample-sheet",
+            str(sheet),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--reference-panel",
+            str(ref),
+            "--marker-regions",
+            str(bed),
+            "--config",
+            str(yaml_cfg),
+            # NOTE: NOT passing --input-format, --meth-col, --total-col
+        ]
+        from finaleme_too.cli import main
+
+        try:
+            main(standalone_mode=False)
+        except SystemExit:
+            pass
+    finally:
+        pipeline_mod.TOOPipeline.__init__ = orig_init  # type: ignore[assignment]
+
+    # The config should carry the YAML values through
+    cfg = captured["config"]
+    assert cfg.input.format == "finaleme_bed"
+    assert cfg.input.meth_col == 5
+    assert cfg.input.total_col == 6

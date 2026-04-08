@@ -203,22 +203,45 @@ def run_cmd(
         for s in sample_sheet.samples:
             s.mode = forced_mode  # type: ignore[misc]
 
-    # Optional global input format override (set on every sample)
-    if input_format != "auto":
+    # Optional global input format override:
+    #   1. CLI flag wins if the user explicitly provided one
+    #   2. Otherwise config.input.format wins (when not "auto")
+    #   3. Otherwise the per-sample sheet input_format is kept
+    if _was_provided("input_format"):
+        effective_input_format = input_format
+    else:
+        effective_input_format = config.input.format
+    if effective_input_format and effective_input_format != "auto":
         for s in sample_sheet.samples:
-            s.input_format = input_format  # type: ignore[misc]
-    if meth_col is not None:
+            s.input_format = effective_input_format  # type: ignore[misc]
+
+    # meth_col / total_col follow the same precedence as input_format
+    if _was_provided("meth_col"):
+        effective_meth_col = meth_col
+    else:
+        effective_meth_col = config.input.meth_col
+    if effective_meth_col is not None:
         for s in sample_sheet.samples:
-            s.meth_col = meth_col  # type: ignore[misc]
-    if total_col is not None:
+            s.meth_col = int(effective_meth_col)  # type: ignore[misc]
+
+    if _was_provided("total_col"):
+        effective_total_col = total_col
+    else:
+        effective_total_col = config.input.total_col
+    if effective_total_col is not None:
         for s in sample_sheet.samples:
-            s.total_col = total_col  # type: ignore[misc]
+            s.total_col = int(effective_total_col)  # type: ignore[misc]
 
     # Apply marker selection / strict regions overrides from CLI
     if strict_regions is not None:
         config.markers.strict_regions = strict_regions
     if n_markers_per_type is not None:
         config.markers.n_per_type = n_markers_per_type
+    # --marker-format overrides the config value only when the user
+    # explicitly passed it on the command line (otherwise YAML wins).
+    if _was_provided("marker_format"):
+        config.markers.marker_format = marker_format
+    effective_marker_format = config.markers.marker_format
 
     reference, markers, cpg_idx = build_reference_and_markers(
         config=config,
@@ -227,7 +250,7 @@ def run_cmd(
         explicit_ref_betas=ref_betas,
         explicit_ref_groups=ref_groups,
         explicit_cpg_index=cpg_index,
-        explicit_marker_format=marker_format,
+        explicit_marker_format=effective_marker_format,
     )
 
     # Phase B: load calibration + region annotations (FinaleMe mode)

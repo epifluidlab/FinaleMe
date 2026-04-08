@@ -249,8 +249,11 @@ class TOOPipeline:
         )
         write_qc_summary(adjusted_results, sample_groups, out_dir / "qc_summary.tsv")
 
-        # Group comparison (P1)
-        if self.group_comparison_spec and len(results) >= 4:
+        # Group comparison (P1): delegate sample-sufficiency checks to the
+        # per-test helpers in run_group_comparisons. Bayesian comparisons
+        # can produce valid rows with as few as 3 samples; ILR regression
+        # needs >=2 per group but not an overall cohort size threshold.
+        if self.group_comparison_spec and len(results) >= 2:
             test_results = self._run_group_comparisons(adjusted_results, sample_groups)
             if test_results:
                 write_group_comparison(test_results, out_dir / "group_comparison.tsv")
@@ -355,22 +358,19 @@ class TOOPipeline:
             covariates=cov_df,
             columns=bio,
         )
+        # Use dataclasses.replace so every enriched field on the original
+        # result (mean_dispersion, mean_coverage, n_markers_used, pct_imputed,
+        # calibration_flag, hemolysis_flag, overall_qc, residuals, marker_*)
+        # is preserved after covariate adjustment. Only the fields we
+        # actually want to change are overridden.
+        from dataclasses import replace as dc_replace
+
         out: list[DeconvolutionResult] = []
         for r, new_p in zip(results, adjusted):
             out.append(
-                DeconvolutionResult(
-                    sample_id=r.sample_id,
-                    cell_types=r.cell_types,
+                dc_replace(
+                    r,
                     proportions=new_p,
-                    ci_lower=r.ci_lower,
-                    ci_upper=r.ci_upper,
-                    p_goodness=r.p_goodness,
-                    p_detection=r.p_detection,
-                    reliability=r.reliability,
-                    n_markers=r.n_markers,
-                    bootstrap_proportions=r.bootstrap_proportions,
-                    posterior_samples=r.posterior_samples,
-                    coverage_tier=r.coverage_tier,
                     qc_flags=list(r.qc_flags),
                 )
             )
