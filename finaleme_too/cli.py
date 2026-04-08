@@ -291,7 +291,16 @@ def run_cmd(
                    "at FinaleMe 'prediction.bed.gz' outputs.")
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Per-marker CpG density annotation TSV (chrom, start, end, cpg_density). "
-                   "If omitted, all markers are placed in bin 0.")
+                   "Optional: if omitted and --cpg-index is provided, density is "
+                   "auto-computed per row using a --region-annotation-window-bp "
+                   "local window. If neither is provided, all rows are placed "
+                   "in a single bin (which collapses calibration to a constant).")
+@click.option("--cpg-index", "cpg_index_path", default=None, type=click.Path(exists=True),
+              help="CpG index BED file (same file as BetaValueDeconvolution's "
+                   "-cpgIndex; e.g. data/CpG_index.hg19.bed.gz). Used to "
+                   "auto-compute CpG density when --region-annotation is not provided.")
+@click.option("--region-annotation-window", "region_annotation_window", default=1000, type=int,
+              help="Window size in bp for the auto-computed density (default: 1000).")
 @click.option("--n-bins-candidates", default="4,6,8,10,12,16",
               help="Comma-separated list of bin counts to evaluate via CV.")
 @click.option("--output", required=True, type=click.Path(),
@@ -304,6 +313,8 @@ def train_calibration_cmd(
     matched_wgbs: str,
     matched_finaleme: str,
     region_annotation: str | None,
+    cpg_index_path: str | None,
+    region_annotation_window: int,
     n_bins_candidates: str,
     output: str,
     report: str,
@@ -322,10 +333,55 @@ def train_calibration_cmd(
         n_bins_candidates=candidates,
         out_params=output,
         out_report=report,
+        cpg_index=cpg_index_path,
+        region_annotation_window=region_annotation_window,
     )
     click.echo(
         f"finaleme-too: trained calibration with B={params.n_bins} → {output} (report: {report})"
     )
+
+
+@main.command("make-region-annotation")
+@click.option("--regions", "regions_path", required=True, type=click.Path(exists=True),
+              help="BED or TSV of regions to annotate. 3+ columns (chrom, start, end); "
+                   "a 'track ...' or '#'-prefixed header line is OK. Most users pass the "
+                   "CpG index itself here, so density is computed at every CpG.")
+@click.option("--cpg-index", "cpg_index_path", required=True, type=click.Path(exists=True),
+              help="CpG index BED file used to count nearby CpGs (e.g. "
+                   "data/CpG_index.hg19.bed.gz).")
+@click.option("--window", default=1000, type=int,
+              help="Window size in bp centered on each region (default: 1000). "
+                   "cpg_density = count of CpGs in [center - window/2, center + window/2) / window.")
+@click.option("--output", required=True, type=click.Path(),
+              help="Output TSV with columns chrom, start, end, cpg_density. "
+                   "Pass this path to `train-calibration --region-annotation`.")
+@click.option("--verbose", is_flag=True, default=False)
+def make_region_annotation_cmd(
+    regions_path: str,
+    cpg_index_path: str,
+    window: int,
+    output: str,
+    verbose: bool,
+) -> None:
+    """Build a region_annotation.tsv from a CpG index.
+
+    For each row in ``--regions``, compute the local CpG density via a
+    sliding window and write the result as a TSV with ``chrom start end
+    cpg_density`` columns. The output is directly consumable by
+    ``finaleme-too train-calibration --region-annotation``.
+    """
+    _setup_logging(verbose)
+    from finaleme_too.preprocessing.calibration import (
+        make_region_annotation_from_regions_file,
+    )
+
+    make_region_annotation_from_regions_file(
+        regions_path=regions_path,
+        cpg_index_path=cpg_index_path,
+        output_path=output,
+        window=window,
+    )
+    click.echo(f"finaleme-too: wrote region annotation → {output}")
 
 
 def _setup_logging(verbose: bool) -> None:
