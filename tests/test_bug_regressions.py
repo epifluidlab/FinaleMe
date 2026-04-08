@@ -25,8 +25,6 @@ from finaleme_too.config import (
 from finaleme_too.io.marker_regions import MarkerRegions
 from finaleme_too.io.methylation_loader import MarkerObservations, MethylationLoader
 from finaleme_too.postprocessing.group_comparison import run_group_comparisons
-from finaleme_too.preprocessing.calibration import CalibrationParams
-from finaleme_too.preprocessing.calibration_eval import compute_inference_qc
 from finaleme_too.preprocessing.imputation import CohortImputer
 
 
@@ -89,72 +87,11 @@ def test_bug1_bayesian_falls_back_to_ilr_when_no_posterior():
 
 
 # ---------------------------------------------------------------------------
-# Bug 2: Calibration inference QC must use CpG density for bins, not the
-#        predicted beta values.
+# Bug 2: v2 continuous-calibration inference QC — DELETED in v3.
+# The binomial-with-error-rates binarization model has a different inference
+# QC (fraction_called / bin_balance / state_distribution_kl) covered by
+# tests/test_binarization.py::test_inference_qc_*.
 # ---------------------------------------------------------------------------
-
-
-def _density_calibration() -> CalibrationParams:
-    return CalibrationParams(
-        n_bins=4,
-        bin_edges=np.array([0.0, 0.025, 0.05, 0.075, 1.0]),
-        a=np.array([0.8, 0.9, 0.95, 1.0]),
-        c=np.array([-0.05, 0.0, 0.02, 0.05]),
-        log_dispersion=np.full(4, np.log(20.0)),
-    )
-
-
-def test_bug2_inference_qc_uses_density_for_bins_not_beta():
-    """All markers in bin 0 (low density) should produce balance < 1.0
-    even if predicted betas span [0, 1]."""
-    cal = _density_calibration()
-    n = 50
-    sample_pred = np.linspace(0.05, 0.95, n)  # spans full beta range
-    # All markers have low density → all in bin 0
-    density = np.full(n, 0.001)
-    qc = compute_inference_qc(sample_pred, cal, cpg_density=density)
-    # Bin 0 has 50 markers (>= 10), bins 1-3 have 0 → balance = 1/4 = 0.25
-    assert qc["bin_coverage_balance"] == pytest.approx(0.25)
-    # And it should have flagged WARN/FAIL due to balance, not PASS
-    assert qc["flag"] in ("WARN", "FAIL")
-
-
-def test_bug2_inference_qc_residuals_are_real_calibration_residuals():
-    """KS p should be high when sample residuals match training residuals."""
-    cal = _density_calibration()
-    rng = np.random.default_rng(0)
-    n = 200
-    sample_pred = np.clip(rng.uniform(0.1, 0.9, size=n), 1e-3, 1 - 1e-3)
-    density = np.full(n, 0.001)  # all in bin 0 → a=0.8, c=-0.05
-
-    # Compute the *true* residuals the function should be testing against
-    from scipy.special import logit
-    raw_logit = logit(sample_pred)
-    expected_residuals = (cal.a[0] - 1.0) * raw_logit + cal.c[0]
-
-    qc = compute_inference_qc(
-        sample_pred,
-        cal,
-        cpg_density=density,
-        training_residuals=expected_residuals,  # exact match
-    )
-    # When residuals match exactly, KS p should be ~1
-    assert qc["residual_ks_p"] > 0.5
-
-
-def test_bug2_prediction_range_coverage_uses_training_range():
-    cal = _density_calibration()
-    n = 100
-    # Half inside [0.1, 0.9], half outside
-    sample_pred = np.concatenate([np.linspace(0.2, 0.8, 50), np.linspace(0.91, 0.99, 50)])
-    qc = compute_inference_qc(
-        sample_pred,
-        cal,
-        cpg_density=np.zeros(n),
-        training_pred_range=(0.1, 0.9),
-    )
-    # 50/100 inside (0.1, 0.9)
-    assert abs(qc["prediction_range_coverage"] - 0.5) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +310,7 @@ def test_bug5_cli_options_applied(tmp_path: Path):
 def test_round2_bug1_enum_coercion_from_yaml(tmp_path: Path):
     """Loading a YAML config must coerce enum-typed fields, not leave strings."""
     from finaleme_too.config import (
-        CalibrationConfig,
+        BinarizationConfig,
         MeasurementMode,
         SolverMethod,
         TestMethod,
@@ -384,7 +321,7 @@ def test_round2_bug1_enum_coercion_from_yaml(tmp_path: Path):
     yaml_path.write_text(
         "model:\n"
         "  deconvolution: bayesian\n"
-        "calibration:\n"
+        "binarization:\n"
         "  mode: WGBS\n"
         "testing:\n"
         "  method: wilcoxon\n"
@@ -394,8 +331,8 @@ def test_round2_bug1_enum_coercion_from_yaml(tmp_path: Path):
     # All three enum-typed fields must be the actual Enum subclass instance
     assert isinstance(cfg.model.deconvolution, SolverMethod)
     assert cfg.model.deconvolution == SolverMethod.BAYESIAN
-    assert isinstance(cfg.calibration.mode, MeasurementMode)
-    assert cfg.calibration.mode == MeasurementMode.WGBS
+    assert isinstance(cfg.binarization.mode, MeasurementMode)
+    assert cfg.binarization.mode == MeasurementMode.WGBS
     assert isinstance(cfg.testing.method, TestMethod)
     assert cfg.testing.method == TestMethod.WILCOXON
     # And .value access works (this would crash if the field were a plain str)
@@ -537,49 +474,44 @@ def test_round2_bug3_omnibus_rows_have_adjusted_p_value():
                 f"{r.test_type}/{r.cell_type}: adjusted_p {r.adjusted_p_value} < raw {r.p_value}"
 
 
-# Bug D — calibration fallback binning is deterministic with +/-inf edges
-def test_round2_bug4_assign_bin_with_nan_density_does_not_return_nan():
-    """assign_bin must produce a finite bin index even when density is NaN
-    and bin_edges contain ±inf."""
-    from finaleme_too.preprocessing.calibration import CalibrationParams
+# Bug D — v3 binarization fallback binning is deterministic with NaN density.
+# Translated from the v2 test_round2_bug4 pair into a single v3 test against
+# BinarizationParams.assign_bin + apply_binarization. The original v2 bug
+# (bin_edges.mean() returning NaN when edges contained ±inf) was about the
+# fallback_bin lookup; the v3 analog is that NaN density must still land
+# deterministically in open_sea / sub-bin 0.
+def test_round2_bug4_binarization_assign_bin_with_nan_density_does_not_return_nan():
+    """``BinarizationParams.assign_bin`` must route NaN / ±inf density to
+    the open_sea class + lowest sub-bin without producing NaN or crashing.
+    This is the v3 analog of the v2 calibration fallback_bin fix.
+    """
+    from finaleme_too.preprocessing.binarization import build_identity_placeholder_params
 
-    edges = np.array([-np.inf, 0.01, 0.05, 0.075, np.inf])
-    params = CalibrationParams(
-        n_bins=4,
-        bin_edges=edges,
-        a=np.ones(4),
-        c=np.zeros(4),
-        log_dispersion=np.zeros(4),
+    params = build_identity_placeholder_params()
+    out = params.assign_bin(
+        np.array([np.nan, 0.005, 0.06, np.nan, np.inf, -np.inf], dtype=np.float64)
     )
-    out = params.assign_bin(np.array([np.nan, 0.005, 0.06, np.nan, np.inf, -np.inf]))
-    # All entries must be finite ints in [0, n_bins-1]
     assert out.dtype.kind in ("i", "u"), f"expected integer dtype, got {out.dtype}"
     assert np.all((out >= 0) & (out < params.n_bins))
-    # NaN entries → fallback_bin (deterministic)
-    fallback = params.fallback_bin
-    assert int(out[0]) == fallback
-    assert int(out[3]) == fallback
-    # Real values still bin correctly
-    assert int(out[1]) == 0  # 0.005 in [-inf, 0.01)
-    assert int(out[2]) == 2  # 0.06 in [0.05, 0.075)
+    # NaN / ±inf → open_sea (class 3), sub-bin 0 → bin index 6
+    assert int(out[0]) == 6
+    assert int(out[3]) == 6
+    assert int(out[4]) == 6
+    assert int(out[5]) == 6
 
 
-def test_round2_bug4_apply_calibration_with_no_region_annotation_does_not_nan(tmp_path):
-    """apply_calibration with region_annotations=None must not silently NaN."""
+def test_round2_bug4_apply_binarization_with_no_region_annotation_does_not_crash(tmp_path):
+    """``apply_binarization`` with region_annotations=None must not crash
+    or produce NaN called_state / context_bin. v3 analog of the v2
+    apply_calibration NaN-propagation bug."""
     from finaleme_too.config import MeasurementMode
     from finaleme_too.io.methylation_loader import MarkerObservations
-    from finaleme_too.preprocessing.calibration import CalibrationParams, apply_calibration
-
-    edges = np.array([-np.inf, 0.01, 0.05, np.inf])
-    # Aggressive non-identity calibration so we can see the effect:
-    # bin 1 (the deterministic fallback) has a=2.0, c=1.0
-    cal = CalibrationParams(
-        n_bins=3,
-        bin_edges=edges,
-        a=np.array([2.0, 2.0, 2.0]),
-        c=np.array([1.0, 1.0, 1.0]),
-        log_dispersion=np.zeros(3),
+    from finaleme_too.preprocessing.binarization import (
+        apply_binarization,
+        build_identity_placeholder_params,
     )
+
+    params = build_identity_placeholder_params()
     n = 5
     obs = MarkerObservations(
         sample_id="x",
@@ -588,18 +520,21 @@ def test_round2_bug4_apply_calibration_with_no_region_annotation_does_not_nan(tm
         end=np.array([200, 300, 400, 500, 600], dtype=np.int64),
         k=np.array([3, 5, 7, 2, 8], dtype=np.int32),
         n=np.array([10, 10, 10, 10, 10], dtype=np.int32),
-        predicted_beta=np.array([0.3, 0.5, 0.7, 0.2, 0.8], dtype=np.float32),
+        predicted_beta=np.array([0.05, 0.5, 0.95, 0.1, 0.9], dtype=np.float32),
         mode=MeasurementMode.FINALEME,
     )
-    out = apply_calibration(obs, cal, region_annotations=None)
-    # The key assertion: NO NaNs anywhere (the original bug produced NaN
-    # because params.bin_edges.mean() with +/-inf returns NaN, which then
-    # propagated through the bin lookup)
-    assert np.all(np.isfinite(out.k))
-    assert np.all((out.k >= 0) & (out.k <= out.n))
-    # The aggressive a=2.0, c=1.0 calibration must actually change at least
-    # one value (sanity check that the lookup table is being used)
-    assert not np.array_equal(out.k, obs.k)
+    out = apply_binarization(obs, params, region_annotations=None)
+    # The key assertion: no NaN in called_state or context_bin, and the
+    # arrays are integer-typed as promised.
+    assert out.called_state is not None
+    assert out.context_bin is not None
+    assert out.called_state.dtype == np.uint8
+    assert out.context_bin.dtype == np.int32
+    # With no region annotations → all NaN density → all open_sea → bin 6
+    assert np.all(out.context_bin == 6)
+    # k / n / predicted_beta are preserved
+    np.testing.assert_array_equal(out.k, obs.k)
+    np.testing.assert_array_equal(out.n, obs.n)
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +754,7 @@ def test_round3_gap_down_tier_keeps_marker_that_scalar_filter_would_drop():
 # HIGH — covariate adjustment must preserve enriched fields
 def test_round4_covariate_adjustment_preserves_enriched_fields():
     """After _maybe_adjust_covariates, mean_coverage, n_markers_used,
-    pct_imputed, calibration_flag, overall_qc, residuals, and the marker
+    pct_imputed, binarization_flag, overall_qc, residuals, and the marker
     coordinate arrays must all be preserved on the adjusted result."""
     import pandas as pd
     from finaleme_too.config import CoverageTier, TOOConfig
@@ -850,7 +785,7 @@ def test_round4_covariate_adjustment_preserves_enriched_fields():
             mean_coverage=27.3,  # distinctive value
             n_markers_used=18,  # distinctive value
             pct_imputed=0.125,  # distinctive value
-            calibration_flag="PASS",
+            binarization_flag="PASS",
             hemolysis_flag=False,
             overall_qc="PASS",
             residuals=rng.normal(0, 0.05, size=5),  # distinctive
@@ -898,7 +833,7 @@ def test_round4_covariate_adjustment_preserves_enriched_fields():
             f"mean_coverage dropped: {adj.mean_coverage} != {orig.mean_coverage}"
         assert adj.n_markers_used == orig.n_markers_used
         assert abs(adj.pct_imputed - orig.pct_imputed) < 1e-12
-        assert adj.calibration_flag == orig.calibration_flag
+        assert adj.binarization_flag == orig.binarization_flag
         assert adj.hemolysis_flag == orig.hemolysis_flag
         assert adj.overall_qc == orig.overall_qc
         assert adj.residuals is not None

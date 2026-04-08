@@ -61,19 +61,31 @@ class CoverageConfig:
 
 
 @dataclass
-class CalibrationConfig:
+class BinarizationConfig:
+    """v3 FinaleMe context-dependent binarization config.
+
+    Replaces ``CalibrationConfig`` for new pipelines. Carries the path to
+    the trained ``BinarizationParams`` JSON file plus tunable defaults
+    for the training-time bin search and inference-time QC.
+    """
+
     mode: MeasurementMode = MeasurementMode.FINALEME
-    calibration_file: str | None = None
-    n_density_bins: int = 8
-    use_default: bool = True  # use shipped default if calibration_file is None
-    # CV strategy used during bin tuning (train-calibration only).
-    #   "auto"   — leave-one-sample-out when >=2 samples, else random region K-fold
-    #   "sample" — always leave-one-sample-out (returns NaN cv_rmse if <2 samples)
-    #   "region" — always random K-fold on row indices (works with 1 sample)
-    #   "none"   — skip CV, select by AIC / in-sample RMSE only
-    cv_strategy: str = "auto"
-    cv_n_folds: int = 10  # K for region-level CV (ignored for sample mode)
-    cv_seed: int | None = None  # reproducible region-level shuffle
+    binarization_file: str | None = None
+    # Total bin count default for training (B = n_region_classes * sub_bins).
+    # With the v3 default of 4 region classes and 2 density sub-bins per
+    # class, this gives B=8 — matches arch §5.3.2 default.
+    n_context_bins: int = 8
+    # Bins with ε_U or ε_M ≥ this are marked unusable (arch §6.4).
+    max_error_rate: float = 0.15
+    # Cross-validation method during training. v3 specifies chromosome-blocked
+    # K-fold CV (math doc §6.5); kept as a config field so future strategies
+    # can be added without breaking the schema.
+    cv_method: str = "chromosome_blocked"
+    cv_n_folds: int = 10
+    cv_seed: int | None = None
+    # Use the shipped default_binarization.json when no explicit
+    # ``binarization_file`` is given.
+    use_default: bool = True
 
 
 @dataclass
@@ -154,7 +166,7 @@ class TOOConfig:
 
     model: ModelConfig = field(default_factory=ModelConfig)
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    binarization: BinarizationConfig = field(default_factory=BinarizationConfig)
     markers: MarkersConfig = field(default_factory=MarkersConfig)
     uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
     batch_correction: BatchCorrectionConfig = field(default_factory=BatchCorrectionConfig)
@@ -176,7 +188,43 @@ class TOOConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TOOConfig:
-        """Build a TOOConfig from a nested dict (e.g. parsed YAML)."""
+        """Build a TOOConfig from a nested dict (e.g. parsed YAML).
+
+        v2 -> v3 backwards compatibility: an old YAML file using
+        ``calibration:`` is accepted with a DeprecationWarning. The keys
+        are mapped into the new ``binarization:`` section best-effort:
+        ``calibration_file`` -> ``binarization_file``, ``use_default``
+        passes through, ``mode`` passes through, ``n_density_bins`` ->
+        ``n_context_bins``. Unknown v2 keys are silently dropped.
+        """
+        import warnings
+
+        raw = dict(raw)  # shallow copy so we can mutate
+        # v2 -> v3 shim: convert legacy ``calibration:`` subsection to
+        # ``binarization:`` fields with a deprecation notice. An explicit
+        # ``binarization:`` section takes precedence (the user has already
+        # migrated; the ``calibration:`` is just residue).
+        legacy_cal = raw.pop("calibration", None)
+        if legacy_cal is not None:
+            warnings.warn(
+                "TOOConfig: the YAML 'calibration:' section is deprecated in v3. "
+                "Use 'binarization:' for the new context-dependent binarization "
+                "model. Known keys are mapped automatically for this run.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if "binarization" not in raw and isinstance(legacy_cal, dict):
+                mapped = {}
+                if "calibration_file" in legacy_cal:
+                    mapped["binarization_file"] = legacy_cal["calibration_file"]
+                if "use_default" in legacy_cal:
+                    mapped["use_default"] = legacy_cal["use_default"]
+                if "mode" in legacy_cal:
+                    mapped["mode"] = legacy_cal["mode"]
+                if "n_density_bins" in legacy_cal:
+                    mapped["n_context_bins"] = legacy_cal["n_density_bins"]
+                raw["binarization"] = mapped
+
         cfg = cls()
         for f in fields(cls):
             if f.name not in raw:
@@ -274,7 +322,7 @@ __all__ = [
     "TestMethod",
     "ModelConfig",
     "CoverageConfig",
-    "CalibrationConfig",
+    "BinarizationConfig",
     "MarkersConfig",
     "UncertaintyConfig",
     "BatchCorrectionConfig",

@@ -22,7 +22,30 @@ class InvalidMarkerRegionsError(FinaleMeTOOError):
 
 
 class InvalidCalibrationError(FinaleMeTOOError):
-    """Calibration parameters file is malformed or missing required fields."""
+    """Calibration parameters file is malformed or missing required fields.
+
+    DEPRECATED in v3: retained as a base class for ``InvalidBinarizationError``
+    and for any v2 calibration code paths still alive during migration. New
+    code should raise ``InvalidBinarizationError`` or
+    ``InvalidMatchedDataError``.
+    """
+
+
+class InvalidBinarizationError(InvalidCalibrationError):
+    """Binarization parameters file is malformed or missing required fields.
+
+    Subclasses ``InvalidCalibrationError`` so existing ``except InvalidCalibrationError``
+    blocks still catch v3 errors during the migration.
+    """
+
+
+class InvalidMatchedDataError(InvalidCalibrationError):
+    """Matched WGBS / FinaleMe training table is malformed or unparseable.
+
+    Shared between v2 calibration training and v3 binarization training.
+    Subclasses ``InvalidCalibrationError`` so existing ``except`` blocks in v2
+    code keep working during the migration.
+    """
 
 
 class IllegalImputationError(FinaleMeTOOError):

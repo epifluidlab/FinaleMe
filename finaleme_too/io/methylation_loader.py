@@ -29,6 +29,14 @@ class MarkerObservations:
     observation. k and n are the per-marker methylated and total read counts.
     For FINALEME mode, predicted_beta optionally holds the raw FinaleMe
     prediction (uncalibrated) for each marker.
+
+    ``called_state`` and ``context_bin`` are v3 FinaleMe binarization
+    outputs populated by ``preprocessing.binarization.apply_binarization``.
+    They default to ``None`` for WGBS mode and for any FinaleMe sample that
+    has not yet been through the binarizer. The convention for
+    ``called_state`` is a uint8 array where ``0 = U``, ``1 = M``,
+    ``2 = Ambiguous``, ``3 = Excluded`` (bin not usable). ``context_bin``
+    is an int32 array of per-marker bin indices in ``[0, n_bins)``.
     """
 
     sample_id: str
@@ -39,6 +47,8 @@ class MarkerObservations:
     n: np.ndarray  # int32
     predicted_beta: np.ndarray | None  # float32 or None
     mode: MeasurementMode
+    called_state: np.ndarray | None = None  # uint8 (U=0, M=1, Ambiguous=2, Excluded=3)
+    context_bin: np.ndarray | None = None  # int32 bin index
 
     def __len__(self) -> int:
         return len(self.k)
@@ -53,6 +63,24 @@ class MarkerObservations:
 
     def with_counts(self, k: np.ndarray, n: np.ndarray) -> "MarkerObservations":
         return replace(self, k=k.astype(np.int32, copy=False), n=n.astype(np.int32, copy=False))
+
+    def with_binarization(
+        self,
+        called_state: np.ndarray,
+        context_bin: np.ndarray,
+    ) -> "MarkerObservations":
+        """Return a new ``MarkerObservations`` with binarization outputs filled in.
+
+        v3 FinaleMe path: ``apply_binarization`` calls this to attach the
+        ``called_state`` and ``context_bin`` arrays to a sample. All other
+        fields (k, n, chrom, start, end, predicted_beta, mode, sample_id)
+        are preserved bit-for-bit.
+        """
+        return replace(
+            self,
+            called_state=np.asarray(called_state, dtype=np.uint8),
+            context_bin=np.asarray(context_bin, dtype=np.int32),
+        )
 
 
 class MethylationLoader:
