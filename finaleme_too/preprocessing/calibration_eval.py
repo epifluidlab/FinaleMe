@@ -307,17 +307,56 @@ def fit_calibration(
     )
 
 
+def _cv_fold_task(
+    finaleme_beta: np.ndarray,
+    wgbs_beta: np.ndarray,
+    cpg_density: np.ndarray,
+    train_mask: np.ndarray,
+    test_mask: np.ndarray,
+    n_bins: int,
+) -> float | None:
+    """Fit one CV fold and return its test-set RMSE (or None if skipped).
+
+    Factored out so ``joblib.Parallel`` can dispatch it across workers.
+    """
+    if int(np.sum(train_mask)) < 10 or int(np.sum(test_mask)) < 5:
+        return None
+    fit = fit_calibration(
+        finaleme_beta[train_mask],
+        wgbs_beta[train_mask],
+        cpg_density[train_mask],
+        n_bins=n_bins,
+    )
+    bin_idx = _bin_indices(cpg_density[test_mask], fit.bin_edges)
+    pred = np.zeros(int(np.sum(test_mask)), dtype=np.float64)
+    for b in range(n_bins):
+        m = bin_idx == b
+        if not np.any(m):
+            continue
+        pred[m] = _expit(
+            fit.a[b] * _logit(np.clip(finaleme_beta[test_mask][m], 1e-6, 1 - 1e-6))
+            + fit.c[b]
+        )
+    return float(np.sqrt(np.mean((pred - wgbs_beta[test_mask]) ** 2)))
+
+
 def cross_validate_calibration(
     finaleme_beta: np.ndarray,
     wgbs_beta: np.ndarray,
     cpg_density: np.ndarray,
     sample_ids: np.ndarray,
     n_bins: int,
+    threads: int = 1,
 ) -> dict:
-    """Leave-one-sample-out cross-validation for a given B (math doc §6.3)."""
+    """Leave-one-sample-out cross-validation for a given B (math doc §6.3).
+
+    ``threads > 1`` parallelizes the fold loop with joblib (architecture
+    §14.2 says calibration training is embarrassingly parallel).
+    """
+    from finaleme_too.utils.parallel import parallel_map
+
     unique_samples = np.unique(sample_ids)
     if unique_samples.size < 2:
-        # No real CV possible — fit on all data
         fit = fit_calibration(finaleme_beta, wgbs_beta, cpg_density, n_bins)
         return {
             "n_bins": n_bins,
@@ -327,31 +366,27 @@ def cross_validate_calibration(
             "n_folds": 0,
         }
 
-    fold_rmses: list[float] = []
-    for held_out in unique_samples:
-        train_mask = sample_ids != held_out
-        test_mask = sample_ids == held_out
-        if int(np.sum(train_mask)) < 10 or int(np.sum(test_mask)) < 5:
-            continue
-        fit = fit_calibration(
-            finaleme_beta[train_mask],
-            wgbs_beta[train_mask],
-            cpg_density[train_mask],
-            n_bins=n_bins,
+    fold_args = [
+        (
+            finaleme_beta,
+            wgbs_beta,
+            cpg_density,
+            sample_ids != held_out,
+            sample_ids == held_out,
+            n_bins,
         )
-        edges = fit.bin_edges
-        bin_idx = _bin_indices(cpg_density[test_mask], edges)
-        pred = np.zeros(int(np.sum(test_mask)), dtype=np.float64)
-        for b in range(n_bins):
-            m = bin_idx == b
-            if not np.any(m):
-                continue
-            pred[m] = _expit(
-                fit.a[b] * _logit(np.clip(finaleme_beta[test_mask][m], 1e-6, 1 - 1e-6))
-                + fit.c[b]
-            )
-        rmse = float(np.sqrt(np.mean((pred - wgbs_beta[test_mask]) ** 2)))
-        fold_rmses.append(rmse)
+        for held_out in unique_samples
+    ]
+    # Use the threading backend: _cv_fold_task is pure numpy / scipy, which
+    # releases the GIL, and the shared arrays are huge so we avoid the
+    # loky pickling overhead.
+    fold_rmses_raw = parallel_map(
+        lambda args: _cv_fold_task(*args),
+        fold_args,
+        n_jobs=max(1, threads),
+        backend="threading",
+    )
+    fold_rmses = [r for r in fold_rmses_raw if r is not None]
     cv_rmse = float(np.mean(fold_rmses)) if fold_rmses else float("nan")
 
     in_sample = fit_calibration(finaleme_beta, wgbs_beta, cpg_density, n_bins)
@@ -372,26 +407,106 @@ def tune_n_bins(
     cpg_density: np.ndarray,
     sample_ids: np.ndarray,
     n_bins_candidates: list[int],
+    threads: int = 1,
 ) -> dict:
     """Cross-validate calibration over multiple B candidates (math doc §6.4).
 
-    Returns the best B (lowest CV-RMSE) and a list of all candidates.
+    The fold × candidate cross-product is flattened and dispatched to joblib
+    so a single pool of workers handles the entire grid. This maximizes CPU
+    utilization when there are few candidates but many CV folds (or vice
+    versa); nested parallelism would leave cores idle.
     """
-    candidates: list[dict] = []
+    from finaleme_too.utils.parallel import parallel_map
+
+    threads = max(1, int(threads))
+    unique_samples = np.unique(sample_ids)
     n_obs = int(np.sum(np.isfinite(finaleme_beta) & np.isfinite(wgbs_beta)))
+
+    # Fast path: if we have < 2 distinct samples the CV can't run — just
+    # fit each candidate on all data. Keep this serial, it's cheap.
+    if unique_samples.size < 2 or threads <= 1:
+        candidates: list[dict] = []
+        for B in n_bins_candidates:
+            result = cross_validate_calibration(
+                finaleme_beta, wgbs_beta, cpg_density, sample_ids, n_bins=B,
+                threads=1,
+            )
+            _annotate_aic_bic(result, B, n_obs)
+            candidates.append(result)
+        return _select_best_candidate(candidates)
+
+    # Parallel path: build the flat (B, held_out) task grid, run all folds
+    # through a single joblib pool, then reduce back to per-candidate
+    # results. This avoids nested parallelism.
+    fold_jobs: list[tuple[int, object, tuple]] = []
+    per_candidate_folds: dict[int, list[object]] = {B: [] for B in n_bins_candidates}
     for B in n_bins_candidates:
-        result = cross_validate_calibration(
-            finaleme_beta, wgbs_beta, cpg_density, sample_ids, n_bins=B
-        )
-        # AIC / BIC using residual sum of squares as a proxy for log-likelihood
-        n_params = 3 * B  # a_b, c_b, log_phi_b per bin
-        if not np.isnan(result["in_sample_rmse"]):
-            sse = (result["in_sample_rmse"] ** 2) * max(n_obs, 1)
-            ll = -0.5 * n_obs * (np.log(2 * np.pi * sse / max(n_obs, 1)) + 1)
-            result["aic"] = float(-2 * ll + 2 * n_params)
-            result["bic"] = float(-2 * ll + np.log(max(n_obs, 1)) * n_params)
+        for held_out in unique_samples:
+            args = (
+                finaleme_beta,
+                wgbs_beta,
+                cpg_density,
+                sample_ids != held_out,
+                sample_ids == held_out,
+                B,
+            )
+            per_candidate_folds[B].append(held_out)
+            fold_jobs.append((B, held_out, args))
+
+    # Use threading backend for the same reason as cross_validate_calibration:
+    # the inner work is pure numpy (releases the GIL) and the shared arrays
+    # would be pickled once per task with loky.
+    fold_rmses_all = parallel_map(
+        lambda job: (job[0], job[1], _cv_fold_task(*job[2])),
+        fold_jobs,
+        n_jobs=threads,
+        backend="threading",
+    )
+    # Group fold RMSEs by B
+    rmses_by_B: dict[int, list[float]] = {B: [] for B in n_bins_candidates}
+    for B, _held, rmse in fold_rmses_all:
+        if rmse is not None:
+            rmses_by_B[B].append(rmse)
+
+    # Also run the in-sample fits in parallel (cheap but non-trivial)
+    in_sample_fits = parallel_map(
+        lambda B: fit_calibration(
+            finaleme_beta, wgbs_beta, cpg_density, n_bins=B
+        ),
+        list(n_bins_candidates),
+        n_jobs=threads,
+        backend="threading",
+    )
+
+    candidates = []
+    for B, in_sample in zip(n_bins_candidates, in_sample_fits):
+        rmses = rmses_by_B[B]
+        result = {
+            "n_bins": B,
+            "cv_rmse": float(np.mean(rmses)) if rmses else float("nan"),
+            "in_sample_rmse": in_sample.overall["rmse"],
+            "in_sample_r_squared": in_sample.overall["r_squared"],
+            "n_folds": len(rmses),
+            "per_bin_metrics": in_sample.per_bin_metrics,
+            "overall": in_sample.overall,
+        }
+        _annotate_aic_bic(result, B, n_obs)
         candidates.append(result)
-    # Choose B with lowest CV-RMSE; ties broken by AIC
+    return _select_best_candidate(candidates)
+
+
+def _annotate_aic_bic(result: dict, B: int, n_obs: int) -> None:
+    """Attach AIC / BIC columns to a candidate result in place."""
+    n_params = 3 * B  # a_b, c_b, log_phi_b per bin
+    if not np.isnan(result["in_sample_rmse"]):
+        sse = (result["in_sample_rmse"] ** 2) * max(n_obs, 1)
+        ll = -0.5 * n_obs * (np.log(2 * np.pi * sse / max(n_obs, 1)) + 1)
+        result["aic"] = float(-2 * ll + 2 * n_params)
+        result["bic"] = float(-2 * ll + np.log(max(n_obs, 1)) * n_params)
+
+
+def _select_best_candidate(candidates: list[dict]) -> dict:
+    """Pick the B with lowest CV-RMSE, ties broken by AIC."""
     valid = [c for c in candidates if not np.isnan(c["cv_rmse"])]
     if not valid:
         valid = candidates

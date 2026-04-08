@@ -335,6 +335,7 @@ def train_calibration_cmd(
         out_report=report,
         cpg_index=cpg_index_path,
         region_annotation_window=region_annotation_window,
+        threads=threads,
     )
     click.echo(
         f"finaleme-too: trained calibration with B={params.n_bins} → {output} (report: {report})"

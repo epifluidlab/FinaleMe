@@ -215,6 +215,7 @@ def _normalize_chrom(df: pd.DataFrame) -> pd.DataFrame:
 def _load_matched_table(
     path: str | Path,
     modality: str = "wgbs",
+    threads: int = 1,
 ) -> pd.DataFrame:
     """Load a matched WGBS or FinaleMe table for calibration training.
 
@@ -236,6 +237,9 @@ def _load_matched_table(
 
     Chromosome prefixes are always stripped before returning so downstream
     join keys are uniform.
+
+    When ``threads > 1`` and the input is a sample sheet, per-sample files
+    are parsed in parallel via joblib.
     """
     df = pd.read_csv(path, sep="\t", comment="#")
     cols = set(df.columns)
@@ -248,7 +252,7 @@ def _load_matched_table(
     # Sample sheet format
     sheet_required = {"sample_id", "methylation_file"}
     if sheet_required.issubset(cols):
-        return _load_sample_sheet(df, Path(path).parent, modality)
+        return _load_sample_sheet(df, Path(path).parent, modality, threads=threads)
 
     raise InvalidCalibrationError(
         f"{path}: table has neither legacy columns {sorted(legacy_required)} "
@@ -256,43 +260,75 @@ def _load_matched_table(
     )
 
 
+def _parse_one_sample_row(
+    row_dict: dict,
+    base_dir: Path,
+    default_format: str,
+    has_format_col: bool,
+) -> pd.DataFrame:
+    """Worker: parse a single sample-sheet row into the canonical layout.
+
+    Factored out so ``joblib.Parallel`` can dispatch it across workers.
+    """
+    sample_id = str(row_dict["sample_id"])
+    file_path = Path(str(row_dict["methylation_file"]))
+    if not file_path.is_absolute():
+        file_path = base_dir / file_path
+    if not file_path.exists():
+        raise InvalidCalibrationError(
+            f"Sample {sample_id}: file not found: {file_path}"
+        )
+
+    file_format = None
+    if has_format_col:
+        raw_fmt = row_dict.get("format")
+        if raw_fmt is not None and pd.notna(raw_fmt) and str(raw_fmt).strip():
+            file_format = str(raw_fmt).strip().lower()
+    if file_format is None:
+        file_format = default_format
+
+    if file_format == "bissnp_6plus2":
+        return _parse_bissnp_6plus2(file_path, sample_id)
+    if file_format == "finaleme_bed":
+        return _parse_finaleme_prediction(file_path, sample_id)
+    raise InvalidCalibrationError(
+        f"Sample {sample_id}: unknown file format '{file_format}'. "
+        "Supported: bissnp_6plus2, finaleme_bed"
+    )
+
+
 def _load_sample_sheet(
     df: pd.DataFrame,
     base_dir: Path,
     modality: str,
+    threads: int = 1,
 ) -> pd.DataFrame:
-    """Iterate a sample sheet and concatenate per-sample parsed tables."""
-    parts: list[pd.DataFrame] = []
-    for _, row in df.iterrows():
-        sample_id = str(row["sample_id"])
-        file_path = Path(str(row["methylation_file"]))
-        if not file_path.is_absolute():
-            file_path = base_dir / file_path
-        if not file_path.exists():
-            raise InvalidCalibrationError(
-                f"Sample {sample_id}: file not found: {file_path}"
-            )
+    """Iterate a sample sheet and concatenate per-sample parsed tables.
 
-        file_format = None
-        if "format" in df.columns:
-            raw_fmt = row.get("format")
-            if pd.notna(raw_fmt) and str(raw_fmt).strip():
-                file_format = str(raw_fmt).strip().lower()
-        if file_format is None:
-            file_format = _default_format_for_modality(modality)
+    Parses per-sample files in parallel when ``threads > 1``. Parsing is
+    the dominant cost on large cohorts (millions of CpGs per file through
+    pandas.read_csv) so this is where parallelism pays off the most.
+    """
+    from finaleme_too.utils.parallel import parallel_map
 
-        if file_format == "bissnp_6plus2":
-            parts.append(_parse_bissnp_6plus2(file_path, sample_id))
-        elif file_format == "finaleme_bed":
-            parts.append(_parse_finaleme_prediction(file_path, sample_id))
-        else:
-            raise InvalidCalibrationError(
-                f"Sample {sample_id}: unknown file format '{file_format}'. "
-                "Supported: bissnp_6plus2, finaleme_bed"
-            )
-
-    if not parts:
+    if df.empty:
         raise InvalidCalibrationError("Sample sheet had no rows")
+
+    default_format = _default_format_for_modality(modality)
+    has_format_col = "format" in df.columns
+    # Convert DataFrame rows to plain dicts so joblib can pickle them cheaply
+    row_dicts = df.to_dict("records")
+
+    # pandas.read_csv + the gzip streaming release the GIL, so the threading
+    # backend gives real parallelism here without the loky pickling overhead.
+    parts = parallel_map(
+        lambda row_dict: _parse_one_sample_row(
+            row_dict, base_dir, default_format, has_format_col
+        ),
+        row_dicts,
+        n_jobs=max(1, int(threads)),
+        backend="threading",
+    )
     combined = pd.concat(parts, ignore_index=True)
     return _normalize_chrom(combined)
 
@@ -581,6 +617,7 @@ def train_calibration(
     out_report: str | Path,
     cpg_index: str | Path | None = None,
     region_annotation_window: int = 1000,
+    threads: int = 1,
 ) -> CalibrationParams:
     """Train per-bin calibration parameters from matched WGBS / FinaleMe samples.
 
@@ -616,8 +653,9 @@ def train_calibration(
     from finaleme_too.preprocessing.calibration_eval import fit_calibration, tune_n_bins
     from finaleme_too.io.output_writer import write_calibration_report
 
-    wgbs_df = _load_matched_table(matched_wgbs, modality="wgbs")
-    fme_df = _load_matched_table(matched_finaleme, modality="finaleme")
+    threads = max(1, int(threads))
+    wgbs_df = _load_matched_table(matched_wgbs, modality="wgbs", threads=threads)
+    fme_df = _load_matched_table(matched_finaleme, modality="finaleme", threads=threads)
 
     join_keys = ["sample_id", "chrom", "start", "end"]
     merged = wgbs_df.merge(
@@ -674,6 +712,7 @@ def train_calibration(
         cpg_density=density,
         sample_ids=sample_ids,
         n_bins_candidates=n_bins_candidates,
+        threads=threads,
     )
     best_B = int(tune_result["selected_n_bins"])
 
