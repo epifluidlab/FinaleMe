@@ -38,8 +38,15 @@ class DeconvolutionResult:
         mean_coverage     — mean total reads per marker actually used
         n_markers_used    — total markers passing the tier coverage filter
         pct_imputed       — fraction of markers filled in by CohortImputer
-        calibration_flag  — PASS / WARN / FAIL from calibration inference QC
-                            (FinaleMe mode only; None otherwise)
+        binarization_flag — PASS / WARN / FAIL from FinaleMe inference QC
+                            (FinaleMe mode only; None otherwise). Renamed
+                            from calibration_flag in v3 — under v3 the
+                            FinaleMe path uses context-dependent
+                            binarization with error rates instead of
+                            continuous calibration, but the field name
+                            stays semantically the same: it's the
+                            sample-level inference QC for the FinaleMe
+                            preprocessing step (whichever path was used).
         hemolysis_flag    — from sample metadata (None if missing)
         overall_qc        — PASS / WARN / FAIL derived from qc_flags
         residuals         — (M_used,) per-marker residual (mu_obs - mu_pred)
@@ -68,7 +75,7 @@ class DeconvolutionResult:
     mean_coverage: float = 0.0
     n_markers_used: int = 0
     pct_imputed: float = 0.0
-    calibration_flag: str | None = None
+    binarization_flag: str | None = None
     hemolysis_flag: bool | None = None
     overall_qc: str = "PASS"
     residuals: np.ndarray | None = None

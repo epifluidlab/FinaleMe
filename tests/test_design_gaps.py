@@ -217,7 +217,7 @@ def _mk_decon_result(sample_id: str, unknown: float, residuals: np.ndarray) -> D
         mean_coverage=25.0,
         n_markers_used=20,
         pct_imputed=0.0,
-        calibration_flag="PASS",
+        binarization_flag="PASS",
         hemolysis_flag=False,
         overall_qc="PASS",
         residuals=residuals,
@@ -300,7 +300,7 @@ def test_gap7_cohort_tsv_has_enriched_columns(tmp_path: Path):
         "mean_coverage",
         "n_markers_used",
         "pct_imputed",
-        "calibration_flag",
+        "binarization_flag",
         "hemolysis",
         "overall_qc",
     ):
@@ -325,7 +325,7 @@ def test_gap7_qc_summary_has_architecture_columns(tmp_path: Path):
         "pct_imputed",
         "wbc_fraction",  # NaN is fine when no Blood-* cell types
         "unknown_fraction",
-        "calibration_flag",
+        "binarization_flag",
         "hemolysis",
         "qc_flags",
         "overall_qc",

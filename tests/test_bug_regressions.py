@@ -819,7 +819,7 @@ def test_round3_gap_down_tier_keeps_marker_that_scalar_filter_would_drop():
 # HIGH — covariate adjustment must preserve enriched fields
 def test_round4_covariate_adjustment_preserves_enriched_fields():
     """After _maybe_adjust_covariates, mean_coverage, n_markers_used,
-    pct_imputed, calibration_flag, overall_qc, residuals, and the marker
+    pct_imputed, binarization_flag, overall_qc, residuals, and the marker
     coordinate arrays must all be preserved on the adjusted result."""
     import pandas as pd
     from finaleme_too.config import CoverageTier, TOOConfig
@@ -850,7 +850,7 @@ def test_round4_covariate_adjustment_preserves_enriched_fields():
             mean_coverage=27.3,  # distinctive value
             n_markers_used=18,  # distinctive value
             pct_imputed=0.125,  # distinctive value
-            calibration_flag="PASS",
+            binarization_flag="PASS",
             hemolysis_flag=False,
             overall_qc="PASS",
             residuals=rng.normal(0, 0.05, size=5),  # distinctive
@@ -898,7 +898,7 @@ def test_round4_covariate_adjustment_preserves_enriched_fields():
             f"mean_coverage dropped: {adj.mean_coverage} != {orig.mean_coverage}"
         assert adj.n_markers_used == orig.n_markers_used
         assert abs(adj.pct_imputed - orig.pct_imputed) < 1e-12
-        assert adj.calibration_flag == orig.calibration_flag
+        assert adj.binarization_flag == orig.binarization_flag
         assert adj.hemolysis_flag == orig.hemolysis_flag
         assert adj.overall_qc == orig.overall_qc
         assert adj.residuals is not None

@@ -415,7 +415,7 @@ class TOOPipeline:
         )
         # Use dataclasses.replace so every enriched field on the original
         # result (mean_dispersion, mean_coverage, n_markers_used, pct_imputed,
-        # calibration_flag, hemolysis_flag, overall_qc, residuals, marker_*)
+        # binarization_flag, hemolysis_flag, overall_qc, residuals, marker_*)
         # is preserved after covariate adjustment. Only the fields we
         # actually want to change are overridden.
         from dataclasses import replace as dc_replace
@@ -565,7 +565,7 @@ class TOOPipeline:
             and obs.context_bin is not None
         )
 
-        calibration_flag: str | None = None
+        binarization_flag: str | None = None
         if use_binarization:
             # v3 inference QC
             from finaleme_too.preprocessing.binarization_eval import (
@@ -576,7 +576,7 @@ class TOOPipeline:
                 context_bin=obs.context_bin,
                 params=self.binarization,
             )
-            calibration_flag = qc.get("flag")
+            binarization_flag = qc.get("flag")
         elif (
             sample.mode == MeasurementMode.FINALEME
             and self.calibration is not None
@@ -589,7 +589,7 @@ class TOOPipeline:
                 self.calibration,
                 cpg_density=density_vec,
             )
-            calibration_flag = qc.get("flag")
+            binarization_flag = qc.get("flag")
 
         tier = self.tier_assigner.assign(obs)
 
@@ -611,7 +611,7 @@ class TOOPipeline:
                 obs=obs,
                 reference=reference,
                 tier=tier,
-                calibration_flag=calibration_flag,
+                binarization_flag=binarization_flag,
                 pre_impute_n=pre_impute_n,
                 out_dir=out_dir,
             )
@@ -888,7 +888,7 @@ class TOOPipeline:
             mean_coverage=mean_coverage,
             n_markers_used=valid_n,
             pct_imputed=pct_imputed,
-            calibration_flag=calibration_flag,
+            binarization_flag=binarization_flag,
             hemolysis_flag=hemolysis_flag,
             residuals=residuals,
             marker_chrom=np.asarray(obs_filtered.chrom, dtype=object),
@@ -899,7 +899,7 @@ class TOOPipeline:
             result=result,
             observation=observation,
             qc_config=self.config.qc,
-            calibration_flag=calibration_flag,
+            binarization_flag=binarization_flag,
             hemolysis=hemolysis_flag,
         )
         # overall_qc derived from qc_flags
@@ -919,7 +919,7 @@ class TOOPipeline:
         obs: MarkerObservations,
         reference: ReferencePanel,
         tier: CoverageTier,
-        calibration_flag: str | None,
+        binarization_flag: str | None,
         pre_impute_n: np.ndarray | None,
         out_dir: Path,
     ) -> DeconvolutionResult:
@@ -947,7 +947,7 @@ class TOOPipeline:
             mean_coverage=effective_coverage_in_markers(obs),
             n_markers_used=0,
             pct_imputed=0.0,
-            calibration_flag=calibration_flag,
+            binarization_flag=binarization_flag,
             hemolysis_flag=None,
             overall_qc="FAIL",
         )

@@ -17,10 +17,17 @@ def compute_qc_flags(
     result: "DeconvolutionResult",
     observation: "ObservationModel",
     qc_config: QCConfig,
-    calibration_flag: str | None = None,
+    binarization_flag: str | None = None,
     hemolysis: bool | None = None,
 ) -> list[str]:
-    """Generate the qc_flags list for a single sample."""
+    """Generate the qc_flags list for a single sample.
+
+    The ``binarization_flag`` parameter was renamed from ``calibration_flag``
+    in v3 to reflect the FinaleMe path now using context-dependent
+    binarization. The flag values (PASS / WARN / FAIL) and their semantics
+    are unchanged — they describe the per-sample inference QC for the
+    FinaleMe preprocessing step.
+    """
     flags: list[str] = []
 
     # Unknown component too high
@@ -41,9 +48,9 @@ def compute_qc_flags(
         if wbc > qc_config.max_wbc_fraction:
             flags.append("WBC_DOMINANT")
 
-    # Calibration flag (FinaleMe mode)
-    if calibration_flag in ("WARN", "FAIL"):
-        flags.append(f"CALIBRATION_{calibration_flag}")
+    # Binarization flag (FinaleMe mode). Renamed from CALIBRATION_* in v3.
+    if binarization_flag in ("WARN", "FAIL"):
+        flags.append(f"BINARIZATION_{binarization_flag}")
 
     # Hemolysis (from sample sheet)
     if hemolysis is True:

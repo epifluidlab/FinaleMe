@@ -132,7 +132,7 @@ def write_cohort_proportions(
         columns.append(f"{ct}_reliability")
     columns.extend(
         [
-            "calibration_flag",
+            "binarization_flag",
             "hemolysis",
             "qc_flags",
             "overall_qc",
@@ -159,7 +159,7 @@ def write_cohort_proportions(
                 row[f"{ct}_p_goodness"] = float("nan")
             row[f"{ct}_p_detection"] = float(r.p_detection[i])
             row[f"{ct}_reliability"] = str(r.reliability[i])
-        row["calibration_flag"] = r.calibration_flag or "NA"
+        row["binarization_flag"] = r.binarization_flag or "NA"
         row["hemolysis"] = (
             "TRUE" if r.hemolysis_flag is True
             else ("FALSE" if r.hemolysis_flag is False else "NA")
@@ -182,8 +182,13 @@ def write_qc_summary(
 
     Columns:
         sample_id group coverage_tier mean_coverage n_markers_used
-        pct_imputed wbc_fraction unknown_fraction calibration_flag
+        pct_imputed wbc_fraction unknown_fraction binarization_flag
         hemolysis qc_flags overall_qc
+
+    The ``binarization_flag`` column was renamed from ``calibration_flag``
+    in v3 to reflect the FinaleMe path's switch from continuous calibration
+    to context-dependent binarization. Values (PASS / WARN / FAIL) and
+    semantics are unchanged.
     """
     rows = []
     for r in results:
@@ -204,7 +209,7 @@ def write_qc_summary(
                 "pct_imputed": _format_proportion(r.pct_imputed),
                 "wbc_fraction": _format_proportion(wbc) if not np.isnan(wbc) else float("nan"),
                 "unknown_fraction": _format_proportion(unknown),
-                "calibration_flag": r.calibration_flag or "NA",
+                "binarization_flag": r.binarization_flag or "NA",
                 "hemolysis": (
                     "TRUE" if r.hemolysis_flag is True
                     else ("FALSE" if r.hemolysis_flag is False else "NA")
