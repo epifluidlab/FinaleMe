@@ -313,6 +313,11 @@ def apply_binarization(
     # the open_sea fallback bin — the exact issue reported by the user.
     if region_annotations is not None and not region_annotations.empty:
         ann_lookup = prepare_region_annotation_lookup(region_annotations)
+        # Defensive guard: pandas reindex on MultiIndex requires uniqueness.
+        # prepare_region_annotation_lookup enforces this, but keep a local
+        # fallback so stale cached objects from older runs cannot crash.
+        if not ann_lookup.index.is_unique:
+            ann_lookup = ann_lookup[~ann_lookup.index.duplicated(keep="first")]
         obs_chrom_norm = np.array(
             [
                 c[3:] if isinstance(c, str) and c.startswith("chr") else str(c)
@@ -425,6 +430,13 @@ def prepare_region_annotation_lookup(
         )
         lookup = lookup.drop_duplicates(subset=["chrom", "start", "end"], keep="first")
         lookup = lookup.set_index(["chrom", "start", "end"])
+
+    # ``reindex`` on a MultiIndex raises if duplicates remain.
+    if not lookup.index.is_unique:
+        lookup = lookup[~lookup.index.duplicated(keep="first")]
+    # Stable ordering improves reindex performance on repeated calls.
+    if not lookup.index.is_monotonic_increasing:
+        lookup = lookup.sort_index()
 
     lookup.attrs["_finaleme_too_region_lookup"] = True
     return lookup

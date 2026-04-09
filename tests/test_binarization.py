@@ -281,6 +281,33 @@ def test_apply_binarization_with_no_region_annotation_does_not_crash():
     assert set(binarized.context_bin.tolist()) == {6}
 
 
+def test_apply_binarization_with_duplicate_region_keys_does_not_crash():
+    """Duplicate (chrom,start,end) rows in region_annotation should be
+    handled by taking the first row, not by raising MultiIndex reindex
+    errors."""
+    params = build_identity_placeholder_params()
+    pred = np.array([0.05, 0.95], dtype=np.float32)
+    obs = _mk_obs("s1", pred)
+
+    # Marker 0 appears twice with different annotations (duplicate key).
+    ann = pd.DataFrame(
+        {
+            "chrom": ["chr1", "1", "chr1"],
+            "start": [1000, 1000, 2000],
+            "end": [1100, 1100, 2100],
+            "cpg_density": [0.15, 0.005, 0.05],
+            "region_class": ["CGI", "open_sea", "shore"],
+        }
+    )
+
+    out = apply_binarization(obs, params, region_annotations=ann)
+    assert out.called_state.shape == (2,)
+    assert out.context_bin.shape == (2,)
+    # First duplicate row is kept for marker 0: CGI -> class 0, sub-bin 0 => bin 0
+    # Marker 1: shore -> class 1, sub-bin 0 => bin 2
+    assert out.context_bin.tolist() == [0, 2]
+
+
 def test_apply_binarization_preserves_k_n_predicted_beta():
     """apply_binarization must NOT modify k, n, or predicted_beta."""
     params = build_identity_placeholder_params()
