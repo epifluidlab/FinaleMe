@@ -2056,3 +2056,140 @@ def test_v3bug_biological_covariates_empty_when_no_metadata():
     pipeline = TOOPipeline(cfg)
     resolved = pipeline._resolve_biological_covariates(sheet)
     assert resolved == []
+
+
+# HIGH — post-drop group size re-check in compositional_regression_test
+def test_v3bug_ilr_regression_rechecks_group_size_after_nan_dropna():
+    """compositional_regression_test must NOT fit a regression where
+    either contrast group has <2 samples AFTER covariate row-dropping.
+
+    The pre-fit guard only checks pre-drop group sizes. If a sample has a
+    NaN covariate value it's dropped from the fit, which can silently
+    turn a pre-drop 2-vs-3 contrast into a 1-vs-3 contrast — statistically
+    meaningless because the 1-sample group's coefficient has zero
+    within-group variance. The fix: after computing row_valid, re-check
+    that each contrast group still has ≥2 samples in the filtered mask.
+    """
+    from finaleme_too.postprocessing.statistical_testing import (
+        compositional_regression_test,
+    )
+
+    sample_ids = ["s1", "s2", "s3", "s4", "s5"]
+    groups = ["A", "A", "B", "B", "B"]
+    proportions = np.array([
+        [0.4, 0.4, 0.2],
+        [0.5, 0.3, 0.2],
+        [0.2, 0.6, 0.2],
+        [0.3, 0.5, 0.2],
+        [0.25, 0.55, 0.2],
+    ])
+    # Group A has 2 samples pre-drop but one has a NaN age → 1 after drop
+    cov_df = pd.DataFrame(
+        {"age": [50, np.nan, 60, 62, 58]},
+        index=sample_ids,
+    )
+    cov_df.index.name = "sample_id"
+
+    results = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B")],
+        covariates=cov_df,
+    )
+    # Both cell types should be skipped (NaN p-values) because A post-drop
+    # has only 1 sample. The pre-fix behavior would produce finite but
+    # meaningless p-values.
+    assert len(results) == 2
+    for r in results:
+        assert np.isnan(r.p_value), (
+            f"{r.cell_type} {r.contrast}: expected NaN (skipped), got {r.p_value}"
+        )
+
+
+def test_v3bug_ilr_regression_post_drop_guard_preserves_clean_runs():
+    """Sanity check: the post-drop group-size guard must NOT spuriously
+    skip contrasts where all samples have finite covariates. This
+    verifies the fix doesn't over-fire."""
+    from finaleme_too.postprocessing.statistical_testing import (
+        compositional_regression_test,
+    )
+
+    sample_ids = ["s1", "s2", "s3", "s4", "s5"]
+    groups = ["A", "A", "B", "B", "B"]
+    proportions = np.array([
+        [0.4, 0.4, 0.2],
+        [0.5, 0.3, 0.2],
+        [0.2, 0.6, 0.2],
+        [0.3, 0.5, 0.2],
+        [0.25, 0.55, 0.2],
+    ])
+    cov_df = pd.DataFrame(
+        {"age": [50, 52, 60, 62, 58]},  # no NaNs
+        index=sample_ids,
+    )
+    cov_df.index.name = "sample_id"
+
+    results = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B")],
+        covariates=cov_df,
+    )
+    # Both cell types should produce finite p-values (2 vs 3 is usable)
+    assert len(results) == 2
+    for r in results:
+        assert np.isfinite(r.p_value)
+        # And extras must report the post-drop group sizes
+        assert r.extra is not None
+        assert r.extra["n_a_after_dropna"] == 2
+        assert r.extra["n_b_after_dropna"] == 3
+
+
+def test_v3bug_ilr_regression_post_drop_guard_per_contrast():
+    """The post-drop guard must be per-contrast: a cohort where contrast
+    (A, B) is valid but contrast (A, C) is not (because C has all-NaN
+    covariates) should return a valid result for (A, B) and a skipped
+    result for (A, C)."""
+    from finaleme_too.postprocessing.statistical_testing import (
+        compositional_regression_test,
+    )
+
+    sample_ids = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"]
+    groups = ["A", "A", "A", "B", "B", "B", "C", "C"]
+    proportions = np.array([
+        [0.4, 0.4, 0.2], [0.45, 0.35, 0.2], [0.5, 0.3, 0.2],
+        [0.2, 0.6, 0.2], [0.25, 0.55, 0.2], [0.3, 0.5, 0.2],
+        [0.6, 0.2, 0.2], [0.55, 0.25, 0.2],
+    ])
+    # C has all-NaN age → both C samples drop, so (A, C) cannot run
+    # but (A, B) is clean and should produce finite p-values.
+    cov_df = pd.DataFrame(
+        {"age": [50, 52, 48, 60, 62, 58, np.nan, np.nan]},
+        index=sample_ids,
+    )
+    cov_df.index.name = "sample_id"
+
+    results = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B"), ("A", "C")],
+        covariates=cov_df,
+    )
+    # 2 cell types * 2 contrasts = 4 rows
+    assert len(results) == 4
+    ab_results = [r for r in results if r.contrast == "A_vs_B"]
+    ac_results = [r for r in results if r.contrast == "A_vs_C"]
+    assert len(ab_results) == 2
+    assert len(ac_results) == 2
+    # A_vs_B should be finite
+    for r in ab_results:
+        assert np.isfinite(r.p_value), f"A_vs_B should be finite: {r}"
+    # A_vs_C should be skipped (C has 0 samples after NaN drop)
+    for r in ac_results:
+        assert np.isnan(r.p_value), f"A_vs_C should be skipped: {r}"

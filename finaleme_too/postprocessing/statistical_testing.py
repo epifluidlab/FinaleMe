@@ -130,6 +130,23 @@ def compositional_regression_test(
                 results.append(_skipped_result(cell_type_names[j], group_a, group_b))
                 continue
 
+            # Post-drop group-size re-check. The initial pre-drop guard
+            # above confirms each contrast group has ≥2 samples in the
+            # full cohort, but covariate NaN row-dropping can silently
+            # shrink either group below that threshold. A 1-vs-N contrast
+            # post-drop yields a statistically meaningless p-value (the
+            # group coefficient and its standard error are both driven
+            # by a single observation), so we re-check per-group sizes
+            # on the filtered mask and skip any contrast where either
+            # group has <2 samples remaining.
+            a_mask_filtered = a_mask & row_valid
+            b_mask_filtered = b_mask & row_valid
+            n_a_after = int(a_mask_filtered.sum())
+            n_b_after = int(b_mask_filtered.sum())
+            if n_a_after < 2 or n_b_after < 2:
+                results.append(_skipped_result(cell_type_names[j], group_a, group_b))
+                continue
+
             X = X_full[row_valid]
             y_v = y[row_valid]
             n_obs = X.shape[0]
@@ -192,6 +209,8 @@ def compositional_regression_test(
                     p_value=p,
                     extra={
                         "n_obs": n_obs,
+                        "n_a_after_dropna": n_a_after,
+                        "n_b_after_dropna": n_b_after,
                         "n_covariates": (
                             len(cov_col_names) if cov_col_names else 0
                         ),
