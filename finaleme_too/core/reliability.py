@@ -4,7 +4,8 @@ Reliability combines:
   - p_detection: bootstrap stability above a noise floor.
   - likelihood_score: weighted per-marker log-likelihood gain over an
     ablated-null model.
-  - p_likelihood: likelihood-ratio p-value vs the same ablated-null model.
+  - q_likelihood: BH-adjusted likelihood-ratio p-value vs the same
+    ablated-null model (fallback to raw p_likelihood when q is unavailable).
 
 ``p_goodness`` remains available as a legacy helper function, but it is no
 longer used for reliability assignment or default output tables.
@@ -559,25 +560,31 @@ def assign_reliability(
     p_detection: float,
     likelihood_score: float | None = None,
     p_likelihood: float | None = None,
+    q_likelihood: float | None = None,
     effect_size: float | None = None,
 ) -> str:
     """Assign HIGH/MODERATE/LOW/UNRELIABLE from stability + likelihood metrics.
 
     Thresholds are intentionally conservative:
-      HIGH:      p_detection >= 0.95, likelihood > 0, p_likelihood <= 1e-3
-      MODERATE:  p_detection >= 0.50, likelihood > 0, p_likelihood <= 0.05
+      HIGH:      p_detection >= 0.95, likelihood > 0, q_likelihood <= 1e-3
+      MODERATE:  p_detection >= 0.50, likelihood > 0, q_likelihood <= 0.05
       UNRELIABLE (when fit metrics unavailable): p_detection < 0.10
       UNRELIABLE (when fit metrics available):   p_detection < 0.50 and
-                                                 (likelihood <= 0 or p_likelihood > 0.20)
+                                                 (likelihood <= 0 or q_likelihood > 0.20)
       else LOW.
+
+    ``q_likelihood`` is preferred when available; raw ``p_likelihood`` is a
+    backward-compatible fallback.
     """
     _ = effect_size  # deprecated, ignored
     if np.isnan(p_detection):
         p_detection = 0.0
 
     lik_missing = likelihood_score is None or np.isnan(likelihood_score)
-    pl_missing = p_likelihood is None or np.isnan(p_likelihood)
-    if lik_missing or pl_missing:
+    q_missing = q_likelihood is None or np.isnan(q_likelihood)
+    fit_p = p_likelihood if q_missing else q_likelihood
+    fp_missing = fit_p is None or np.isnan(fit_p)
+    if lik_missing or fp_missing:
         if p_detection >= 0.95:
             return "HIGH"
         if p_detection >= 0.50:
@@ -587,7 +594,7 @@ def assign_reliability(
         return "LOW"
 
     lik = float(likelihood_score)
-    pl = float(p_likelihood)
+    pl = float(fit_p)
 
     if p_detection >= 0.95 and lik > 0.0 and pl <= 1e-3:
         return "HIGH"

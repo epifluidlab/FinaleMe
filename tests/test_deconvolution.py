@@ -105,11 +105,16 @@ def test_bootstrap_ci_contains_point_estimate(
 
 
 def test_reliability_assignment_table():
-    # New reliability uses p_detection + likelihood_score + p_likelihood.
-    assert assign_reliability(0.99, 0.05, 1e-6) == "HIGH"
-    assert assign_reliability(0.70, 0.01, 1e-2) == "MODERATE"
-    assert assign_reliability(0.70, 0.0, 0.5) == "LOW"
-    assert assign_reliability(0.10, -0.01, 0.9) == "UNRELIABLE"
+    # Reliability uses p_detection + likelihood_score + q_likelihood
+    # (falling back to raw p_likelihood when q is unavailable).
+    assert assign_reliability(0.99, 0.05, 1e-6, 1e-6) == "HIGH"
+    assert assign_reliability(0.70, 0.01, 1e-2, 1e-2) == "MODERATE"
+    assert assign_reliability(0.70, 0.0, 0.5, 0.5) == "LOW"
+    assert assign_reliability(0.10, -0.01, 0.9, 0.9) == "UNRELIABLE"
+    # q_likelihood should take precedence over raw p_likelihood.
+    assert assign_reliability(0.95, 0.1, 1e-9, 0.2) == "LOW"
+    # Backward-compatible call path (q missing -> use raw p_likelihood).
+    assert assign_reliability(0.99, 0.05, 1e-6, None) == "HIGH"
     # Unknown-component style call (no fit metrics): detection-only fallback.
     assert assign_reliability(0.99, None, None) == "HIGH"
     assert assign_reliability(0.70, None, None) == "MODERATE"

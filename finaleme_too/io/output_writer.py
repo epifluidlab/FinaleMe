@@ -60,8 +60,10 @@ _TOO_TSV_HEADER_COMMENT = """\
 #                      vs the same ablated null model (higher is better)
 #   p_likelihood     — likelihood-ratio p-value vs the same ablated null
 #                      (smaller is better; <0.05 usually indicates real gain)
+#   q_likelihood     — BH-adjusted p_likelihood across known cell types
+#                      (preferred for reliability thresholding)
 #   reliability      — HIGH / MODERATE / LOW / UNRELIABLE combining p_detection,
-#                      likelihood_score, and p_likelihood
+#                      likelihood_score, and q_likelihood
 #   n_markers        — number of markers contributing to this cell type's estimate
 #   mean_dispersion  — mean beta-binomial dispersion phi over the top discriminative
 #                      markers for this cell type (larger = tighter, less noisy)
@@ -75,7 +77,8 @@ def write_per_sample_too(result: DeconvolutionResult, path: str | Path) -> None:
 
     Output columns (architecture §10.1):
         cell_type proportion ci_lower ci_upper p_detection
-        likelihood_score p_likelihood reliability n_markers mean_dispersion
+        likelihood_score p_likelihood q_likelihood reliability n_markers
+        mean_dispersion
 
     The file begins with a ``#``-prefixed header comment documenting the
     high-confusability column semantics (see ``_TOO_TSV_HEADER_COMMENT``).
@@ -95,6 +98,11 @@ def write_per_sample_too(result: DeconvolutionResult, path: str | Path) -> None:
             if result.p_likelihood is not None and i < len(result.p_likelihood)
             else float("nan")
         )
+        qlik = (
+            float(result.q_likelihood[i])
+            if result.q_likelihood is not None and i < len(result.q_likelihood)
+            else float("nan")
+        )
         n_mark = int(result.n_markers[i]) if i < K and result.n_markers is not None else 0
         mean_disp = (
             float(result.mean_dispersion[i])
@@ -110,6 +118,7 @@ def write_per_sample_too(result: DeconvolutionResult, path: str | Path) -> None:
                 "p_detection": float(result.p_detection[i]),
                 "likelihood_score": lik,
                 "p_likelihood": plik,
+                "q_likelihood": qlik,
                 "reliability": str(result.reliability[i]),
                 "n_markers": n_mark,
                 "mean_dispersion": mean_disp,
@@ -159,6 +168,7 @@ def write_cohort_proportions(
         columns.append(f"{ct}_p_detection")
         columns.append(f"{ct}_likelihood_score")
         columns.append(f"{ct}_p_likelihood")
+        columns.append(f"{ct}_q_likelihood")
         columns.append(f"{ct}_reliability")
     columns.extend(
         [
@@ -192,6 +202,10 @@ def write_cohort_proportions(
                 row[f"{ct}_p_likelihood"] = float(r.p_likelihood[i])
             else:
                 row[f"{ct}_p_likelihood"] = float("nan")
+            if r.q_likelihood is not None and i < len(r.q_likelihood):
+                row[f"{ct}_q_likelihood"] = float(r.q_likelihood[i])
+            else:
+                row[f"{ct}_q_likelihood"] = float("nan")
             row[f"{ct}_reliability"] = str(r.reliability[i])
         row["binarization_flag"] = r.binarization_flag or "NA"
         row["hemolysis"] = (
@@ -258,7 +272,7 @@ def write_binarization_debug(
     sample_groups: dict[str, str | None],
     path: str | Path,
 ) -> None:
-    """Write a per-sample FinaleMe binarization debug report.
+    """Write a transposed FinaleMe binarization debug report.
 
     This report is intentionally compact and focused on answering:
     "why did this sample end up with n_markers_used == 0 / unknown == 1?"
@@ -280,7 +294,7 @@ def write_binarization_debug(
         rows.append(row)
     if not rows:
         return
-    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.6g")
+    _write_sample_transposed(pd.DataFrame(rows), path)
 
 
 def write_group_comparison(

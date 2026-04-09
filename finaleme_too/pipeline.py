@@ -1005,10 +1005,12 @@ class TOOPipeline:
         # Reliability assignment uses:
         #   (1) p_detection
         #   (2) likelihood_score
-        #   (3) p_likelihood (LRT p-value vs ablated-null)
+        #   (3) q_likelihood (BH-adjusted LRT p-value vs ablated-null)
+        #       with raw p_likelihood retained for transparency.
         K = reference.n_cell_types
         likelihood_score = np.full(K + 1, np.nan, dtype=np.float64)
         p_likelihood = np.full(K + 1, np.nan, dtype=np.float64)
+        q_likelihood = np.full(K + 1, np.nan, dtype=np.float64)
         p_detection = np.zeros(K + 1, dtype=np.float64)
         for j in range(K):
             p_detection[j] = compute_p_detection(
@@ -1037,6 +1039,8 @@ class TOOPipeline:
         )
         likelihood_score[K] = lik_u
         p_likelihood[K] = plik_u
+        # Multiple-testing correction across known cell types only.
+        q_likelihood[:K] = _benjamini_hochberg(p_likelihood[:K])
 
         reliability = np.empty(K + 1, dtype=object)
         for j in range(K):
@@ -1044,11 +1048,13 @@ class TOOPipeline:
                 p_detection=p_detection[j],
                 likelihood_score=likelihood_score[j],
                 p_likelihood=p_likelihood[j],
+                q_likelihood=q_likelihood[j],
             )
         reliability[K] = assign_reliability(
             p_detection=p_detection[K],
             likelihood_score=likelihood_score[K],
             p_likelihood=p_likelihood[K],
+            q_likelihood=q_likelihood[K],
         )
 
         # n_markers per cell type — count valid markers contributing to that
@@ -1138,6 +1144,7 @@ class TOOPipeline:
             p_detection=p_detection,
             likelihood_score=likelihood_score,
             p_likelihood=p_likelihood,
+            q_likelihood=q_likelihood,
             reliability=reliability,
             n_markers=n_markers,
             bootstrap_proportions=bootstrap_samples_field,
@@ -1200,6 +1207,7 @@ class TOOPipeline:
             p_detection=np.zeros(K + 1, dtype=np.float64),
             likelihood_score=np.full(K + 1, np.nan, dtype=np.float64),
             p_likelihood=np.full(K + 1, np.nan, dtype=np.float64),
+            q_likelihood=np.full(K + 1, np.nan, dtype=np.float64),
             reliability=reliability,
             n_markers=np.zeros(K, dtype=np.int32),
             coverage_tier=tier,
@@ -1224,6 +1232,27 @@ class TOOPipeline:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
+    """BH-adjust p-values in [0, 1], preserving NaN entries."""
+    pvals = np.asarray(pvals, dtype=np.float64)
+    out = np.full(pvals.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(pvals)
+    if not np.any(finite):
+        return out
+    p = np.clip(pvals[finite], 0.0, 1.0)
+    m = p.size
+    order = np.argsort(p)
+    ranked = p[order]
+    ranks = np.arange(1, m + 1, dtype=np.float64)
+    adj_ranked = ranked * (m / ranks)
+    adj_ranked = np.minimum.accumulate(adj_ranked[::-1])[::-1]
+    adj_ranked = np.clip(adj_ranked, 0.0, 1.0)
+    adj = np.empty_like(adj_ranked)
+    adj[order] = adj_ranked
+    out[finite] = adj
+    return out
 
 
 def _subset_reference(reference: ReferencePanel, indices: np.ndarray) -> ReferencePanel:

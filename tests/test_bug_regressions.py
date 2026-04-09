@@ -1625,6 +1625,7 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
         p_detection=np.array([1.0, 0.97, 0.9]),
         likelihood_score=np.array([0.05, 0.03, 0.02]),
         p_likelihood=np.array([1e-6, 1e-4, 1e-2]),
+        q_likelihood=np.array([2e-6, 2e-4, np.nan]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([10, 10], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1646,6 +1647,7 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
     assert "p_detection" in head_text
     assert "likelihood_score" in head_text
     assert "p_likelihood" in head_text
+    assert "q_likelihood" in head_text
     # Some variant of "HIGH = GOOD" must appear (case-insensitive).
     assert "HIGH = GOOD" in head_text or "high = good" in head_text.lower()
 
@@ -1667,6 +1669,7 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
         p_detection=np.array([0.99, 0.97, 0.85]),
         likelihood_score=np.array([0.07, 0.04, 0.01]),
         p_likelihood=np.array([1e-5, 1e-3, 0.2]),
+        q_likelihood=np.array([2e-5, 2e-3, np.nan]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([42, 37], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1687,6 +1690,7 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
     # Unknown row now carries fit metrics (no missing values).
     assert np.isfinite(float(df["likelihood_score"].iloc[-1]))
     assert np.isfinite(float(df["p_likelihood"].iloc[-1]))
+    assert np.isnan(float(df["q_likelihood"].iloc[-1]))
 
 
 # ---------------------------------------------------------------------------

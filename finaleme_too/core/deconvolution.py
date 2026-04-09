@@ -71,9 +71,11 @@ class DeconvolutionResult:
     n_markers: np.ndarray  # (K,)
     # New reliability metrics (K+1; unknown included as last entry):
     #   likelihood_score — weighted per-marker log-likelihood gain vs null
-    #   p_likelihood     — LRT p-value vs ablated-null (smaller is better)
+    #   p_likelihood     — raw LRT p-value vs ablated-null (smaller is better)
+    #   q_likelihood     — BH-adjusted p-value across known cell types
     likelihood_score: np.ndarray | None = None  # (K+1,)
     p_likelihood: np.ndarray | None = None  # (K+1,)
+    q_likelihood: np.ndarray | None = None  # (K+1,)
     # Deprecated legacy metric (kept for backward compatibility only).
     effect_size: np.ndarray | None = None  # (K+1,)
     bootstrap_proportions: np.ndarray | None = None  # (B, K+1)
