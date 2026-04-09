@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
+from scipy import special
 from scipy.optimize import minimize
 
 from finaleme_too.config import CoverageTier
@@ -24,6 +25,61 @@ if TYPE_CHECKING:
 
 UNKNOWN_PROFILE = 0.5  # flat methylation for the unknown component
 log = logging.getLogger(__name__)
+
+
+def hierarchical_marker_log_likelihood(
+    *,
+    w: np.ndarray,
+    reference_continuous: np.ndarray,
+    k: np.ndarray,
+    n: np.ndarray,
+    phi: np.ndarray,
+    tau_low: np.ndarray,
+    tau_high: np.ndarray,
+    call_zone_prob: np.ndarray,
+    call_weight: float,
+) -> np.ndarray:
+    """Per-marker hierarchical log-likelihood for FinaleMe binarization.
+
+    The joint marker term is:
+      log P(k | n, mu(w), phi) + log E_posterior[q(call | zone(p))^call_weight]
+
+    where the expectation is under p ~ Beta(k+alpha, n-k+beta), with
+    alpha=mu*phi and beta=(1-mu)*phi.
+    """
+    mu = np.clip(reference_continuous @ w, 1e-9, 1.0 - 1e-9)
+    ll_count = log_likelihood_per_marker(k, n, mu, phi)
+
+    alpha = mu * phi
+    beta = (1.0 - mu) * phi
+    post_a = k + alpha
+    post_b = (n - k) + beta
+
+    t_low = np.clip(np.minimum(tau_low, tau_high), 0.0, 1.0)
+    t_high = np.clip(np.maximum(tau_low, tau_high), 0.0, 1.0)
+
+    p_low = special.betainc(post_a, post_b, t_low)
+    p_high = 1.0 - special.betainc(post_a, post_b, t_high)
+    p_mid = np.clip(1.0 - p_low - p_high, 0.0, 1.0)
+
+    cz = np.clip(call_zone_prob, 1e-12, 1.0)
+    cw = float(np.clip(call_weight, 0.0, 1.0))
+    if abs(cw - 1.0) < 1e-12:
+        g_low = cz[:, 0]
+        g_mid = cz[:, 1]
+        g_high = cz[:, 2]
+    elif cw <= 0.0:
+        g_low = np.ones_like(p_low)
+        g_mid = np.ones_like(p_mid)
+        g_high = np.ones_like(p_high)
+    else:
+        g_low = np.power(cz[:, 0], cw)
+        g_mid = np.power(cz[:, 1], cw)
+        g_high = np.power(cz[:, 2], cw)
+
+    q_eff = np.clip(g_low * p_low + g_mid * p_mid + g_high * p_high, 1e-15, 1.0)
+    ll_call = np.log(q_eff)
+    return ll_count + ll_call
 
 
 @dataclass
@@ -110,6 +166,8 @@ class MLEDeconvolver:
         max_iter: int = 200,
         tol: float = 1e-8,
         binarization_count_weight: float = 1.0,
+        binarization_model: str = "legacy",
+        hierarchical_quadrature_points: int = 24,
     ):
         self.max_iter = max_iter
         self.tol = tol
@@ -117,6 +175,10 @@ class MLEDeconvolver:
         #   logL = logL_state + binarization_count_weight * logL_count
         # Set to 0.0 to recover the legacy state-only solver.
         self.binarization_count_weight = max(float(binarization_count_weight), 0.0)
+        self.binarization_model = str(binarization_model or "legacy").lower()
+        self.hierarchical_quadrature_points = max(
+            int(hierarchical_quadrature_points), 2
+        )
 
     def solve(
         self,
@@ -147,6 +209,9 @@ class MLEDeconvolver:
         )
 
         if isinstance(model, BinarizationObservationModel):
+            obs_model = str(getattr(model, "binarization_model", "legacy")).lower()
+            if self.binarization_model == "hierarchical" or obs_model == "hierarchical":
+                return self._solve_hierarchical_binarization(model, marker_subset)
             return self._solve_binarization(model, reference, marker_subset)
         return self._solve_betabinom(model, reference, marker_subset)
 
@@ -346,6 +411,91 @@ class MLEDeconvolver:
             neg_ll, neg_grad, K_total, sample_id=model.sample_id
         )
 
+    def _solve_hierarchical_binarization(
+        self,
+        model,  # BinarizationObservationModel
+        marker_subset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Hierarchical FinaleMe MLE solve with joint count+state likelihood."""
+        if (
+            model.reference_continuous is None
+            or model.k is None
+            or model.n is None
+            or model.dispersion is None
+            or model.tau_low_per is None
+            or model.tau_high_per is None
+            or model.call_zone_prob is None
+        ):
+            raise DeconvolutionFailedError(
+                f"Sample {model.sample_id}: hierarchical binarization model is missing "
+                "reference_continuous/k/n/dispersion/tau/call_zone_prob."
+            )
+
+        R = np.asarray(model.reference_continuous, dtype=np.float64)
+        k = np.asarray(model.k, dtype=np.float64)
+        n = np.asarray(model.n, dtype=np.float64)
+        phi = np.asarray(model.dispersion, dtype=np.float64)
+        tau_low = np.asarray(model.tau_low_per, dtype=np.float64)
+        tau_high = np.asarray(model.tau_high_per, dtype=np.float64)
+        call_zone_prob = np.asarray(model.call_zone_prob, dtype=np.float64)
+        weights = np.asarray(model.weights, dtype=np.float64)
+        call_weight = float(np.clip(getattr(model, "call_weight", 1.0), 0.0, 1.0))
+
+        if marker_subset is not None:
+            R = R[marker_subset]
+            k = k[marker_subset]
+            n = n[marker_subset]
+            phi = phi[marker_subset]
+            tau_low = tau_low[marker_subset]
+            tau_high = tau_high[marker_subset]
+            call_zone_prob = call_zone_prob[marker_subset]
+            weights = weights[marker_subset]
+
+        valid = (
+            np.all(np.isfinite(R), axis=1)
+            & np.isfinite(k)
+            & np.isfinite(n)
+            & np.isfinite(phi)
+            & np.isfinite(tau_low)
+            & np.isfinite(tau_high)
+            & np.all(np.isfinite(call_zone_prob), axis=1)
+            & (n > 0)
+        )
+        K_total = R.shape[1]
+        if int(np.sum(valid)) < K_total:
+            uniform = np.zeros(K_total, dtype=np.float64)
+            uniform[-1] = 1.0
+            return uniform
+
+        R_v = R[valid]
+        k_v = k[valid]
+        n_v = n[valid]
+        phi_v = phi[valid]
+        tl_v = tau_low[valid]
+        th_v = tau_high[valid]
+        cz_v = call_zone_prob[valid]
+        w_obj = weights[valid]
+
+        def neg_ll(w: np.ndarray) -> float:
+            ll_vec = hierarchical_marker_log_likelihood(
+                w=w,
+                reference_continuous=R_v,
+                k=k_v,
+                n=n_v,
+                phi=phi_v,
+                tau_low=tl_v,
+                tau_high=th_v,
+                call_zone_prob=cz_v,
+                call_weight=call_weight,
+            )
+            return -float(np.sum(w_obj * ll_vec))
+
+        # Start with scipy's internal finite-difference Jacobian for the
+        # hierarchical model; this is robust and keeps implementation simple.
+        return self._run_slsqp(
+            neg_ll, None, K_total, sample_id=model.sample_id
+        )
+
     def _run_slsqp(
         self,
         neg_ll,
@@ -368,14 +518,18 @@ class MLEDeconvolver:
         bounds = [(0.0, 1.0)] * K_total
 
         try:
+            kwargs = {
+                "method": "SLSQP",
+                "bounds": bounds,
+                "constraints": constraints,
+                "options": {"maxiter": self.max_iter, "ftol": self.tol},
+            }
+            if neg_grad is not None:
+                kwargs["jac"] = neg_grad
             res = minimize(
                 neg_ll,
                 w0,
-                jac=neg_grad,
-                method="SLSQP",
-                bounds=bounds,
-                constraints=constraints,
-                options={"maxiter": self.max_iter, "ftol": self.tol},
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             raise DeconvolutionFailedError(
@@ -425,6 +579,8 @@ class BayesianDeconvolver:
         prior_alpha: float = 1.0,
         seed: int | None = None,
         binarization_count_weight: float = 1.0,
+        binarization_model: str = "legacy",
+        hierarchical_quadrature_points: int = 24,
     ):
         self.n_walkers = n_walkers
         self.n_steps = n_steps
@@ -432,6 +588,10 @@ class BayesianDeconvolver:
         self.prior_alpha = prior_alpha
         self.seed = seed
         self.binarization_count_weight = max(float(binarization_count_weight), 0.0)
+        self.binarization_model = str(binarization_model or "legacy").lower()
+        self.hierarchical_quadrature_points = max(
+            int(hierarchical_quadrature_points), 2
+        )
 
     def _effective_n_walkers(self, k_free: int) -> int:
         """Return a sampler-safe walker count for the current dimensionality.
@@ -466,6 +626,13 @@ class BayesianDeconvolver:
         )
 
         if isinstance(model, BinarizationObservationModel):
+            obs_model = str(getattr(model, "binarization_model", "legacy")).lower()
+            if self.binarization_model == "hierarchical" or obs_model == "hierarchical":
+                return self._solve_hierarchical_binarization(
+                    model=model,
+                    marker_subset=marker_subset,
+                    emcee_module=emcee,
+                )
             return self._solve_hybrid_binarization(
                 model=model,
                 reference=reference,
@@ -540,6 +707,124 @@ class BayesianDeconvolver:
 
         chain = sampler.get_chain(discard=self.burn_in, flat=True)  # (n_keep, K_free)
         # Convert to (K+1)-simplex
+        n_keep = chain.shape[0]
+        out = np.empty((n_keep, K_total), dtype=np.float64)
+        for i in range(n_keep):
+            full_z = np.concatenate([chain[i], np.array([0.0])])
+            out[i] = softmax(full_z)
+        return out
+
+    def _solve_hierarchical_binarization(
+        self,
+        model,  # BinarizationObservationModel
+        marker_subset: np.ndarray | None,
+        emcee_module,
+    ) -> np.ndarray:
+        """Bayesian solve for the hierarchical FinaleMe binarization model."""
+        if (
+            model.reference_continuous is None
+            or model.k is None
+            or model.n is None
+            or model.dispersion is None
+            or model.tau_low_per is None
+            or model.tau_high_per is None
+            or model.call_zone_prob is None
+        ):
+            raise DeconvolutionFailedError(
+                "BinarizationObservationModel is missing hierarchical fields "
+                "(reference_continuous/k/n/dispersion/tau/call_zone_prob)."
+            )
+
+        R = np.asarray(model.reference_continuous, dtype=np.float64)
+        weights = np.asarray(model.weights, dtype=np.float64)
+        k = np.asarray(model.k, dtype=np.float64)
+        n = np.asarray(model.n, dtype=np.float64)
+        phi = np.asarray(model.dispersion, dtype=np.float64)
+        tau_low = np.asarray(model.tau_low_per, dtype=np.float64)
+        tau_high = np.asarray(model.tau_high_per, dtype=np.float64)
+        call_zone_prob = np.asarray(model.call_zone_prob, dtype=np.float64)
+        call_weight = float(np.clip(getattr(model, "call_weight", 1.0), 0.0, 1.0))
+
+        if marker_subset is not None:
+            R = R[marker_subset]
+            weights = weights[marker_subset]
+            k = k[marker_subset]
+            n = n[marker_subset]
+            phi = phi[marker_subset]
+            tau_low = tau_low[marker_subset]
+            tau_high = tau_high[marker_subset]
+            call_zone_prob = call_zone_prob[marker_subset]
+
+        valid = (
+            np.all(np.isfinite(R), axis=1)
+            & np.isfinite(k)
+            & np.isfinite(n)
+            & np.isfinite(phi)
+            & np.isfinite(tau_low)
+            & np.isfinite(tau_high)
+            & np.all(np.isfinite(call_zone_prob), axis=1)
+            & (n > 0)
+        )
+        R_v = R[valid]
+        weights_v = weights[valid]
+        k_v = k[valid]
+        n_v = n[valid]
+        phi_v = phi[valid]
+        tl_v = tau_low[valid]
+        th_v = tau_high[valid]
+        cz_v = call_zone_prob[valid]
+        if int(R_v.shape[0]) < int(R_v.shape[1]):
+            raise DeconvolutionFailedError(
+                "Not enough valid markers for hierarchical Bayesian binarization solve."
+            )
+
+        K_total = R_v.shape[1]
+        K_free = K_total - 1
+
+        def softmax(z: np.ndarray) -> np.ndarray:
+            z_max = np.max(z)
+            ez = np.exp(z - z_max)
+            return ez / ez.sum()
+
+        def log_posterior(z: np.ndarray) -> float:
+            full_z = np.concatenate([z, np.array([0.0])])
+            w = softmax(full_z)
+            ll_vec = hierarchical_marker_log_likelihood(
+                w=w,
+                reference_continuous=R_v,
+                k=k_v,
+                n=n_v,
+                phi=phi_v,
+                tau_low=tl_v,
+                tau_high=th_v,
+                call_zone_prob=cz_v,
+                call_weight=call_weight,
+            )
+            log_lik = float(np.sum(weights_v * ll_vec))
+            if abs(self.prior_alpha - 1.0) < 1e-12:
+                log_prior = 0.0
+            else:
+                log_prior = float(
+                    (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
+                )
+            return log_lik + log_prior
+
+        n_walkers = self._effective_n_walkers(K_free)
+        if n_walkers != self.n_walkers:
+            log.info(
+                "BayesianDeconvolver (hierarchical): increasing n_walkers from %d to %d for ndim=%d",
+                self.n_walkers,
+                n_walkers,
+                K_free,
+            )
+
+        rng = np.random.default_rng(self.seed)
+        p0 = rng.normal(0, 0.1, size=(n_walkers, K_free))
+
+        sampler = emcee_module.EnsembleSampler(n_walkers, K_free, log_posterior)
+        sampler.run_mcmc(p0, self.n_steps, progress=False)
+
+        chain = sampler.get_chain(discard=self.burn_in, flat=True)
         n_keep = chain.shape[0]
         out = np.empty((n_keep, K_total), dtype=np.float64)
         for i in range(n_keep):

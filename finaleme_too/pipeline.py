@@ -133,7 +133,9 @@ class TOOPipeline:
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
         self.deconvolver = MLEDeconvolver(
-            binarization_count_weight=config.model.binarization_count_weight
+            binarization_count_weight=config.model.binarization_count_weight,
+            binarization_model=config.model.binarization_model,
+            hierarchical_quadrature_points=config.model.hierarchical_quadrature_points,
         )
         self.fragment_deconvolver = FragmentLevelDeconvolver()
         # v3 binarization observation-model builder. Cheap to construct
@@ -141,6 +143,8 @@ class TOOPipeline:
         # _deconvolve_sample only uses it when self.binarization is not None.
         self._binarization_builder = BinarizationModel(
             hard_threshold=self.binarize_threshold,
+            binarization_model=config.model.binarization_model,
+            call_weight_override=config.model.hierarchical_call_weight,
         )
 
         # Decouple uncertainty source from the point-estimate solver.
@@ -168,6 +172,8 @@ class TOOPipeline:
                 prior_alpha=config.uncertainty.bayesian_prior_alpha,
                 seed=config.uncertainty.seed,
                 binarization_count_weight=config.model.binarization_count_weight,
+                binarization_model=config.model.binarization_model,
+                hierarchical_quadrature_points=config.model.hierarchical_quadrature_points,
             )
             if needs_bayesian
             else None

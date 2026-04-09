@@ -956,6 +956,71 @@ def test_mle_solver_binarization_handles_marker_subset():
     assert w_subset[0] > 0.7  # CT0 still dominant on the subset
 
 
+def test_hierarchical_binarization_mle_runs_with_legacy_params_fallback():
+    """Hierarchical mode should run even when params are legacy-style
+    (no explicit call_model_params), by falling back to eps-derived
+    call-zone probabilities."""
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+    params.model_version = "hierarchical_v1"
+    params.call_model_type = "piecewise_v1"
+    params.call_model_params = None  # force fallback table path
+
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0_hier", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel(binarization_model="hierarchical").build(
+        binarized, params, reference
+    )
+
+    solver = MLEDeconvolver(binarization_model="hierarchical")
+    w_hat = solver.solve(model, reference)
+    assert w_hat.shape == (K + 1,)
+    assert np.isclose(np.sum(w_hat), 1.0, atol=1e-6)
+    assert np.all(np.isfinite(w_hat))
+    # Should still favor CT0 on this synthetic pure-CT0 sample.
+    assert int(np.argmax(w_hat)) == 0
+
+
+def test_hierarchical_binarization_fit_metrics_are_finite():
+    """Reliability fit metrics should remain finite for hierarchical
+    binarization models (regression for coef-only scoring paths)."""
+    from finaleme_too.core.deconvolution import MLEDeconvolver
+    from finaleme_too.core.reliability import compute_fit_metrics
+
+    K = 3
+    n_per_ct = 4
+    reference = _mk_richer_reference(K, n_per_ct)
+    params = build_identity_placeholder_params()
+    params.model_version = "hierarchical_v1"
+    params.call_model_type = "piecewise_v1"
+    params.call_model_params = None
+
+    pred = _mk_pure_celltype_pred(K, n_per_ct, target_ct=0)
+    obs = _mk_obs("pure_ct0_hier_fit", pred)
+    binarized = apply_binarization(obs, params, region_annotations=None)
+    model = BinarizationModel(binarization_model="hierarchical").build(
+        binarized, params, reference
+    )
+    w_hat = MLEDeconvolver(binarization_model="hierarchical").solve(model, reference)
+
+    lik, plik = compute_fit_metrics(
+        w_hat=w_hat,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        top_n=20,
+        binarizer=params,
+    )
+    assert np.isfinite(lik)
+    assert np.isfinite(plik)
+    assert 0.0 <= plik <= 1.0
+
+
 def test_compute_p_goodness_finaleme_binomial_concordance():
     """compute_p_goodness on a BinarizationObservationModel uses the
     binomial concordance test against eps_U/eps_M, not chi-square. With

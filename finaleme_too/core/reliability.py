@@ -413,17 +413,20 @@ def compute_fit_metrics(
 
         w_full = np.asarray(w_hat, dtype=np.float64)
         w_null = _ablate_component_and_renormalize(w_full, cell_type_index)
-
-        coef = np.asarray(observation.coef, dtype=np.float64)[filtered_idx]
         weights = np.asarray(observation.weights, dtype=np.float64)[filtered_idx]
         wsum = float(np.sum(weights))
         if wsum <= 0:
             wsum = float(weights.size)
             weights = np.ones_like(weights, dtype=np.float64)
-        p_full = np.clip(coef @ w_full, 1e-15, 1.0)
-        p_null = np.clip(coef @ w_null, 1e-15, 1.0)
-        ll_full = float(np.sum(weights * np.log(p_full)))
-        ll_null = float(np.sum(weights * np.log(p_null)))
+
+        ll_full_vec = np.asarray(observation.log_likelihood(w_full), dtype=np.float64)[
+            filtered_idx
+        ]
+        ll_null_vec = np.asarray(observation.log_likelihood(w_null), dtype=np.float64)[
+            filtered_idx
+        ]
+        ll_full = float(np.sum(weights * ll_full_vec))
+        ll_null = float(np.sum(weights * ll_null_vec))
         likelihood_score = (ll_full - ll_null) / wsum
         p_likelihood = _likelihood_ratio_pvalue(ll_full, ll_null, df=1)
         return float(likelihood_score), float(p_likelihood)
@@ -499,19 +502,21 @@ def compute_unknown_fit_metrics(
     w_null = _ablate_component_and_renormalize(w_full, unknown_idx)
 
     if isinstance(observation, BinarizationObservationModel):
-        coef = np.asarray(observation.coef, dtype=np.float64)
+        ll_full_vec = np.asarray(observation.log_likelihood(w_full), dtype=np.float64)
+        ll_null_vec = np.asarray(observation.log_likelihood(w_null), dtype=np.float64)
+        n_rows = int(ll_full_vec.size)
+        if n_rows != int(ll_null_vec.size):
+            return float("nan"), float("nan")
         weights = np.asarray(observation.weights, dtype=np.float64)
-        if coef.shape[0] < 5:
+        if n_rows < 5:
             return float("nan"), float("nan")
         wsum = float(np.sum(weights))
         if wsum <= 0:
             wsum = float(weights.size)
             weights = np.ones_like(weights, dtype=np.float64)
-        p_full = np.clip(coef @ w_full, 1e-15, 1.0)
-        p_null = np.clip(coef @ w_null, 1e-15, 1.0)
-        ll_full = float(np.sum(weights * np.log(p_full)))
-        ll_null = float(np.sum(weights * np.log(p_null)))
-        likelihood_score = float(np.sum(weights * (np.log(p_full) - np.log(p_null))) / wsum)
+        ll_full = float(np.sum(weights * ll_full_vec))
+        ll_null = float(np.sum(weights * ll_null_vec))
+        likelihood_score = float(np.sum(weights * (ll_full_vec - ll_null_vec)) / wsum)
         p_likelihood = _likelihood_ratio_pvalue(ll_full, ll_null, df=1)
         return likelihood_score, p_likelihood
 

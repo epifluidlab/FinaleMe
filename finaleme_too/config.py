@@ -50,6 +50,15 @@ class ModelConfig:
     deconvolution: SolverMethod = SolverMethod.MLE
     unknown_component: bool = True  # always on; flag kept for documentation
     fragment_level: str = "auto"  # "auto", "always", "never"
+    # FinaleMe binarization observation model:
+    #   legacy       -> existing state+count hybrid objective
+    #   hierarchical -> joint count+state hierarchical likelihood
+    binarization_model: str = "legacy"
+    # Optional override for hierarchical call-channel tempering.
+    # When None, the value from binarization params is used.
+    hierarchical_call_weight: float | None = None
+    # Quadrature nodes used by the hierarchical likelihood.
+    hierarchical_quadrature_points: int = 24
     # FinaleMe v3 binarization hybrid objective weight:
     #   logL = logL_state + binarization_count_weight * logL_count
     # where logL_count is a per-read normalized beta-binomial term.

@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://finaleme-too/schema/binarization_hierarchical_v1.json",
+  "title": "FinaleMe TOO Binarization Parameters (hierarchical_v1)",
+  "type": "object",
+  "required": [
+    "model_version",
+    "n_bins",
+    "call_model_type",
+    "call_weight_default",
+    "call_model_params"
+  ],
+  "properties": {
+    "model_version": {
+      "type": "string",
+      "const": "hierarchical_v1"
+    },
+    "n_bins": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "call_model_type": {
+      "type": "string",
+      "const": "piecewise_v1"
+    },
+    "call_weight_default": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "call_model_params": {
+      "type": "object",
+      "required": [
+        "states",
+        "zones",
+        "per_bin"
+      ],
+      "properties": {
+        "states": {
+          "type": "array",
+          "const": [
+            "U",
+            "M",
+            "A",
+            "X"
+          ]
+        },
+        "zones": {
+          "type": "array",
+          "const": [
+            "low",
+            "mid",
+            "high"
+          ]
+        },
+        "per_bin": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "bin_index",
+              "zone_confusion"
+            ],
+            "properties": {
+              "bin_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "zone_confusion": {
+                "type": "object",
+                "required": [
+                  "low",
+                  "mid",
+                  "high"
+                ],
+                "properties": {
+                  "low": {
+                    "$ref": "#/$defs/state_prob_row"
+                  },
+                  "mid": {
+                    "$ref": "#/$defs/state_prob_row"
+                  },
+                  "high": {
+                    "$ref": "#/$defs/state_prob_row"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "n_train_low": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "n_train_mid": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "n_train_high": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "fitted": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "state_prob_row": {
+      "type": "object",
+      "required": [
+        "U",
+        "M",
+        "A",
+        "X"
+      ],
+      "properties": {
+        "U": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "M": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "A": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "X": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$comment": "Loader must also enforce: len(per_bin)==n_bins, complete unique bin_index coverage [0..n_bins-1], and each row sum(U,M,A,X)==1.0+/-1e-6.",
+  "additionalProperties": true
+}

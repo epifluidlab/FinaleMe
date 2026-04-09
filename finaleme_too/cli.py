@@ -79,6 +79,31 @@ def main() -> None:
               help="Only used with --binarizeThreshold. Sets tolerated mismatch "
                    "rate for p_goodness (0..0.49). Example: 0.10 means "
                    "p_goodness expects ~90% concordance, not 100%.")
+@click.option(
+    "--binarization-model",
+    "binarization_model",
+    default=None,
+    type=click.Choice(["legacy", "hierarchical"]),
+    help="FinaleMe binarization likelihood model. "
+    "`legacy` uses the current state+count hybrid objective; "
+    "`hierarchical` enables the joint count+state hierarchical model.",
+)
+@click.option(
+    "--hierarchical-call-weight",
+    "hierarchical_call_weight",
+    default=None,
+    type=float,
+    help="Optional override for hierarchical call-channel weight (0..1). "
+    "Ignored unless --binarization-model hierarchical is active.",
+)
+@click.option(
+    "--hierarchical-quadrature-points",
+    "hierarchical_quadrature_points",
+    default=None,
+    type=int,
+    help="Number of quadrature points for hierarchical binarization "
+    "likelihood integration (default from config: 24).",
+)
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Pre-computed CpG density / region class annotations TSV "
                    "(chrom, start, end, cpg_density, [region_class]).")
@@ -131,6 +156,9 @@ def run_cmd(
     binarization_path: str | None,
     binarize_threshold: float | None,
     binarize_mismatch_tolerance: float,
+    binarization_model: str | None,
+    hierarchical_call_weight: float | None,
+    hierarchical_quadrature_points: int | None,
     region_annotation: str | None,
     strict_regions: str | None,
     n_markers_per_type: int | None,
@@ -194,6 +222,27 @@ def run_cmd(
         config.uncertainty.bayesian_n_samples = bayesian_n_samples
     if _was_provided("uncertainty_method"):
         config.uncertainty.method = uncertainty_method
+    if _was_provided("binarization_model"):
+        config.model.binarization_model = str(binarization_model)
+    if _was_provided("hierarchical_call_weight"):
+        if hierarchical_call_weight is None:
+            config.model.hierarchical_call_weight = None
+        else:
+            hw = float(hierarchical_call_weight)
+            if hw < 0.0 or hw > 1.0:
+                raise click.BadParameter(
+                    "--hierarchical-call-weight must be within [0, 1]",
+                    param_hint="--hierarchical-call-weight",
+                )
+            config.model.hierarchical_call_weight = hw
+    if _was_provided("hierarchical_quadrature_points"):
+        hq = int(hierarchical_quadrature_points or 0)
+        if hq < 2:
+            raise click.BadParameter(
+                "--hierarchical-quadrature-points must be >= 2",
+                param_hint="--hierarchical-quadrature-points",
+            )
+        config.model.hierarchical_quadrature_points = hq
     if bayesian:  # is_flag — only True when explicitly set
         config.model.deconvolution = SolverMethod.BAYESIAN
         # --bayesian implies Bayesian uncertainty unless the user picked
@@ -290,6 +339,17 @@ def run_cmd(
     has_finaleme = any(s.mode.value == "FINALEME" for s in sample_sheet.samples)
     t0 = perf_counter()
     if has_finaleme:
+        if config.model.binarization_model == "hierarchical":
+            log.info(
+                "FinaleMe binarization model: hierarchical "
+                "(call_weight=%s, quadrature_points=%d)",
+                (
+                    "auto"
+                    if config.model.hierarchical_call_weight is None
+                    else f"{config.model.hierarchical_call_weight:.3f}"
+                ),
+                int(config.model.hierarchical_quadrature_points),
+            )
         if binarize_threshold is not None:
             if binarize_threshold < 0.0 or binarize_threshold > 1.0:
                 raise click.BadParameter(

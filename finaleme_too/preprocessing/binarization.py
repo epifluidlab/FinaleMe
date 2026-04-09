@@ -136,6 +136,13 @@ class BinarizationParams:
     n_markers_M: np.ndarray  # shape (n_bins,) int
     train_fraction_U: np.ndarray  # shape (n_bins,) float
     train_fraction_M: np.ndarray  # shape (n_bins,) float
+    # Schema/version tags for the binarization likelihood model.
+    # legacy_v3: existing v3 threshold+error-rate model
+    # hierarchical_v1: joint count+state hierarchical model
+    model_version: str = "legacy_v3"
+    call_model_type: str | None = None
+    call_weight_default: float = 1.0
+    call_model_params: dict | None = None
     training_metadata: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -145,6 +152,11 @@ class BinarizationParams:
     @classmethod
     def from_dict(cls, raw: dict) -> "BinarizationParams":
         try:
+            cw_raw = raw.get("call_weight_default", 1.0)
+            try:
+                cw = float(cw_raw) if cw_raw is not None else 1.0
+            except (TypeError, ValueError):
+                cw = 1.0
             return cls(
                 n_bins=int(raw["n_bins"]),
                 n_region_classes=int(raw["n_region_classes"]),
@@ -161,6 +173,10 @@ class BinarizationParams:
                 n_markers_M=np.asarray(raw["n_markers_M"], dtype=np.int64),
                 train_fraction_U=np.asarray(raw["train_fraction_U"], dtype=np.float64),
                 train_fraction_M=np.asarray(raw["train_fraction_M"], dtype=np.float64),
+                model_version=str(raw.get("model_version", "legacy_v3")),
+                call_model_type=raw.get("call_model_type"),
+                call_weight_default=cw,
+                call_model_params=raw.get("call_model_params"),
                 training_metadata=dict(raw.get("training_metadata", {})),
             )
         except KeyError as exc:
@@ -194,6 +210,10 @@ class BinarizationParams:
             "n_markers_M": self.n_markers_M.astype(np.int64).tolist(),
             "train_fraction_U": self.train_fraction_U.tolist(),
             "train_fraction_M": self.train_fraction_M.tolist(),
+            "model_version": str(self.model_version),
+            "call_model_type": self.call_model_type,
+            "call_weight_default": float(self.call_weight_default),
+            "call_model_params": _to_jsonable(self.call_model_params),
             "training_metadata": _to_jsonable(self.training_metadata),
         }
         Path(path).write_text(json.dumps(out, indent=2))
@@ -256,6 +276,146 @@ class BinarizationParams:
         sub_bin[nan_mask] = 0
 
         return (class_idx * self.density_sub_bins_per_class + sub_bin).astype(np.int64)
+
+    # ------------------------------------------------------------------
+    # Hierarchical call model helpers
+    # ------------------------------------------------------------------
+
+    def is_hierarchical_v1(self) -> bool:
+        return str(self.model_version).lower() == "hierarchical_v1"
+
+    def resolve_call_weight(self, override: float | None = None) -> float:
+        if override is not None:
+            return float(np.clip(float(override), 0.0, 1.0))
+        return float(np.clip(float(self.call_weight_default), 0.0, 1.0))
+
+    def has_piecewise_call_model(self) -> bool:
+        if str(self.call_model_type or "").lower() != "piecewise_v1":
+            return False
+        if not isinstance(self.call_model_params, dict):
+            return False
+        per_bin = self.call_model_params.get("per_bin")
+        return isinstance(per_bin, list) and len(per_bin) > 0
+
+    def _fallback_call_model_table(self) -> np.ndarray:
+        """Build a per-bin/state/zone table from eps_U/eps_M.
+
+        Shape: (n_bins, 4 states, 3 zones[low,mid,high]).
+        States are ordered as [U, M, Ambiguous, Excluded].
+        """
+        table = np.zeros((self.n_bins, 4, 3), dtype=np.float64)
+        eps_u = np.asarray(self.eps_U, dtype=np.float64)
+        eps_m = np.asarray(self.eps_M, dtype=np.float64)
+
+        for b in range(self.n_bins):
+            # low zone
+            p_u_low = float(np.clip(1.0 - eps_u[b], 0.0, 1.0))
+            p_m_low = float(np.clip(eps_m[b], 0.0, 1.0))
+            p_a_low = max(0.0, 1.0 - p_u_low - p_m_low)
+            s_low = p_u_low + p_m_low + p_a_low
+            if s_low <= 0:
+                p_u_low, p_m_low, p_a_low = 1.0, 0.0, 0.0
+            else:
+                p_u_low /= s_low
+                p_m_low /= s_low
+                p_a_low /= s_low
+
+            # high zone
+            p_m_high = float(np.clip(1.0 - eps_m[b], 0.0, 1.0))
+            p_u_high = float(np.clip(eps_u[b], 0.0, 1.0))
+            p_a_high = max(0.0, 1.0 - p_u_high - p_m_high)
+            s_high = p_u_high + p_m_high + p_a_high
+            if s_high <= 0:
+                p_u_high, p_m_high, p_a_high = 0.0, 1.0, 0.0
+            else:
+                p_u_high /= s_high
+                p_m_high /= s_high
+                p_a_high /= s_high
+
+            # mid zone defaults to ambiguous
+            p_u_mid, p_m_mid, p_a_mid = 0.0, 0.0, 1.0
+
+            # U state probabilities across zones
+            table[b, STATE_U, :] = np.array([p_u_low, p_u_mid, p_u_high], dtype=np.float64)
+            # M state probabilities across zones
+            table[b, STATE_M, :] = np.array([p_m_low, p_m_mid, p_m_high], dtype=np.float64)
+            # A state probabilities across zones
+            table[b, STATE_AMBIGUOUS, :] = np.array([p_a_low, p_a_mid, p_a_high], dtype=np.float64)
+            # Excluded states are not modeled in hierarchical likelihood.
+            table[b, STATE_EXCLUDED, :] = np.array([1e-9, 1e-9, 1e-9], dtype=np.float64)
+
+        return np.clip(table, 1e-12, 1.0)
+
+    def _piecewise_call_model_table(self) -> np.ndarray:
+        """Parse call_model_params into a dense table.
+
+        Returns shape (n_bins, 4 states, 3 zones[low,mid,high]).
+        Missing/invalid bins fall back to eps-derived defaults.
+        """
+        fallback = self._fallback_call_model_table()
+        if not self.has_piecewise_call_model():
+            return fallback
+
+        params = self.call_model_params or {}
+        per_bin = params.get("per_bin", [])
+        states = params.get("states", ["U", "M", "A", "X"])
+        zones = params.get("zones", ["low", "mid", "high"])
+        state_to_idx = {str(s): i for i, s in enumerate(states)}
+        zone_to_idx = {str(z): i for i, z in enumerate(zones)}
+
+        table = fallback.copy()
+        for entry in per_bin:
+            try:
+                b = int(entry["bin_index"])
+                if b < 0 or b >= self.n_bins:
+                    continue
+                zc = entry["zone_confusion"]
+                for z_name in ("low", "mid", "high"):
+                    if z_name not in zc:
+                        continue
+                    z_idx = zone_to_idx.get(z_name)
+                    if z_idx is None or z_idx < 0 or z_idx > 2:
+                        continue
+                    row = zc[z_name]
+                    p_u = float(row.get("U", row.get("u", 0.0)))
+                    p_m = float(row.get("M", row.get("m", 0.0)))
+                    p_a = float(row.get("A", row.get("a", 0.0)))
+                    p_x = float(row.get("X", row.get("x", 0.0)))
+                    # Normalize for robustness.
+                    probs = np.array([p_u, p_m, p_a, p_x], dtype=np.float64)
+                    probs = np.clip(probs, 0.0, None)
+                    s = float(np.sum(probs))
+                    if s <= 0:
+                        continue
+                    probs = probs / s
+                    table[b, STATE_U, z_idx] = probs[state_to_idx.get("U", 0)]
+                    table[b, STATE_M, z_idx] = probs[state_to_idx.get("M", 1)]
+                    table[b, STATE_AMBIGUOUS, z_idx] = probs[state_to_idx.get("A", 2)]
+                    table[b, STATE_EXCLUDED, z_idx] = probs[state_to_idx.get("X", 3)]
+            except Exception:  # noqa: BLE001
+                continue
+        return np.clip(table, 1e-12, 1.0)
+
+    def call_zone_probabilities(
+        self,
+        bin_idx: np.ndarray,
+        called_state: np.ndarray,
+    ) -> np.ndarray:
+        """Return per-marker P(called_state | zone) for zones low/mid/high.
+
+        Output shape: (n_markers, 3). Values are clipped to [1e-12, 1].
+        """
+        b = np.asarray(bin_idx, dtype=np.int64)
+        s = np.asarray(called_state, dtype=np.int64)
+        if b.size != s.size:
+            raise InvalidBinarizationError(
+                "call_zone_probabilities: bin_idx and called_state size mismatch"
+            )
+        table = self._piecewise_call_model_table()
+        s_safe = np.clip(s, 0, 3)
+        b_safe = np.clip(b, 0, self.n_bins - 1)
+        out = table[b_safe, s_safe, :]
+        return np.clip(np.asarray(out, dtype=np.float64), 1e-12, 1.0)
 
 
 # ---------------------------------------------------------------------------

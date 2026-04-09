@@ -112,6 +112,21 @@ class BinarizationObservationModel:
     coverage_tier: CoverageTier
     coverage_cap: int
     hard_threshold: float | None = None
+    # Observation model flavor for FinaleMe:
+    #   legacy       -> linear coef path
+    #   hierarchical -> joint count+state path
+    binarization_model: str = "legacy"
+    # Per-marker continuous reference row for hierarchical likelihood.
+    # Shape (M_valid, K+1), includes unknown column.
+    reference_continuous: np.ndarray | None = None
+    # Per-marker thresholds and call-zone probabilities for hierarchical path.
+    # tau arrays have shape (M_valid,), call_zone_prob has shape (M_valid, 3)
+    # with zones ordered [low, mid, high].
+    tau_low_per: np.ndarray | None = None
+    tau_high_per: np.ndarray | None = None
+    call_zone_prob: np.ndarray | None = None
+    # Effective call-channel tempering used in the hierarchical model.
+    call_weight: float = 1.0
     # Optional count-level fields for hybrid Bayesian inference. These are
     # aligned to the same valid-marker subset as coef/called_state.
     k: np.ndarray | None = None  # int64 (M_valid,)
@@ -134,6 +149,31 @@ class BinarizationObservationModel:
         per-marker log-likelihood contributions (already per-marker, NOT
         weighted by ω_i — multiply by ``self.weights`` for the objective).
         """
+        if (
+            self.binarization_model == "hierarchical"
+            and self.reference_continuous is not None
+            and self.k is not None
+            and self.n is not None
+            and self.dispersion is not None
+            and self.tau_low_per is not None
+            and self.tau_high_per is not None
+            and self.call_zone_prob is not None
+        ):
+            from finaleme_too.core.deconvolution import (
+                hierarchical_marker_log_likelihood,
+            )
+
+            return hierarchical_marker_log_likelihood(
+                w=np.asarray(w, dtype=np.float64),
+                reference_continuous=np.asarray(self.reference_continuous, dtype=np.float64),
+                k=np.asarray(self.k, dtype=np.float64),
+                n=np.asarray(self.n, dtype=np.float64),
+                phi=np.asarray(self.dispersion, dtype=np.float64),
+                tau_low=np.asarray(self.tau_low_per, dtype=np.float64),
+                tau_high=np.asarray(self.tau_high_per, dtype=np.float64),
+                call_zone_prob=np.asarray(self.call_zone_prob, dtype=np.float64),
+                call_weight=float(np.clip(self.call_weight, 0.0, 1.0)),
+            )
         p_obs = self.coef @ w  # (M_valid,)
         p_obs = np.clip(p_obs, 1e-15, 1.0)
         return np.log(p_obs)
@@ -195,10 +235,17 @@ class BinarizationModel:
     so the pipeline dispatcher can treat the two builders interchangeably.
     """
 
-    def __init__(self, hard_threshold: float | None = None):
+    def __init__(
+        self,
+        hard_threshold: float | None = None,
+        binarization_model: str = "legacy",
+        call_weight_override: float | None = None,
+    ):
         # Optional universal hard threshold used by
         # ``finaleme-too run --binarizeThreshold``.
         self.hard_threshold = hard_threshold
+        self.binarization_model = str(binarization_model or "legacy").lower()
+        self.call_weight_override = call_weight_override
 
     def build(
         self,
@@ -219,9 +266,14 @@ class BinarizationModel:
         context_bin = np.asarray(obs.context_bin, dtype=np.int32)
         n_original = called_state.size
 
-        # Valid markers: called U or M AND in a usable bin.
+        # Valid markers:
+        #   legacy       -> called U/M and usable
+        #   hierarchical -> any non-excluded call (U/M/A) and usable
         usable_mask = binarization.usable[context_bin]
-        called_valid = (called_state == STATE_U) | (called_state == STATE_M)
+        if self.binarization_model == "hierarchical":
+            called_valid = called_state != STATE_EXCLUDED
+        else:
+            called_valid = (called_state == STATE_U) | (called_state == STATE_M)
         valid_mask = usable_mask & called_valid
 
         # If absolutely nothing is valid, return an empty model — the solver
@@ -241,6 +293,12 @@ class BinarizationModel:
                 mode=obs.mode,
                 coverage_tier=tier,
                 coverage_cap=coverage_cap,
+                binarization_model=self.binarization_model,
+                reference_continuous=np.zeros((0, K + 1), dtype=np.float64),
+                tau_low_per=np.zeros(0, dtype=np.float64),
+                tau_high_per=np.zeros(0, dtype=np.float64),
+                call_zone_prob=np.zeros((0, 3), dtype=np.float64),
+                call_weight=binarization.resolve_call_weight(self.call_weight_override),
                 k=np.zeros(empty_k, dtype=np.int64),
                 n=np.zeros(empty_k, dtype=np.int64),
                 dispersion=np.zeros(empty_k, dtype=np.float64),
@@ -255,9 +313,13 @@ class BinarizationModel:
         K = ref_binary_full.shape[1]
         unknown_col = np.full((ref_binary_full.shape[0], 1), 0.5, dtype=np.float64)
         ref_full = np.hstack([ref_binary_full, unknown_col])  # (M_original, K+1)
+        ref_cont_full = np.hstack(
+            [np.asarray(reference.methylation, dtype=np.float64), unknown_col]
+        )
 
         # Subset to valid markers
         ref_valid = ref_full[valid_mask]  # (M_valid, K+1)
+        ref_cont_valid = ref_cont_full[valid_mask]  # (M_valid, K+1)
         state_valid = called_state[valid_mask]
         bin_valid = context_bin[valid_mask]
 
@@ -278,6 +340,19 @@ class BinarizationModel:
             (1.0 - eps_M_per[m_rows]) * ref_valid[m_rows]
             + eps_M_per[m_rows] * (1.0 - ref_valid[m_rows])
         )
+        # Ambiguous/Excluded markers are represented as residual probability
+        # so legacy reliability calculations remain finite when hierarchical
+        # mode includes Ambiguous calls.
+        amb_or_exc_rows = (state_valid == STATE_AMBIGUOUS) | (state_valid == STATE_EXCLUDED)
+        if np.any(amb_or_exc_rows):
+            p_u = (1.0 - eps_U_per[amb_or_exc_rows]) * (1.0 - ref_valid[amb_or_exc_rows]) + (
+                eps_U_per[amb_or_exc_rows] * ref_valid[amb_or_exc_rows]
+            )
+            p_m = (1.0 - eps_M_per[amb_or_exc_rows]) * ref_valid[amb_or_exc_rows] + (
+                eps_M_per[amb_or_exc_rows] * (1.0 - ref_valid[amb_or_exc_rows])
+            )
+            p_a = np.clip(1.0 - p_u - p_m, 1e-12, 1.0)
+            coef[amb_or_exc_rows] = p_a
 
         # Per-marker coverage weight ω_i. For FinaleMe mode we use the
         # per-marker total read count n_i (the number of fragments used by
@@ -302,6 +377,10 @@ class BinarizationModel:
         k_valid = np.asarray(obs.k, dtype=np.int64)[valid_mask]
         n_valid_i64 = np.asarray(obs.n, dtype=np.int64)[valid_mask]
         phi_valid = np.full(k_valid.size, float(phi_default), dtype=np.float64)
+        tau_low_per = np.asarray(binarization.tau_low, dtype=np.float64)[bin_valid]
+        tau_high_per = np.asarray(binarization.tau_high, dtype=np.float64)[bin_valid]
+        call_zone_prob = binarization.call_zone_probabilities(bin_valid, state_valid)
+        call_weight = binarization.resolve_call_weight(self.call_weight_override)
 
         return BinarizationObservationModel(
             sample_id=obs.sample_id,
@@ -315,6 +394,12 @@ class BinarizationModel:
             coverage_tier=tier,
             coverage_cap=coverage_cap,
             hard_threshold=self.hard_threshold,
+            binarization_model=self.binarization_model,
+            reference_continuous=ref_cont_valid,
+            tau_low_per=tau_low_per,
+            tau_high_per=tau_high_per,
+            call_zone_prob=call_zone_prob,
+            call_weight=call_weight,
             k=k_valid,
             n=n_valid_i64,
             dispersion=phi_valid,
