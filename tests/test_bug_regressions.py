@@ -1560,21 +1560,18 @@ def test_pipeline_writes_consistent_qc_summary_for_high_coverage_sample(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# April 2026 — .too.tsv header comment documenting p_goodness / p_detection
+# April 2026 — .too.tsv header comment documenting reliability semantics
 # ---------------------------------------------------------------------------
-# User feedback: p_goodness=1.0 with reliability=HIGH is confusing because
-# the naming implies "low p-value = significant". Added a #-prefixed header
-# block at the top of every .too.tsv explaining that HIGH = GOOD for both
-# columns. These tests pin (a) that the header exists, (b) that it actually
-# names both fields and the "high = good" convention, and (c) that pandas
-# can still parse the body when comment='#' is passed.
+# Added a #-prefixed header block at the top of every .too.tsv explaining
+# the reliability semantics. These tests pin (a) that the header exists,
+# (b) that it names p_detection + fit metrics, and (c) that pandas can still
+# parse the body when comment='#' is passed.
 
 
 def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
     """The .too.tsv file must carry a ``#``-prefixed header block that
-    explicitly documents the counter-intuitive p_goodness / p_detection
-    interpretation. Regression guard so future refactors don't silently
-    drop the explainer."""
+    documents p_detection + fit metrics interpretation. Regression guard so
+    future refactors don't silently drop the explainer."""
     from finaleme_too.config import CoverageTier
     from finaleme_too.core.deconvolution import DeconvolutionResult
     from finaleme_too.io.output_writer import write_per_sample_too
@@ -1587,6 +1584,8 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
         ci_upper=np.array([0.55, 0.35, 0.25]),
         p_goodness=np.array([1.0, 0.98]),
         p_detection=np.array([1.0, 0.97, 0.9]),
+        effect_size=np.array([0.11, 0.07, 0.03]),
+        likelihood_score=np.array([0.05, 0.03, 0.02]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([10, 10], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1604,10 +1603,10 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
     assert head_lines, "Expected a #-prefixed header block at the top of .too.tsv"
 
     head_text = "\n".join(head_lines)
-    # The header must mention both p-value fields and the "high = good"
-    # convention so readers don't mis-interpret the output.
-    assert "p_goodness" in head_text
+    # The header must mention the reliability-driving fields and "high = good".
     assert "p_detection" in head_text
+    assert "effect_size" in head_text
+    assert "likelihood_score" in head_text
     # Some variant of "HIGH = GOOD" must appear (case-insensitive).
     assert "HIGH = GOOD" in head_text or "high = good" in head_text.lower()
 
@@ -1627,6 +1626,8 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
         ci_upper=np.array([0.65, 0.35, 0.15]),
         p_goodness=np.array([0.87, 0.91]),
         p_detection=np.array([0.99, 0.97, 0.85]),
+        effect_size=np.array([0.12, 0.08, 0.02]),
+        likelihood_score=np.array([0.07, 0.04, 0.01]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([42, 37], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1643,10 +1644,10 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
     assert list(df["cell_type"]) == ["Neutrophil", "Adipocyte", "Unknown"]
     # Body values must match the values we just wrote.
     assert abs(float(df["proportion"].iloc[0]) - 0.6) < 1e-4
-    assert abs(float(df["p_goodness"].iloc[0]) - 0.87) < 1e-4
     assert abs(float(df["p_detection"].iloc[0]) - 0.99) < 1e-4
-    # Unknown row must have NaN p_goodness (no goodness-of-fit for unknown).
-    assert np.isnan(float(df["p_goodness"].iloc[-1]))
+    # Unknown row now carries fit metrics (no missing values).
+    assert np.isfinite(float(df["effect_size"].iloc[-1]))
+    assert np.isfinite(float(df["likelihood_score"].iloc[-1]))
 
 
 # ---------------------------------------------------------------------------

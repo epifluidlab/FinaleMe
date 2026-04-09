@@ -15,10 +15,7 @@ def _format_proportion(x: float) -> float:
     return float(round(x, 4))
 
 
-# Header comment prepended to every per-sample .too.tsv file. The column
-# semantics for ``p_goodness`` and ``p_detection`` are counter-intuitive —
-# both use "HIGH = GOOD" rather than the usual "reject if < 0.05" convention
-# — so we document it inline instead of hoping users read the design doc.
+# Header comment prepended to every per-sample .too.tsv file.
 # ``pandas.read_csv(..., sep='\t', comment='#')`` reads these files without
 # any extra arguments.
 _TOO_TSV_HEADER_COMMENT = """\
@@ -28,10 +25,6 @@ _TOO_TSV_HEADER_COMMENT = """\
 #   cell_type        — reference cell type label; "Unknown" is the unmodeled residual
 #   proportion       — point-estimate proportion (0..1), sums to ~1 including Unknown
 #   ci_lower/ci_upper— bootstrap (or posterior) credible interval for the proportion
-#   p_goodness       — chi-square goodness-of-fit p-value for this cell type's markers
-#                        NOTE: HIGH = GOOD fit (opposite of the usual p < 0.05 convention)
-#                        > 0.05 → data is consistent with the model
-#                        < 0.01 → poor fit, proportion may be unreliable
 #   p_detection      — fraction of bootstrap replicates where this cell type was above
 #                      the noise floor (NOT a traditional p-value despite the name)
 #                        HIGH = reliably detected; > 0.95 → reliably above noise
@@ -46,7 +39,7 @@ _TOO_TSV_HEADER_COMMENT = """\
 #   mean_dispersion  — mean beta-binomial dispersion phi over the top discriminative
 #                      markers for this cell type (larger = tighter, less noisy)
 #
-# TL;DR: HIGH = GOOD; reliability now tracks p_detection + fit gains.
+# TL;DR: HIGH = GOOD; reliability tracks p_detection + fit gains.
 """
 
 
@@ -54,8 +47,8 @@ def write_per_sample_too(result: DeconvolutionResult, path: str | Path) -> None:
     """Write a per-sample TSV with one row per cell type (incl. unknown).
 
     Output columns (architecture §10.1):
-        cell_type proportion ci_lower ci_upper p_goodness p_detection
-        effect_size likelihood_score reliability n_markers mean_dispersion
+        cell_type proportion ci_lower ci_upper p_detection effect_size
+        likelihood_score reliability n_markers mean_dispersion
 
     The file begins with a ``#``-prefixed header comment documenting the
     high-confusability column semantics (see ``_TOO_TSV_HEADER_COMMENT``).
@@ -65,37 +58,28 @@ def write_per_sample_too(result: DeconvolutionResult, path: str | Path) -> None:
     cell_type_labels = list(result.cell_types) + ["Unknown"]
     K = len(result.cell_types)
     for i, ct in enumerate(cell_type_labels):
-        if i < K:
-            p_good = float(result.p_goodness[i]) if result.p_goodness is not None else float("nan")
-            eff = (
-                float(result.effect_size[i])
-                if result.effect_size is not None
-                else float("nan")
-            )
-            lik = (
-                float(result.likelihood_score[i])
-                if result.likelihood_score is not None
-                else float("nan")
-            )
-            n_mark = int(result.n_markers[i]) if result.n_markers is not None else 0
-            mean_disp = (
-                float(result.mean_dispersion[i])
-                if result.mean_dispersion is not None
-                else float("nan")
-            )
-        else:
-            p_good = float("nan")
-            eff = float("nan")
-            lik = float("nan")
-            n_mark = 0
-            mean_disp = float("nan")
+        eff = (
+            float(result.effect_size[i])
+            if result.effect_size is not None and i < len(result.effect_size)
+            else float("nan")
+        )
+        lik = (
+            float(result.likelihood_score[i])
+            if result.likelihood_score is not None and i < len(result.likelihood_score)
+            else float("nan")
+        )
+        n_mark = int(result.n_markers[i]) if i < K and result.n_markers is not None else 0
+        mean_disp = (
+            float(result.mean_dispersion[i])
+            if i < K and result.mean_dispersion is not None
+            else float("nan")
+        )
         rows.append(
             {
                 "cell_type": ct,
                 "proportion": _format_proportion(result.proportions[i]),
                 "ci_lower": _format_proportion(result.ci_lower[i]),
                 "ci_upper": _format_proportion(result.ci_upper[i]),
-                "p_goodness": p_good,
                 "p_detection": float(result.p_detection[i]),
                 "effect_size": eff,
                 "likelihood_score": lik,
@@ -122,9 +106,9 @@ def write_cohort_proportions(
 ) -> None:
     """Write cohort_proportions.tsv with one row per sample.
 
-    Each cell type contributes proportion + ci_lo + ci_hi + p_goodness +
-    p_detection + effect_size + likelihood_score + reliability columns; the
-    unknown component is appended at the end.
+    Each cell type contributes proportion + ci_lo + ci_hi + p_detection +
+    effect_size + likelihood_score + reliability columns; the unknown
+    component is appended at the end.
     """
     if not results:
         pd.DataFrame().to_csv(path, sep="\t", index=False)
@@ -146,7 +130,6 @@ def write_cohort_proportions(
         columns.append(ct)
         columns.append(f"{ct}_ci_lo")
         columns.append(f"{ct}_ci_hi")
-        columns.append(f"{ct}_p_goodness")
         columns.append(f"{ct}_p_detection")
         columns.append(f"{ct}_effect_size")
         columns.append(f"{ct}_likelihood_score")
@@ -174,16 +157,12 @@ def write_cohort_proportions(
             row[ct] = _format_proportion(r.proportions[i])
             row[f"{ct}_ci_lo"] = _format_proportion(r.ci_lower[i])
             row[f"{ct}_ci_hi"] = _format_proportion(r.ci_upper[i])
-            if i < K and r.p_goodness is not None:
-                row[f"{ct}_p_goodness"] = float(r.p_goodness[i])
-            else:
-                row[f"{ct}_p_goodness"] = float("nan")
             row[f"{ct}_p_detection"] = float(r.p_detection[i])
-            if i < K and r.effect_size is not None:
+            if r.effect_size is not None and i < len(r.effect_size):
                 row[f"{ct}_effect_size"] = float(r.effect_size[i])
             else:
                 row[f"{ct}_effect_size"] = float("nan")
-            if i < K and r.likelihood_score is not None:
+            if r.likelihood_score is not None and i < len(r.likelihood_score):
                 row[f"{ct}_likelihood_score"] = float(r.likelihood_score[i])
             else:
                 row[f"{ct}_likelihood_score"] = float("nan")

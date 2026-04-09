@@ -1,13 +1,13 @@
 """Per-cell-type reliability metrics (math doc §5 + v3 reliability update).
 
-Reliability now combines:
+Reliability combines:
   - p_detection: bootstrap stability above a noise floor.
   - effect_size: practical fit improvement over a cell-type-ablated null.
   - likelihood_score: weighted per-marker log-likelihood gain over the same
     ablated null.
 
-``p_goodness`` (legacy hypothesis-test p-value) is still computed and written
-for backwards compatibility, but reliability assignment no longer depends on it.
+``p_goodness`` remains available as a legacy helper function, but it is no
+longer used for reliability assignment or default output tables.
 """
 
 from __future__ import annotations
@@ -371,7 +371,7 @@ def compute_fit_metrics(
 
     effect_size:
       WGBS — weighted MAE improvement over an ablated-null model.
-      FinaleMe — concordance improvement over an ablated-null model.
+      FinaleMe — weighted mean probability gain over an ablated-null model.
 
     likelihood_score:
       Weighted mean log-likelihood gain (nats per effective marker) over the
@@ -380,7 +380,6 @@ def compute_fit_metrics(
     from finaleme_too.core.observation_model_binarization import (
         BinarizationObservationModel,
     )
-    from finaleme_too.preprocessing.binarization import STATE_M, STATE_U
 
     if isinstance(observation, BinarizationObservationModel):
         top_idx_original, filtered_idx, R_binary = _top_discriminative_indices_binarization(
@@ -395,44 +394,17 @@ def compute_fit_metrics(
         w_full = np.asarray(w_hat, dtype=np.float64)
         w_null = _ablate_component_and_renormalize(w_full, cell_type_index)
 
-        # Effect size = concordance(full) - concordance(null)
-        K = R_binary.shape[1]
-        R_aug_U = np.hstack([1.0 - R_binary, np.full((R_binary.shape[0], 1), 0.5)])
-        p_u_full = (R_aug_U @ w_full)[top_idx_original]
-        p_u_null = (R_aug_U @ w_null)[top_idx_original]
-        expected_full = np.where(p_u_full > 0.5, STATE_U, STATE_M).astype(np.uint8)
-        expected_null = np.where(p_u_null > 0.5, STATE_U, STATE_M).astype(np.uint8)
-        called = np.asarray(observation.called_state, dtype=np.uint8)[filtered_idx]
-        conc_full = float(np.mean(called == expected_full))
-        conc_null = float(np.mean(called == expected_null))
-        effect_size = conc_full - conc_null
-
-        # Likelihood gain using per-marker eps with optional tolerance floor.
-        bins = np.asarray(observation.context_bin, dtype=np.int64)[filtered_idx]
-        ref_rows = np.asarray(observation.reference_binary, dtype=np.float64)[filtered_idx]
+        # Continuous effect size = weighted gain in P(observed_state | w)
+        # over an ablated-null model on top discriminative markers.
+        coef = np.asarray(observation.coef, dtype=np.float64)[filtered_idx]
         weights = np.asarray(observation.weights, dtype=np.float64)[filtered_idx]
         wsum = float(np.sum(weights))
         if wsum <= 0:
             wsum = float(weights.size)
             weights = np.ones_like(weights, dtype=np.float64)
-
-        if binarizer is not None:
-            eps_u = np.asarray(binarizer.eps_U, dtype=np.float64)[bins]
-            eps_m = np.asarray(binarizer.eps_M, dtype=np.float64)[bins]
-        else:
-            eps_u = np.full(bins.size, 0.1, dtype=np.float64)
-            eps_m = np.full(bins.size, 0.1, dtype=np.float64)
-        tol = _binarization_mismatch_tolerance(binarizer)
-        eps_u = np.maximum(eps_u, tol)
-        eps_m = np.maximum(eps_m, tol)
-        eps_u_col = eps_u[:, None]
-        eps_m_col = eps_m[:, None]
-        coef_u = (1.0 - eps_u_col) * (1.0 - ref_rows) + eps_u_col * ref_rows
-        coef_m = (1.0 - eps_m_col) * ref_rows + eps_m_col * (1.0 - ref_rows)
-        coef = coef_u.copy()
-        coef[called == STATE_M] = coef_m[called == STATE_M]
         p_full = np.clip(coef @ w_full, 1e-15, 1.0)
         p_null = np.clip(coef @ w_null, 1e-15, 1.0)
+        effect_size = float(np.sum(weights * (p_full - p_null)) / wsum)
         ll_full = float(np.sum(weights * np.log(p_full)))
         ll_null = float(np.sum(weights * np.log(p_null)))
         likelihood_score = (ll_full - ll_null) / wsum
@@ -493,6 +465,82 @@ def compute_fit_metrics(
     return float(effect_size), float(likelihood_score)
 
 
+def compute_unknown_fit_metrics(
+    w_hat: np.ndarray,
+    reference_methylation: np.ndarray,
+    observation,
+) -> tuple[float, float]:
+    """Return (effect_size, likelihood_score) for the Unknown component.
+
+    The null model removes the Unknown weight and renormalizes known
+    cell types. Metrics are computed over all valid markers.
+    """
+    from finaleme_too.core.observation_model_binarization import (
+        BinarizationObservationModel,
+    )
+
+    w_full = np.asarray(w_hat, dtype=np.float64)
+    unknown_idx = int(w_full.size - 1)
+    w_null = _ablate_component_and_renormalize(w_full, unknown_idx)
+
+    if isinstance(observation, BinarizationObservationModel):
+        coef = np.asarray(observation.coef, dtype=np.float64)
+        weights = np.asarray(observation.weights, dtype=np.float64)
+        if coef.shape[0] < 5:
+            return float("nan"), float("nan")
+        wsum = float(np.sum(weights))
+        if wsum <= 0:
+            wsum = float(weights.size)
+            weights = np.ones_like(weights, dtype=np.float64)
+        p_full = np.clip(coef @ w_full, 1e-15, 1.0)
+        p_null = np.clip(coef @ w_null, 1e-15, 1.0)
+        effect_size = float(np.sum(weights * (p_full - p_null)) / wsum)
+        likelihood_score = float(np.sum(weights * (np.log(p_full) - np.log(p_null))) / wsum)
+        return effect_size, likelihood_score
+
+    # WGBS / beta-binomial path
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    R_full = np.hstack([R, np.full((R.shape[0], 1), UNKNOWN_PROFILE, dtype=np.float64)])
+    n = np.asarray(observation.n, dtype=np.float64)
+    k = np.asarray(observation.k, dtype=np.float64)
+    phi = np.asarray(observation.dispersion, dtype=np.float64)
+    weights = np.asarray(observation.weights, dtype=np.float64)
+    valid = (n > 0) & np.all(np.isfinite(R_full), axis=1)
+    if int(np.sum(valid)) < 5:
+        return float("nan"), float("nan")
+
+    n_v = n[valid]
+    k_v = k[valid]
+    phi_v = phi[valid]
+    weights_v = weights[valid]
+    mu_full = np.clip((R_full @ w_full)[valid], 1e-9, 1.0 - 1e-9)
+    mu_null = np.clip((R_full @ w_null)[valid], 1e-9, 1.0 - 1e-9)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu_obs = np.where(n_v > 0, k_v / np.maximum(n_v, 1), np.nan)
+    finite = np.isfinite(mu_obs)
+    if int(np.sum(finite)) < 5:
+        return float("nan"), float("nan")
+    mu_obs_v = mu_obs[finite]
+    mu_full_v = mu_full[finite]
+    mu_null_v = mu_null[finite]
+    k_f = k_v[finite]
+    n_f = n_v[finite]
+    phi_f = phi_v[finite]
+    w_f = weights_v[finite]
+    wsum = float(np.sum(w_f))
+    if wsum <= 0:
+        wsum = float(w_f.size)
+        w_f = np.ones_like(w_f, dtype=np.float64)
+
+    mae_full = float(np.sum(w_f * np.abs(mu_obs_v - mu_full_v)) / wsum)
+    mae_null = float(np.sum(w_f * np.abs(mu_obs_v - mu_null_v)) / wsum)
+    effect_size = mae_null - mae_full
+    ll_full = np.sum(w_f * log_likelihood_per_marker(k_f, n_f, mu_full_v, phi_f))
+    ll_null = np.sum(w_f * log_likelihood_per_marker(k_f, n_f, mu_null_v, phi_f))
+    likelihood_score = float((ll_full - ll_null) / wsum)
+    return float(effect_size), float(likelihood_score)
+
+
 def assign_reliability(
     p_detection: float,
     effect_size: float | None = None,
@@ -537,6 +585,7 @@ def assign_reliability(
 __all__ = [
     "assign_reliability",
     "compute_fit_metrics",
+    "compute_unknown_fit_metrics",
     "compute_p_detection",
     "compute_p_goodness",
 ]

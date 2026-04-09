@@ -62,15 +62,18 @@ class DeconvolutionResult:
     proportions: np.ndarray  # (K+1,)
     ci_lower: np.ndarray  # (K+1,)
     ci_upper: np.ndarray  # (K+1,)
-    p_goodness: np.ndarray  # (K,) — no p_goodness for unknown
+    # Legacy metric kept only for backward compatibility in in-memory
+    # objects. It is no longer used for reliability assignment and is not
+    # emitted in the default per-sample/cohort TSV outputs.
+    p_goodness: np.ndarray | None  # (K,) — deprecated
     p_detection: np.ndarray  # (K+1,)
     reliability: np.ndarray  # str array (K+1,)
     n_markers: np.ndarray  # (K,)
-    # New reliability metrics (K only; unknown has no cell-type fit metric):
+    # New reliability metrics (K+1; unknown included as last entry):
     #   effect_size      — practical fit improvement vs ablated-null model
     #   likelihood_score — weighted per-marker log-likelihood gain vs null
-    effect_size: np.ndarray | None = None  # (K,)
-    likelihood_score: np.ndarray | None = None  # (K,)
+    effect_size: np.ndarray | None = None  # (K+1,)
+    likelihood_score: np.ndarray | None = None  # (K+1,)
     bootstrap_proportions: np.ndarray | None = None  # (B, K+1)
     posterior_samples: np.ndarray | None = None  # (T, K+1)
     coverage_tier: CoverageTier = CoverageTier.HIGH
