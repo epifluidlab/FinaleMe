@@ -312,31 +312,26 @@ def apply_binarization(
     # Without this the join silently misses and every marker defaults to
     # the open_sea fallback bin — the exact issue reported by the user.
     if region_annotations is not None and not region_annotations.empty:
-        obs_chrom_norm = [
-            c[3:] if isinstance(c, str) and c.startswith("chr") else str(c)
-            for c in obs.chrom.tolist()
-        ]
-        keys = list(zip(obs_chrom_norm, obs.start.tolist(), obs.end.tolist()))
-
-        ann = region_annotations
-        if "chrom" in ann.columns:
-            ann = ann.copy()
-            ann["chrom"] = (
-                ann["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
-            )
-        ann_indexed = ann.set_index(["chrom", "start", "end"])
-        density_lookup = ann_indexed["cpg_density"]
-        density = np.array(
-            [float(density_lookup.get(k, np.nan)) for k in keys], dtype=np.float64
+        ann_lookup = prepare_region_annotation_lookup(region_annotations)
+        obs_chrom_norm = np.array(
+            [
+                c[3:] if isinstance(c, str) and c.startswith("chr") else str(c)
+                for c in obs.chrom.tolist()
+            ],
+            dtype=object,
         )
-        if "region_class" in ann_indexed.columns:
-            class_lookup = ann_indexed["region_class"]
-            region_class = np.array(
-                [
-                    class_lookup.get(k, "open_sea") if k in class_lookup.index else "open_sea"
-                    for k in keys
-                ],
-                dtype=object,
+        obs_index = pd.MultiIndex.from_arrays(
+            [obs_chrom_norm, obs.start, obs.end],
+            names=["chrom", "start", "end"],
+        )
+        matched = ann_lookup.reindex(obs_index)
+        density = matched["cpg_density"].to_numpy(dtype=np.float64)
+        if "region_class" in matched.columns:
+            region_class = (
+                matched["region_class"]
+                .fillna("open_sea")
+                .astype(str)
+                .to_numpy(dtype=object)
             )
         else:
             region_class = _classify_region(density, params.region_class_thresholds)
@@ -378,6 +373,61 @@ def apply_binarization(
     # Markers in unusable bins or with NaN predicted_beta stay EXCLUDED.
 
     return obs.with_binarization(called_state=called_state, context_bin=bin_idx)
+
+
+def prepare_region_annotation_lookup(
+    region_annotations: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build a normalized, indexed lookup table for fast per-sample joins.
+
+    The output uses a MultiIndex on ``(chrom, start, end)`` and includes at
+    least ``cpg_density`` (plus ``region_class`` when available). The lookup
+    object is safe to reuse across samples and threads.
+    """
+    if region_annotations.attrs.get("_finaleme_too_region_lookup", False):
+        return region_annotations
+
+    ann = region_annotations
+    if (
+        isinstance(ann.index, pd.MultiIndex)
+        and list(ann.index.names) == ["chrom", "start", "end"]
+        and "cpg_density" in ann.columns
+    ):
+        lookup = ann.copy()
+        chrom_idx = lookup.index.get_level_values("chrom").astype(str)
+        chrom_norm = chrom_idx.str.replace(r"^chr", "", regex=True)
+        if not chrom_idx.equals(chrom_norm):
+            lookup.index = pd.MultiIndex.from_arrays(
+                [
+                    chrom_norm,
+                    lookup.index.get_level_values("start"),
+                    lookup.index.get_level_values("end"),
+                ],
+                names=["chrom", "start", "end"],
+            )
+        keep_cols = ["cpg_density"]
+        if "region_class" in lookup.columns:
+            keep_cols.append("region_class")
+        lookup = lookup[keep_cols]
+    else:
+        missing = {"chrom", "start", "end", "cpg_density"} - set(ann.columns)
+        if missing:
+            raise InvalidBinarizationError(
+                "region_annotations is missing required columns for lookup: "
+                + ", ".join(sorted(missing))
+            )
+        cols = ["chrom", "start", "end", "cpg_density"]
+        if "region_class" in ann.columns:
+            cols.append("region_class")
+        lookup = ann.loc[:, cols].copy()
+        lookup["chrom"] = lookup["chrom"].astype(str).str.replace(
+            r"^chr", "", regex=True
+        )
+        lookup = lookup.drop_duplicates(subset=["chrom", "start", "end"], keep="first")
+        lookup = lookup.set_index(["chrom", "start", "end"])
+
+    lookup.attrs["_finaleme_too_region_lookup"] = True
+    return lookup
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +760,7 @@ __all__ = [
     "STATE_LABELS",
     "BinarizationParams",
     "apply_binarization",
+    "prepare_region_annotation_lookup",
     "build_identity_placeholder_params",
     "load_default_binarization",
     "shipped_default_binarization_path",

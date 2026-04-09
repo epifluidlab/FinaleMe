@@ -23,6 +23,9 @@ from finaleme_too.io.marker_regions import MarkerRegions
 
 log = logging.getLogger(__name__)
 
+_TABIX_FETCH_MAX_MERGE_GAP_BP = 250_000
+_TABIX_FETCH_DENSE_COVERAGE_RATIO = 0.35
+
 
 @dataclass(frozen=True)
 class MarkerObservations:
@@ -431,76 +434,85 @@ def _parse_finaleme_bed_with_tabix(
             starts = starts[order]
             ends = ends[order]
 
-            fetch_start = int(max(0, starts[0]))
-            fetch_end = int(max(fetch_start, np.max(ends)))
-            if fetch_end <= fetch_start:
-                continue
+            fetch_windows = _build_tabix_fetch_windows(starts, ends)
+            for win_lo, win_hi, fetch_start, fetch_end in fetch_windows:
+                marker_ids_w = marker_ids[win_lo:win_hi]
+                starts_w = starts[win_lo:win_hi]
+                ends_w = ends[win_lo:win_hi]
+                if starts_w.size == 0 or fetch_end <= fetch_start:
+                    continue
 
-            # Fast path when marker intervals on this chromosome do not overlap:
-            # each CpG record belongs to at most one marker interval.
-            non_overlap = bool(np.all(ends[:-1] <= starts[1])) if starts.size > 1 else True
+                # Fast path when marker intervals in this fetch window do not
+                # overlap: each CpG record belongs to at most one marker.
+                non_overlap = (
+                    bool(np.all(ends_w[:-1] <= starts_w[1:]))
+                    if starts_w.size > 1
+                    else True
+                )
 
-            if non_overlap:
-                ptr = 0
-                n_local = starts.size
-                try:
-                    for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
-                        parts = line.split("\t")
-                        if len(parts) < 6:
-                            continue
-                        try:
-                            cpg_start = int(parts[1])
-                            meth = float(parts[4])
-                            total = float(parts[5])
-                        except ValueError:
-                            continue
-                        # prediction.bed.gz is BED-like (0-based, half-open)
-                        while ptr < n_local and ends[ptr] <= cpg_start:
-                            ptr += 1
-                        if ptr >= n_local:
-                            break
-                        if starts[ptr] <= cpg_start < ends[ptr]:
-                            mid = int(marker_ids[ptr])
-                            k_arr[mid] += int(meth)
-                            n_arr[mid] += int(total)
-                except ValueError:
-                    pass
-            else:
-                # Fallback path for overlapping markers: maintain active set.
-                import heapq
+                if non_overlap:
+                    ptr = 0
+                    n_local = starts_w.size
+                    try:
+                        for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
+                            parts = line.split("\t")
+                            if len(parts) < 6:
+                                continue
+                            try:
+                                cpg_start = int(parts[1])
+                                meth = float(parts[4])
+                                total = float(parts[5])
+                            except ValueError:
+                                continue
+                            # prediction.bed.gz is BED-like (0-based, half-open)
+                            while ptr < n_local and ends_w[ptr] <= cpg_start:
+                                ptr += 1
+                            if ptr >= n_local:
+                                break
+                            if starts_w[ptr] <= cpg_start < ends_w[ptr]:
+                                mid = int(marker_ids_w[ptr])
+                                k_arr[mid] += int(meth)
+                                n_arr[mid] += int(total)
+                    except ValueError:
+                        pass
+                else:
+                    # Fallback path for overlapping markers: maintain active set.
+                    import heapq
 
-                active: list[tuple[int, int]] = []  # (end, local_idx)
-                add_ptr = 0
-                n_local = starts.size
-                try:
-                    for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
-                        parts = line.split("\t")
-                        if len(parts) < 6:
-                            continue
-                        try:
-                            cpg_start = int(parts[1])
-                            meth = float(parts[4])
-                            total = float(parts[5])
-                        except ValueError:
-                            continue
+                    active: list[tuple[int, int]] = []  # (end, local_idx)
+                    add_ptr = 0
+                    n_local = starts_w.size
+                    try:
+                        for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
+                            parts = line.split("\t")
+                            if len(parts) < 6:
+                                continue
+                            try:
+                                cpg_start = int(parts[1])
+                                meth = float(parts[4])
+                                total = float(parts[5])
+                            except ValueError:
+                                continue
 
-                        while add_ptr < n_local and starts[add_ptr] <= cpg_start:
-                            heapq.heappush(active, (int(ends[add_ptr]), int(add_ptr)))
-                            add_ptr += 1
-                        while active and active[0][0] <= cpg_start:
-                            heapq.heappop(active)
+                            while add_ptr < n_local and starts_w[add_ptr] <= cpg_start:
+                                heapq.heappush(
+                                    active, (int(ends_w[add_ptr]), int(add_ptr))
+                                )
+                                add_ptr += 1
+                            while active and active[0][0] <= cpg_start:
+                                heapq.heappop(active)
 
-                        if not active:
-                            continue
-                        meth_i = int(meth)
-                        total_i = int(total)
-                        for _, local_idx in active:
-                            if starts[local_idx] <= cpg_start < ends[local_idx]:
-                                mid = int(marker_ids[local_idx])
-                                k_arr[mid] += meth_i
-                                n_arr[mid] += total_i
-                except ValueError:
-                    pass
+                            if not active:
+                                continue
+                            meth_i = int(meth)
+                            total_i = int(total)
+                            for _, local_idx in active:
+                                if starts_w[local_idx] <= cpg_start < ends_w[local_idx]:
+                                    mid = int(marker_ids_w[local_idx])
+                                    k_arr[mid] += meth_i
+                                    n_arr[mid] += total_i
+                    except ValueError:
+                        pass
     finally:
         tbx.close()
 
@@ -534,6 +546,56 @@ def _resolve_query_chrom(chrom: str, contigs: set[str]) -> str | None:
         if alt in contigs:
             return alt
     return None
+
+
+def _build_tabix_fetch_windows(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    max_merge_gap_bp: int = _TABIX_FETCH_MAX_MERGE_GAP_BP,
+    dense_coverage_ratio: float = _TABIX_FETCH_DENSE_COVERAGE_RATIO,
+) -> list[tuple[int, int, int, int]]:
+    """Build fetch windows from sorted marker intervals for one chromosome.
+
+    Returns a list of tuples:
+        (lo, hi, fetch_start, fetch_end)
+    where ``lo:hi`` slice the marker arrays for that window.
+
+    Strategy:
+      * dense marker layout -> one broad fetch (fewer tabix seeks)
+      * sparse marker layout -> clustered fetch windows (avoid scanning
+        large chromosome spans with no markers)
+    """
+    if starts.size == 0:
+        return []
+
+    # Dense layout: one broad fetch is cheaper than many random seeks.
+    chrom_span = int(max(1, int(np.max(ends)) - int(starts[0])))
+    marker_bp = int(np.sum(np.maximum(0, ends - starts)))
+    if starts.size <= 2 or (marker_bp / chrom_span) >= dense_coverage_ratio:
+        fetch_start = int(max(0, starts[0]))
+        fetch_end = int(max(fetch_start, np.max(ends)))
+        return [(0, int(starts.size), fetch_start, fetch_end)]
+
+    # Sparse layout: cluster nearby markers into local windows.
+    windows: list[tuple[int, int, int, int]] = []
+    lo = 0
+    cur_end = int(ends[0])
+    for i in range(1, int(starts.size)):
+        s = int(starts[i])
+        e = int(ends[i])
+        if s <= cur_end + int(max_merge_gap_bp):
+            if e > cur_end:
+                cur_end = e
+            continue
+        fetch_start = int(max(0, starts[lo]))
+        fetch_end = int(max(fetch_start, cur_end))
+        windows.append((lo, i, fetch_start, fetch_end))
+        lo = i
+        cur_end = e
+    fetch_start = int(max(0, starts[lo]))
+    fetch_end = int(max(fetch_start, cur_end))
+    windows.append((lo, int(starts.size), fetch_start, fetch_end))
+    return windows
 
 
 def _has_tabix_index(path: Path) -> bool:

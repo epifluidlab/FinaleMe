@@ -129,6 +129,7 @@ class TOOPipeline:
         else:
             self.binarize_threshold = None
         self.region_annotations = region_annotations
+        self._region_annotation_lookup: pd.DataFrame | None = None
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
         self.deconvolver = MLEDeconvolver()
@@ -188,6 +189,23 @@ class TOOPipeline:
             if config.markers.n_per_type and config.markers.n_per_type > 0
             else None
         )
+        # Region annotation lookup can dominate runtime when rebuilt for
+        # every sample. Pre-index once and reuse across all binarization calls.
+        if region_annotations is not None and not region_annotations.empty:
+            try:
+                from finaleme_too.preprocessing.binarization import (
+                    prepare_region_annotation_lookup,
+                )
+
+                self._region_annotation_lookup = prepare_region_annotation_lookup(
+                    region_annotations
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to pre-index region annotations (%s); falling back to per-sample path.",
+                    exc,
+                )
+                self._region_annotation_lookup = region_annotations
 
     # ------------------------------------------------------------------
     # Top-level
@@ -734,7 +752,11 @@ class TOOPipeline:
         return apply_binarization(
             obs,
             params=self.binarization,
-            region_annotations=self.region_annotations,
+            region_annotations=(
+                self._region_annotation_lookup
+                if self._region_annotation_lookup is not None
+                else self.region_annotations
+            ),
             hard_threshold=self.binarize_threshold,
         )
 
