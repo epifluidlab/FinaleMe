@@ -233,6 +233,25 @@ def test_apply_binarization_classifies_U_M_ambiguous_excluded():
     assert binarized.called_state[5] == STATE_EXCLUDED   # NaN
 
 
+def test_apply_binarization_hard_threshold_has_no_ambiguous():
+    """Hard-threshold mode uses <t => U and >=t => M with no Ambiguous calls."""
+    params = build_identity_placeholder_params()  # all bins usable
+    pred = np.array([0.09, 0.10, 0.11, np.nan], dtype=np.float32)
+    obs = _mk_obs("s1", pred)
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        hard_threshold=0.10,
+    )
+
+    assert binarized.called_state[0] == STATE_U
+    assert binarized.called_state[1] == STATE_M  # boundary: >= 0.10
+    assert binarized.called_state[2] == STATE_M
+    assert binarized.called_state[3] == STATE_EXCLUDED
+    assert int(np.sum(binarized.called_state == STATE_AMBIGUOUS)) == 0
+
+
 def test_apply_binarization_respects_usable_flag():
     """Markers in bins with usable=False must be Excluded even when
     predicted_beta is in the U/M range."""
@@ -678,6 +697,18 @@ def test_binarize_reference_panel_soft_intermediate():
     # Intermediate values are preserved with float32→float64 rounding tolerance
     assert abs(result[0, 1] - 0.5) < 1e-6
     assert abs(result[1, 1] - 0.3) < 1e-6
+
+
+def test_binarize_reference_panel_hard_threshold():
+    """Hard-threshold mode uses <t => 0 and >=t => 1 on finite entries."""
+    ref = np.array([[0.05, 0.1, 0.95], [0.099, 0.101, np.nan]], dtype=np.float32)
+    result = _binarize_reference_panel(ref, hard_threshold=0.1)
+    assert result[0, 0] == 0.0
+    assert result[0, 1] == 1.0  # boundary: >= 0.1
+    assert result[0, 2] == 1.0
+    assert result[1, 0] == 0.0
+    assert result[1, 1] == 1.0
+    assert np.isnan(result[1, 2])
 
 
 def _mk_reference(K: int, M: int) -> ReferencePanel:
@@ -1300,6 +1331,7 @@ def test_cli_run_has_binarization_flag():
     result = runner.invoke(main, ["run", "--help"])
     assert result.exit_code == 0
     assert "--binarization" in result.output
+    assert "--binarizeThreshold" in result.output
     # The legacy v2 --calibration flag should be gone by Phase E
     assert "--calibration" not in result.output
 
