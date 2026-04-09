@@ -297,9 +297,27 @@ def apply_binarization(
     n = pred.size
 
     # Look up per-marker density + region_class from the annotation table.
+    # Defense-in-depth chromosome normalization: strip any leading ``chr``
+    # from BOTH the obs chroms and the annotation chroms before joining.
+    # The annotation writer (``compute_region_annotation``) strips the
+    # prefix, but a hand-written or externally-sourced annotation file may
+    # still carry it, and conversely the loaded obs may or may not.
+    # Without this the join silently misses and every marker defaults to
+    # the open_sea fallback bin — the exact issue reported by the user.
     if region_annotations is not None and not region_annotations.empty:
-        keys = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
-        ann_indexed = region_annotations.set_index(["chrom", "start", "end"])
+        obs_chrom_norm = [
+            c[3:] if isinstance(c, str) and c.startswith("chr") else str(c)
+            for c in obs.chrom.tolist()
+        ]
+        keys = list(zip(obs_chrom_norm, obs.start.tolist(), obs.end.tolist()))
+
+        ann = region_annotations
+        if "chrom" in ann.columns:
+            ann = ann.copy()
+            ann["chrom"] = (
+                ann["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
+            )
+        ann_indexed = ann.set_index(["chrom", "start", "end"])
         density_lookup = ann_indexed["cpg_density"]
         density = np.array(
             [float(density_lookup.get(k, np.nan)) for k in keys], dtype=np.float64

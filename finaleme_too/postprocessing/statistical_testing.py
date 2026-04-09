@@ -41,6 +41,28 @@ def compositional_regression_test(
 ) -> list[TestResult]:
     """Per-cell-type ILR regression Wald test (math doc §7.2-§7.3).
 
+    Fits a per-cell-type OLS regression in ILR space:
+
+        y_{j,s} = β_0 + Σ_g β_g · I(group_s = g) + Σ_c β_c · covariate_{c,s} + ε_s
+
+    and tests the contrast ``β_A - β_B`` via a Wald t-test. The first
+    group alphabetically is the reference (absorbed into the intercept),
+    so group coefficients are "difference from reference". The contrast
+    is recovered as ``β_A - β_B`` regardless of which group is the
+    reference; when the reference is one of the two contrast groups,
+    ``β_ref = 0`` and the contrast collapses to ``±β_other``.
+
+    Covariates flow through a pandas DataFrame indexed by ``sample_id``
+    (or keyed by the ``sample_id`` column if present). Numeric columns
+    are used directly; categorical columns are one-hot-encoded. Rows
+    with any NaN covariate value are dropped for THAT cell type's fit
+    (so a partially-populated covariate doesn't kill the whole analysis).
+
+    When no covariates are supplied the regression reduces to the
+    intercept + group indicator design — which for the two-group case
+    gives the same p-value as Welch's t-test on the ILR coordinate,
+    matching the previous implementation as a special case.
+
     proportions: (S, K+1) — last column is the unknown component.
     contrasts: list of (group_a, group_b) pairs.
     """
@@ -50,13 +72,37 @@ def compositional_regression_test(
         return []
     P = proportions[valid]
     groups = [group_labels[i] for i in valid]
+    valid_sample_ids = [sample_ids[i] for i in valid]
 
     # ILR transform — sum_w_unknown is included so that the simplex is K+1 parts
     # The result has K coords; coord j is the contrast that most directly
     # involves cell type j (because of the Helmert basis).
     ilr_coords = ilr_transform(P)  # (S, K)
-
     n_cells = len(cell_type_names)
+    S = ilr_coords.shape[0]
+
+    # Pre-build per-sample covariate row vector (float64, with one-hot
+    # encoding for non-numeric columns). None if no covariates were supplied.
+    cov_matrix, cov_col_names = _build_covariate_design(
+        covariates, valid_sample_ids
+    )
+    # cov_matrix is (S, C) or None. NaN entries are preserved here; per-cell
+    # dropna happens inside the fitting loop so cell types with different
+    # NaN patterns don't drag each other down.
+
+    # Build the group encoding. Reference group is the first in sorted order.
+    unique_groups = sorted({g for g in groups})
+    reference_group = unique_groups[0] if unique_groups else None
+    non_ref_groups = [g for g in unique_groups if g != reference_group]
+    # group_design is (S, n_non_ref_groups), 1 if sample is in that group
+    group_design = np.zeros((S, len(non_ref_groups)), dtype=np.float64)
+    group_col_to_idx: dict[str, int] = {}
+    for col_idx, g in enumerate(non_ref_groups):
+        group_col_to_idx[g] = col_idx
+        group_design[:, col_idx] = np.array(
+            [1.0 if gs == g else 0.0 for gs in groups], dtype=np.float64
+        )
+
     results: list[TestResult] = []
 
     for j in range(n_cells):
@@ -67,23 +113,72 @@ def compositional_regression_test(
             if int(a_mask.sum()) < 2 or int(b_mask.sum()) < 2:
                 results.append(_skipped_result(cell_type_names[j], group_a, group_b))
                 continue
-            ya = y[a_mask]
-            yb = y[b_mask]
-            mean_a = float(np.mean(ya))
-            mean_b = float(np.mean(yb))
-            n_a = int(a_mask.sum())
-            n_b = int(b_mask.sum())
-            var_a = float(np.var(ya, ddof=1))
-            var_b = float(np.var(yb, ddof=1))
-            se = float(np.sqrt(var_a / n_a + var_b / n_b))
-            if se < 1e-12:
+
+            # Build the design matrix for THIS fit:
+            #   columns = [intercept] + non_ref_group_dummies + covariates
+            # and drop rows where any covariate is NaN.
+            X_parts = [np.ones((S, 1), dtype=np.float64), group_design]
+            if cov_matrix is not None:
+                X_parts.append(cov_matrix)
+            X_full = np.hstack(X_parts)
+            n_cols = X_full.shape[1]
+
+            row_valid = np.all(np.isfinite(X_full), axis=1) & np.isfinite(y)
+            # Require enough samples for the regression to be identified
+            # (more rows than columns plus some slack).
+            if int(np.sum(row_valid)) < n_cols + 1:
                 results.append(_skipped_result(cell_type_names[j], group_a, group_b))
                 continue
-            effect = mean_a - mean_b
-            z = effect / se
-            from scipy.stats import norm
 
-            p = float(2.0 * (1.0 - norm.cdf(abs(z))))
+            X = X_full[row_valid]
+            y_v = y[row_valid]
+            n_obs = X.shape[0]
+            dof = n_obs - n_cols
+            if dof < 1:
+                results.append(_skipped_result(cell_type_names[j], group_a, group_b))
+                continue
+
+            # OLS closed form: β̂ = (Xᵀ X)⁻¹ Xᵀ y
+            try:
+                XtX = X.T @ X
+                XtX_inv = np.linalg.pinv(XtX)
+                beta = XtX_inv @ (X.T @ y_v)
+            except np.linalg.LinAlgError:
+                results.append(_skipped_result(cell_type_names[j], group_a, group_b))
+                continue
+
+            residuals = y_v - X @ beta
+            rss = float(np.sum(residuals ** 2))
+            sigma2 = rss / dof if dof > 0 else float("inf")
+            cov_beta = sigma2 * XtX_inv
+
+            # Contrast vector: difference between β_A and β_B where β_*
+            # refers to the one-hot column for that group (0 for the
+            # reference group since it's absorbed into the intercept).
+            contrast_vec = np.zeros(n_cols, dtype=np.float64)
+            # First column is intercept (coefficient index 0);
+            # non-reference group dummies start at index 1.
+            group_col_offset = 1
+            if group_a in group_col_to_idx:
+                contrast_vec[group_col_offset + group_col_to_idx[group_a]] = 1.0
+            if group_b in group_col_to_idx:
+                contrast_vec[group_col_offset + group_col_to_idx[group_b]] = -1.0
+
+            effect = float(contrast_vec @ beta)
+            var_effect = float(contrast_vec @ cov_beta @ contrast_vec)
+            if var_effect <= 0 or not np.isfinite(var_effect):
+                results.append(_skipped_result(cell_type_names[j], group_a, group_b))
+                continue
+            se = float(np.sqrt(var_effect))
+            t_stat = effect / se
+
+            from scipy.stats import t as student_t
+
+            p = float(2.0 * student_t.sf(abs(t_stat), df=dof))
+
+            # Raw proportion means use the unfiltered (pre-NaN-drop) mask
+            # so the reported mean is the cohort-average even if some
+            # samples were excluded from THIS fit due to missing covariates.
             results.append(
                 TestResult(
                     cell_type=cell_type_names[j],
@@ -93,13 +188,79 @@ def compositional_regression_test(
                     mean_b=float(np.mean(P[b_mask, j])),
                     effect_size=effect,
                     se=se,
-                    statistic=z,
+                    statistic=t_stat,
                     p_value=p,
+                    extra={
+                        "n_obs": n_obs,
+                        "n_covariates": (
+                            len(cov_col_names) if cov_col_names else 0
+                        ),
+                        "dof": dof,
+                        "covariate_columns": list(cov_col_names or []),
+                    },
                 )
             )
 
     _apply_fdr(results, fdr_alpha)
     return results
+
+
+def _build_covariate_design(
+    covariates: pd.DataFrame | None,
+    sample_ids: list[str],
+) -> tuple[np.ndarray | None, list[str] | None]:
+    """Build an (S, C) float64 covariate matrix aligned to ``sample_ids``.
+
+    Numeric columns pass through unchanged. Categorical columns are
+    one-hot-encoded with the first category dropped (treatment encoding)
+    so the design matrix stays full-rank alongside the intercept. The
+    ``sample_id`` column (if present) is consumed for alignment and
+    dropped from the output matrix.
+
+    NaN values are preserved in the output — the caller handles per-fit
+    row dropping so one missing covariate doesn't cascade across all
+    tests. Returns ``(None, None)`` when no covariates are supplied.
+    """
+    if covariates is None or covariates.empty:
+        return None, None
+
+    cov = covariates.copy()
+    if "sample_id" in cov.columns:
+        cov = cov.set_index("sample_id")
+    # Reindex onto our sample order; missing rows become all-NaN.
+    try:
+        cov = cov.reindex(sample_ids)
+    except Exception:
+        # Index mismatch (non-string, duplicates, ...) — give up gracefully.
+        return None, None
+
+    # Drop columns that are entirely missing
+    cov = cov.dropna(axis=1, how="all")
+    if cov.empty:
+        return None, None
+
+    # One-hot-encode non-numeric columns (drop_first so the intercept
+    # captures the reference category and the design is full-rank).
+    cov_encoded = pd.get_dummies(cov, drop_first=True, dummy_na=False)
+    if cov_encoded.empty:
+        return None, None
+
+    col_names = list(cov_encoded.columns)
+    try:
+        M = cov_encoded.to_numpy(dtype=np.float64)
+    except (ValueError, TypeError):
+        # Some column still isn't numeric after encoding (e.g. object dtype)
+        # — drop those and retry.
+        numeric_cols = [
+            c for c in cov_encoded.columns
+            if pd.api.types.is_numeric_dtype(cov_encoded[c])
+        ]
+        if not numeric_cols:
+            return None, None
+        cov_encoded = cov_encoded[numeric_cols]
+        col_names = numeric_cols
+        M = cov_encoded.to_numpy(dtype=np.float64)
+    return M, col_names
 
 
 def wilcoxon_test(

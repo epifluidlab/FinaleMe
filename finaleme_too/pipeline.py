@@ -54,7 +54,10 @@ from finaleme_too.io.reference_panel import (
     load_cpg_index,
 )
 from finaleme_too.io.sample_sheet import Sample, SampleSheet
-from finaleme_too.preprocessing.batch_correction import combat_correct
+from finaleme_too.preprocessing.batch_correction import (
+    combat_correct,
+    combat_correct_predicted_beta,
+)
 from finaleme_too.preprocessing.coverage import (
     CoverageTierAssigner,
     effective_coverage_in_markers,
@@ -206,21 +209,33 @@ class TOOPipeline:
             reference = _subset_reference(reference, marker_subset_indices)
             marker_regions = _subset_marker_regions(marker_regions, marker_subset_indices)
 
-        # Phase D: load all samples first so we can do cohort-level operations
-        # (batch correction, imputation) before deconvolution.
+        # Phase D: load raw samples first — no preprocessing yet. We need
+        # cohort-level operations (batch correction, imputation, and for
+        # FinaleMe mode binarization itself) to run AFTER loading, because
+        # batch correction of FinaleMe predicted_beta must happen BEFORE
+        # binarization (math doc §10). Otherwise the per-marker state calls
+        # would be derived from pre-correction betas and then the corrected
+        # k/n would never feed the FinaleMe likelihood.
+        #
         # Use the threading backend: pandas.read_csv / numpy releases the GIL
-        # in the inner loops, and the marker_regions / cpg_index arguments are
-        # large — pickling them per task (the loky default) would dominate the
-        # runtime and produce the <100% CPU symptom the user reported.
-        log.info("Loading + calibrating %d samples", len(sample_sheet.samples))
+        # in the inner loops, and the marker_regions / cpg_index arguments
+        # are large — pickling them per task (the loky default) would
+        # dominate the runtime.
+        log.info("Loading %d samples", len(sample_sheet.samples))
         loaded_obs: list[MarkerObservations] = parallel_map(
-            lambda s: self._load_and_calibrate(s, marker_regions, cpg_index),
+            lambda s: self._load_sample(s, marker_regions, cpg_index),
             sample_sheet.samples,
             n_jobs=self.config.threads,
             backend="threading",
         )
 
-        # Optional: ComBat-style technical batch correction
+        # Optional: ComBat-style technical batch correction. Mode-aware:
+        #   * WGBS samples → combat_correct on k/n (operates on beta = k/n)
+        #   * FinaleMe samples → combat_correct_predicted_beta on
+        #     predicted_beta (BEFORE binarization, so the corrected
+        #     predictions drive the U / M / Ambiguous state calls).
+        # We run both correctors because a cohort can mix the two modes;
+        # each only touches samples it applies to.
         if self.config.batch_correction.technical_covariates:
             batch_var = self.config.batch_correction.technical_covariates[0]
             batch_labels = [
@@ -228,11 +243,42 @@ class TOOPipeline:
                 for s in sample_sheet.samples
             ]
             log.info("Applying batch correction on %s", batch_var)
+            # WGBS path: correct k/n. The FinaleMe-mode samples in the list
+            # have predicted_beta set, so combat_correct (which reads k/n)
+            # would also mutate them, but their likelihood goes through the
+            # binarization path — k/n only feed the coverage weight, not
+            # the state call. To keep things clean we run each corrector
+            # over only its own mode's samples.
+            wgbs_labels = [
+                lbl if obs.mode == MeasurementMode.WGBS else None
+                for obs, lbl in zip(loaded_obs, batch_labels)
+            ]
+            finaleme_labels = [
+                lbl if obs.mode == MeasurementMode.FINALEME else None
+                for obs, lbl in zip(loaded_obs, batch_labels)
+            ]
             loaded_obs = combat_correct(
                 loaded_obs,
-                batch_labels=batch_labels,
+                batch_labels=wgbs_labels,
                 min_levels=self.config.batch_correction.min_levels,
                 min_per_level=self.config.batch_correction.min_samples_per_level,
+            )
+            loaded_obs = combat_correct_predicted_beta(
+                loaded_obs,
+                batch_labels=finaleme_labels,
+                min_levels=self.config.batch_correction.min_levels,
+                min_per_level=self.config.batch_correction.min_samples_per_level,
+            )
+
+        # Now that FinaleMe samples have their predicted_beta corrected,
+        # apply binarization. This is where called_state + context_bin are
+        # populated — downstream code in _deconvolve_sample reads these.
+        if self.binarization is not None:
+            loaded_obs = parallel_map(
+                self._apply_finaleme_binarization,
+                loaded_obs,
+                n_jobs=self.config.threads,
+                backend="threading",
             )
 
         # Optional: cohort imputation for low-coverage markers (LOW/ULTRALOW).
@@ -298,7 +344,9 @@ class TOOPipeline:
         # can produce valid rows with as few as 3 samples; ILR regression
         # needs >=2 per group but not an overall cohort size threshold.
         if self.group_comparison_spec and len(results) >= 2:
-            test_results = self._run_group_comparisons(adjusted_results, sample_groups)
+            test_results = self._run_group_comparisons(
+                adjusted_results, sample_groups, sample_sheet
+            )
             if test_results:
                 write_group_comparison(test_results, out_dir / "group_comparison.tsv")
 
@@ -377,13 +425,58 @@ class TOOPipeline:
                 return True
         return False
 
+    def _resolve_biological_covariates(
+        self,
+        sample_sheet: SampleSheet,
+    ) -> list[str]:
+        """Resolve the active biological covariate list for this run.
+
+        Per architecture §9.1: biological covariates that are populated on
+        at least one sample are adjusted by default. The user-configurable
+        covariates (``treatment``, ``treatment_efficacy``, ``mutation_status``)
+        stay opt-in — they're only included when the user explicitly
+        configures them via ``config.covariate_adjustment.biological_covariates``.
+
+        Resolution order:
+          1. If ``config.covariate_adjustment.biological_covariates`` is
+             non-empty, use it verbatim (explicit user config wins).
+          2. Otherwise, auto-populate from the sample sheet: any key on
+             any sample's ``biological_covariates`` dict that is NOT in
+             ``config.covariate_adjustment.user_configurable`` is included.
+
+        Returns the resolved list (possibly empty if no samples carry any
+        biological-covariate metadata).
+        """
+        configured = list(self.config.covariate_adjustment.biological_covariates)
+        if configured:
+            return configured
+
+        user_configurable = set(self.config.covariate_adjustment.user_configurable)
+        present: set[str] = set()
+        for s in sample_sheet.samples:
+            for k, v in s.biological_covariates.items():
+                if k in user_configurable:
+                    continue
+                if v is None:
+                    continue
+                # Skip obviously-empty values so "auto" doesn't enable a
+                # column that's NaN on every sample.
+                if isinstance(v, float) and np.isnan(v):
+                    continue
+                if isinstance(v, str) and not v.strip():
+                    continue
+                present.add(k)
+        # Return in a stable (alphabetical) order so different runs on the
+        # same cohort produce identical regression designs.
+        return sorted(present)
+
     def _maybe_adjust_covariates(
         self,
         results: list[DeconvolutionResult],
         sample_sheet: SampleSheet,
     ) -> list[DeconvolutionResult]:
         """Apply ILR-space biological covariate adjustment if configured."""
-        bio = self.config.covariate_adjustment.biological_covariates
+        bio = self._resolve_biological_covariates(sample_sheet)
         if not bio or len(results) < 3:
             return results
 
@@ -424,6 +517,7 @@ class TOOPipeline:
         self,
         results: list[DeconvolutionResult],
         sample_groups: dict[str, str | None],
+        sample_sheet: SampleSheet,
     ) -> list:
         K = len(results[0].cell_types)
         prop = np.array([r.proportions for r in results], dtype=np.float64)  # (S, K+1)
@@ -442,6 +536,15 @@ class TOOPipeline:
                 if r.posterior_samples is not None
             }
 
+        # Build a covariate DataFrame from the sample sheet for the ILR
+        # regression. We include the same biological covariates the
+        # post-deconvolution covariate adjustment step used so the group
+        # comparison is testing "residual group effect after adjusting for
+        # confounders". ``compositional_regression_test`` drops any
+        # sample with NaN covariates on a per-fit basis, so partially-
+        # populated covariates don't kill the whole analysis.
+        covariate_df = self._build_covariate_dataframe(sample_sheet, sample_ids)
+
         return run_group_comparisons(
             proportions=prop,
             sample_ids=sample_ids,
@@ -452,7 +555,39 @@ class TOOPipeline:
             fdr_alpha=self.config.testing.fdr_alpha,
             fdr_method=self.config.testing.fdr_method,
             posterior_samples_by_sample=posterior_by_sample,
+            covariates=covariate_df,
         )
+
+    def _build_covariate_dataframe(
+        self,
+        sample_sheet: SampleSheet,
+        sample_ids: list[str],
+    ) -> pd.DataFrame | None:
+        """Build a per-sample biological-covariate DataFrame for the ILR
+        regression, using the same auto-populated list as
+        ``_maybe_adjust_covariates`` so the covariate adjustment and the
+        group comparison see the same design matrix.
+
+        Returns ``None`` when neither config nor sample metadata provide
+        any biological covariates, in which case
+        ``compositional_regression_test`` skips the covariate columns
+        entirely.
+        """
+        bio_cols = self._resolve_biological_covariates(sample_sheet)
+        if not bio_cols:
+            return None
+        sample_map = {s.sample_id: s for s in sample_sheet.samples}
+        rows = []
+        for sid in sample_ids:
+            sample = sample_map.get(sid)
+            if sample is None:
+                rows.append({c: np.nan for c in bio_cols})
+                continue
+            cov = sample.biological_covariates
+            rows.append({c: cov.get(c, np.nan) for c in bio_cols})
+        cov_df = pd.DataFrame(rows, index=sample_ids)
+        cov_df.index.name = "sample_id"
+        return cov_df
 
     # ------------------------------------------------------------------
     # Per-sample
@@ -469,26 +604,22 @@ class TOOPipeline:
         keys = list(zip(obs.chrom.tolist(), obs.start.tolist(), obs.end.tolist()))
         return np.array([float(ann.get(k, np.nan)) for k in keys], dtype=np.float64)
 
-    def _load_and_preprocess_sample(
+    def _load_sample(
         self,
         sample: Sample,
         marker_regions: MarkerRegions,
         cpg_index: dict | None,
     ) -> MarkerObservations:
-        """Load methylation data and apply FinaleMe binarization.
+        """Load raw methylation data for one sample (no preprocessing).
 
-        FinaleMe-mode samples with ``self.binarization`` set run
-        ``apply_binarization`` which classifies each marker into
-        U / M / Ambiguous / Excluded and writes ``called_state`` and
-        ``context_bin`` onto the returned ``MarkerObservations``.
-
-        WGBS-mode samples are returned as loaded (no preprocessing).
-        Coverage tier assignment, observation model construction, and
-        deconvolution are deferred to ``_deconvolve_sample`` so that
-        batch correction and imputation can run in between.
+        Binarization (for FinaleMe mode) is deliberately NOT applied here —
+        it must run **after** batch correction (math doc §10) so the
+        corrected ``predicted_beta`` is what the binarizer classifies into
+        U / M / Ambiguous / Excluded states. See ``_apply_finaleme_binarization``
+        which runs per-sample after the cohort-level batch correction step.
         """
         log.info("Loading sample %s (%s)", sample.sample_id, sample.mode.value)
-        obs = MethylationLoader.load(
+        return MethylationLoader.load(
             filepath=sample.methylation_file,
             sample_id=sample.sample_id,
             mode=sample.mode,
@@ -498,22 +629,35 @@ class TOOPipeline:
             total_col=sample.total_col,
             cpg_index=cpg_index,
         )
+
+    def _apply_finaleme_binarization(
+        self, obs: MarkerObservations
+    ) -> MarkerObservations:
+        """Apply the trained binarization to a single (possibly batch-corrected)
+        FinaleMe sample. WGBS and un-binarized FinaleMe samples pass through
+        unchanged.
+        """
         if (
-            sample.mode == MeasurementMode.FINALEME
-            and self.binarization is not None
+            obs.mode != MeasurementMode.FINALEME
+            or self.binarization is None
+            or obs.predicted_beta is None
         ):
-            from finaleme_too.preprocessing.binarization import apply_binarization
+            return obs
+        from finaleme_too.preprocessing.binarization import apply_binarization
 
-            obs = apply_binarization(
-                obs,
-                params=self.binarization,
-                region_annotations=self.region_annotations,
-            )
-        return obs
+        return apply_binarization(
+            obs,
+            params=self.binarization,
+            region_annotations=self.region_annotations,
+        )
 
-    # Backwards-compat alias so any stale caller finding
-    # ``pipeline._load_and_calibrate`` still works during the migration.
-    _load_and_calibrate = _load_and_preprocess_sample
+    # Backwards-compat aliases so any stale caller finding the old method
+    # names on TOOPipeline still works. The v2 name was _load_and_calibrate;
+    # the post-Phase-E name was _load_and_preprocess_sample. Both now route
+    # to _load_sample which no longer binarizes (binarization moved to
+    # _apply_finaleme_binarization called after batch correction).
+    _load_and_preprocess_sample = _load_sample
+    _load_and_calibrate = _load_sample
 
     def _deconvolve_sample(
         self,
@@ -1183,10 +1327,29 @@ def load_optional_binarization(
 def load_optional_region_annotations(
     config: TOOConfig, explicit_path: str | None
 ) -> pd.DataFrame | None:
+    """Load a region_annotation TSV and normalize chromosome naming.
+
+    The output TSV from ``make-region-annotation`` / ``compute_region_annotation``
+    strips any ``chr`` prefix (so rows look like ``1`` / ``2`` / ``X``),
+    but the downstream consumer (``apply_binarization``) joins on the raw
+    ``obs.chrom`` which may or may not carry the prefix depending on how
+    the marker regions file was written. Without normalization the join
+    silently misses and every marker falls back to the ``open_sea`` bin,
+    producing wrong context-bin assignments at inference time.
+
+    Normalize both sides by stripping the ``chr`` prefix here; the
+    inference-time apply_binarization applies the same strip to its
+    lookup keys for defense-in-depth.
+    """
     path = explicit_path or config.markers.region_annotation
     if path is None:
         return None
-    return pd.read_csv(path, sep="\t", comment="#")
+    from finaleme_too.preprocessing._matched_sample_sheet import _normalize_chrom
+
+    df = pd.read_csv(path, sep="\t", comment="#")
+    if "chrom" in df.columns:
+        df = _normalize_chrom(df)
+    return df
 
 
 __all__ = [

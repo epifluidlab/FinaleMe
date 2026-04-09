@@ -5,6 +5,7 @@ from __future__ import annotations
 from itertools import combinations
 
 import numpy as np
+import pandas as pd
 
 from finaleme_too.config import TestMethod
 from finaleme_too.postprocessing.statistical_testing import (
@@ -108,8 +109,14 @@ def run_group_comparisons(
     fdr_alpha: float = 0.05,
     fdr_method: str = "BH",
     posterior_samples_by_sample: dict[str, np.ndarray] | None = None,
+    covariates: pd.DataFrame | None = None,
 ) -> list[TestResult]:
     """Top-level dispatcher.
+
+    ``covariates`` is an optional DataFrame indexed (or keyed) by
+    ``sample_id`` with one column per biological/technical covariate that
+    should be adjusted for in the ILR regression. See
+    ``compositional_regression_test`` for the design-matrix semantics.
 
     All results (omnibus + pairwise) go through a single FDR correction at
     the end so that omnibus rows also receive an ``adjusted_p_value``. The
@@ -136,6 +143,7 @@ def run_group_comparisons(
             if not posterior_samples_by_sample:
                 pairwise = compositional_regression_test(
                     proportions, sample_ids, group_labels, cell_type_names, contrasts,
+                    covariates=covariates,
                     fdr_alpha=1.0,
                 )
             else:
@@ -152,6 +160,7 @@ def run_group_comparisons(
         else:
             pairwise = compositional_regression_test(
                 proportions, sample_ids, group_labels, cell_type_names, contrasts,
+                covariates=covariates,
                 fdr_alpha=1.0,
             )
         results.extend(pairwise)
