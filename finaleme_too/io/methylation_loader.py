@@ -402,36 +402,105 @@ def _parse_finaleme_bed_with_tabix(
         n_markers = marker_regions.n_markers
         k_arr = np.zeros(n_markers, dtype=np.int64)
         n_arr = np.zeros(n_markers, dtype=np.int64)
-
+        # Batch markers by chromosome, then do one tabix fetch per chromosome
+        # (instead of one fetch per marker). This is much faster on network
+        # filesystems than thousands of random tabix seeks.
+        chrom_to_marker_idx: dict[str, list[int]] = {}
         for mi in range(n_markers):
             chrom = str(marker_regions.chrom[mi])
-            start = int(marker_regions.start[mi])
-            end = int(marker_regions.end[mi])
+            chrom_to_marker_idx.setdefault(chrom, []).append(mi)
 
-            k_sum = 0.0
-            n_sum = 0.0
+        for chrom, marker_ids_list in chrom_to_marker_idx.items():
             query_chrom = _resolve_query_chrom(chrom, contigs)
-            if query_chrom is not None:
+            if query_chrom is None:
+                continue
+
+            marker_ids = np.asarray(marker_ids_list, dtype=np.int64)
+            starts = np.asarray(marker_regions.start[marker_ids], dtype=np.int64)
+            ends = np.asarray(marker_regions.end[marker_ids], dtype=np.int64)
+            if starts.size == 0:
+                continue
+            valid_marker = ends > starts
+            if not np.any(valid_marker):
+                continue
+            marker_ids = marker_ids[valid_marker]
+            starts = starts[valid_marker]
+            ends = ends[valid_marker]
+            order = np.argsort(starts, kind="mergesort")
+            marker_ids = marker_ids[order]
+            starts = starts[order]
+            ends = ends[order]
+
+            fetch_start = int(max(0, starts[0]))
+            fetch_end = int(max(fetch_start, np.max(ends)))
+            if fetch_end <= fetch_start:
+                continue
+
+            # Fast path when marker intervals on this chromosome do not overlap:
+            # each CpG record belongs to at most one marker interval.
+            non_overlap = bool(np.all(ends[:-1] <= starts[1])) if starts.size > 1 else True
+
+            if non_overlap:
+                ptr = 0
+                n_local = starts.size
                 try:
-                    for line in tbx.fetch(query_chrom, max(0, start), max(0, end)):
+                    for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
                         parts = line.split("\t")
                         if len(parts) < 6:
                             continue
                         try:
                             cpg_start = int(parts[1])
-                            # prediction.bed.gz is BED-like (0-based, half-open).
-                            if cpg_start < start or cpg_start >= end:
-                                continue
-                            k_sum += float(parts[4])
-                            n_sum += float(parts[5])
+                            meth = float(parts[4])
+                            total = float(parts[5])
                         except ValueError:
                             continue
+                        # prediction.bed.gz is BED-like (0-based, half-open)
+                        while ptr < n_local and ends[ptr] <= cpg_start:
+                            ptr += 1
+                        if ptr >= n_local:
+                            break
+                        if starts[ptr] <= cpg_start < ends[ptr]:
+                            mid = int(marker_ids[ptr])
+                            k_arr[mid] += int(meth)
+                            n_arr[mid] += int(total)
                 except ValueError:
-                    # fetch() can still throw for malformed contig names.
                     pass
+            else:
+                # Fallback path for overlapping markers: maintain active set.
+                import heapq
 
-            k_arr[mi] = int(k_sum)
-            n_arr[mi] = int(n_sum)
+                active: list[tuple[int, int]] = []  # (end, local_idx)
+                add_ptr = 0
+                n_local = starts.size
+                try:
+                    for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
+                        parts = line.split("\t")
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            cpg_start = int(parts[1])
+                            meth = float(parts[4])
+                            total = float(parts[5])
+                        except ValueError:
+                            continue
+
+                        while add_ptr < n_local and starts[add_ptr] <= cpg_start:
+                            heapq.heappush(active, (int(ends[add_ptr]), int(add_ptr)))
+                            add_ptr += 1
+                        while active and active[0][0] <= cpg_start:
+                            heapq.heappop(active)
+
+                        if not active:
+                            continue
+                        meth_i = int(meth)
+                        total_i = int(total)
+                        for _, local_idx in active:
+                            if starts[local_idx] <= cpg_start < ends[local_idx]:
+                                mid = int(marker_ids[local_idx])
+                                k_arr[mid] += meth_i
+                                n_arr[mid] += total_i
+                except ValueError:
+                    pass
     finally:
         tbx.close()
 

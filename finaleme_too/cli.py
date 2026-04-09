@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import click
 
@@ -152,6 +153,14 @@ def run_cmd(
 ) -> None:
     """Run TOO deconvolution end-to-end on a cohort."""
     _setup_logging(verbose)
+    t_cmd_start = perf_counter()
+    cli_stage_seconds: dict[str, float] = {}
+    skipped_stages: set[str] = set()
+
+    def _mark_stage(name: str, t0: float, skipped: bool = False) -> None:
+        cli_stage_seconds[name] = perf_counter() - t0
+        if skipped:
+            skipped_stages.add(name)
 
     # Build / load config
     if config_path:
@@ -211,8 +220,10 @@ def run_cmd(
             c.strip() for c in configurable_covariates.split(",") if c.strip()
         ]
 
+    t0 = perf_counter()
     sample_sheet = SampleSheet.from_tsv(sample_sheet_path)
     sample_sheet.validate_files_exist()
+    _mark_stage("sample_sheet", t0)
 
     # Optional global mode override
     if mode is not None:
@@ -260,6 +271,7 @@ def run_cmd(
         config.markers.marker_format = marker_format
     effective_marker_format = config.markers.marker_format
 
+    t0 = perf_counter()
     reference, markers, cpg_idx = build_reference_and_markers(
         config=config,
         explicit_reference=reference_panel,
@@ -270,11 +282,13 @@ def run_cmd(
         explicit_marker_format=effective_marker_format,
         threads=config.threads,
     )
+    _mark_stage("reference_and_markers", t0)
 
     # Load FinaleMe binarization params + region annotations.
     binarization_params = None
     region_annotations = None
     has_finaleme = any(s.mode.value == "FINALEME" for s in sample_sheet.samples)
+    t0 = perf_counter()
     if has_finaleme:
         if binarize_threshold is not None:
             if binarize_threshold < 0.0 or binarize_threshold > 1.0:
@@ -323,6 +337,7 @@ def run_cmd(
                 use_default=config.binarization.use_default,
             )
         region_annotations = load_optional_region_annotations(config, region_annotation)
+    _mark_stage("finaleme_aux_inputs", t0, skipped=not has_finaleme)
 
     # Group comparison: fall back to config default if CLI is omitted
     effective_group_comparison = (
@@ -337,7 +352,29 @@ def run_cmd(
         group_comparison_spec=effective_group_comparison,
         cpg_index=cpg_idx,
     )
+    t0 = perf_counter()
     pipeline.run(sample_sheet, reference, markers, output_dir, cpg_index=cpg_idx)
+    _mark_stage("pipeline_run", t0)
+
+    stage_order = [
+        "sample_sheet",
+        "reference_and_markers",
+        "finaleme_aux_inputs",
+        "pipeline_run",
+    ]
+    stage_parts: list[str] = []
+    for name in stage_order:
+        sec = cli_stage_seconds.get(name, 0.0)
+        if name in skipped_stages:
+            stage_parts.append(f"{name}=skipped({sec:.2f}s)")
+        else:
+            stage_parts.append(f"{name}={sec:.2f}s")
+    log.info(
+        "Run command runtime summary: %s | total=%.2fs",
+        ", ".join(stage_parts),
+        perf_counter() - t_cmd_start,
+    )
+
     click.echo(f"finaleme-too: wrote outputs to {output_dir}")
 
 

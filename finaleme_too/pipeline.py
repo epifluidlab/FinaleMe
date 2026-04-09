@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 import numpy as np
@@ -201,6 +202,15 @@ class TOOPipeline:
         cpg_index: dict | None = None,
     ) -> CohortResult:
         """Run the full pipeline and write outputs to ``output_dir``."""
+        t_run_start = perf_counter()
+        stage_seconds: dict[str, float] = {}
+        skipped_stages: set[str] = set()
+
+        def _mark_stage(name: str, t0: float, skipped: bool = False) -> None:
+            stage_seconds[name] = perf_counter() - t0
+            if skipped:
+                skipped_stages.add(name)
+
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Cache for fragment-level path (ULTRALOW tier) + residual analysis
@@ -209,8 +219,11 @@ class TOOPipeline:
         self._final_marker_regions = marker_regions
 
         # Cell-type-balanced marker selection (P1)
+        t0 = perf_counter()
         marker_subset_indices: np.ndarray | None = None
+        marker_selection_skipped = True
         if self.marker_selector is not None and reference.n_markers > self.marker_selector.n_per_type:
+            marker_selection_skipped = False
             marker_subset_indices = self.marker_selector.select(
                 reference,
                 region_annotations=self.region_annotations,
@@ -222,6 +235,7 @@ class TOOPipeline:
             )
             reference = _subset_reference(reference, marker_subset_indices)
             marker_regions = _subset_marker_regions(marker_regions, marker_subset_indices)
+        _mark_stage("marker_selection", t0, skipped=marker_selection_skipped)
 
         # Phase D: load raw samples first — no preprocessing yet. We need
         # cohort-level operations (batch correction, imputation, and for
@@ -235,6 +249,7 @@ class TOOPipeline:
         # in the inner loops, and the marker_regions / cpg_index arguments
         # are large — pickling them per task (the loky default) would
         # dominate the runtime.
+        t0 = perf_counter()
         log.info("Loading %d samples", len(sample_sheet.samples))
         loaded_obs: list[MarkerObservations] = parallel_map(
             lambda s: self._load_sample(s, marker_regions, cpg_index),
@@ -242,6 +257,7 @@ class TOOPipeline:
             n_jobs=self.config.threads,
             backend="threading",
         )
+        _mark_stage("load_samples", t0)
 
         # Optional: ComBat-style technical batch correction. Mode-aware:
         #   * WGBS samples → combat_correct on k/n (operates on beta = k/n)
@@ -250,7 +266,10 @@ class TOOPipeline:
         #     predictions drive the U / M / Ambiguous state calls).
         # We run both correctors because a cohort can mix the two modes;
         # each only touches samples it applies to.
+        t0 = perf_counter()
+        batch_correction_skipped = True
         if self.config.batch_correction.technical_covariates:
+            batch_correction_skipped = False
             batch_var = self.config.batch_correction.technical_covariates[0]
             batch_labels = [
                 str(s.metadata.get(batch_var)) if batch_var in s.metadata else None
@@ -283,17 +302,22 @@ class TOOPipeline:
                 min_levels=self.config.batch_correction.min_levels,
                 min_per_level=self.config.batch_correction.min_samples_per_level,
             )
+        _mark_stage("batch_correction", t0, skipped=batch_correction_skipped)
 
         # Now that FinaleMe samples have their predicted_beta corrected,
         # apply binarization. This is where called_state + context_bin are
         # populated — downstream code in _deconvolve_sample reads these.
+        t0 = perf_counter()
+        binarization_skipped = True
         if self.binarization is not None:
+            binarization_skipped = False
             loaded_obs = parallel_map(
                 self._apply_finaleme_binarization,
                 loaded_obs,
                 n_jobs=self.config.threads,
                 backend="threading",
             )
+        _mark_stage("apply_binarization", t0, skipped=binarization_skipped)
 
         # Optional: cohort imputation for low-coverage markers (LOW/ULTRALOW).
         # Snapshot pre-imputation counts so we can compute pct_imputed later.
@@ -301,7 +325,10 @@ class TOOPipeline:
             np.asarray(obs.n, dtype=np.int64).copy() for obs in loaded_obs
         ]
         sample_groups_map = {s.sample_id: s.group for s in sample_sheet.samples}
+        t0 = perf_counter()
+        imputation_skipped = True
         if self._should_impute(loaded_obs):
+            imputation_skipped = False
             imputer = CohortImputer(coverage_threshold=self.config.coverage.min_reads)
             # Imputation is pure numpy on per-sample arrays — releases the GIL
             # and shares the cohort donor list by reference, so the threading
@@ -312,6 +339,7 @@ class TOOPipeline:
                 n_jobs=self.config.threads,
                 backend="threading",
             )
+        _mark_stage("imputation", t0, skipped=imputation_skipped)
 
         # Compute the per-sample inner-thread count. When the cohort is
         # smaller than --threads (e.g. one sample run with --threads 8), the
@@ -336,17 +364,26 @@ class TOOPipeline:
         # GIL. Loky here would re-pickle the (large) reference panel for every
         # sample, which is what was capping CPU usage well below the user's
         # `--threads` setting.
+        t0 = perf_counter()
         results = parallel_map(
             _decon,
             list(zip(sample_sheet.samples, loaded_obs, pre_impute_n)),
             n_jobs=outer_jobs,
             backend="threading",
         )
+        _mark_stage("deconvolution", t0)
 
         # Phase D: optional ILR-space biological covariate adjustment
+        t0 = perf_counter()
         adjusted_results = self._maybe_adjust_covariates(results, sample_sheet)
+        _mark_stage(
+            "covariate_adjustment",
+            t0,
+            skipped=adjusted_results is results,
+        )
 
         # Cohort outputs
+        t0 = perf_counter()
         sample_groups = {s.sample_id: s.group for s in sample_sheet.samples}
         write_cohort_proportions(
             adjusted_results, sample_groups, out_dir / "cohort_proportions.tsv"
@@ -355,20 +392,52 @@ class TOOPipeline:
         write_binarization_debug(
             adjusted_results, sample_groups, out_dir / "binarization_debug.tsv"
         )
+        _mark_stage("write_primary_outputs", t0)
 
         # Group comparison (P1): delegate sample-sufficiency checks to the
         # per-test helpers in run_group_comparisons. Bayesian comparisons
         # can produce valid rows with as few as 3 samples; ILR regression
         # needs >=2 per group but not an overall cohort size threshold.
+        t0 = perf_counter()
+        group_comparison_skipped = True
         if self.group_comparison_spec and len(results) >= 2:
+            group_comparison_skipped = False
             test_results = self._run_group_comparisons(
                 adjusted_results, sample_groups, sample_sheet
             )
             if test_results:
                 write_group_comparison(test_results, out_dir / "group_comparison.tsv")
+        _mark_stage("group_comparison", t0, skipped=group_comparison_skipped)
 
         # Residual analysis + NMF discovery (Gap 6b, architecture §9.4)
+        t0 = perf_counter()
         self._run_residual_analysis(adjusted_results, sample_groups, out_dir)
+        _mark_stage("residual_analysis", t0)
+
+        stage_order = [
+            "marker_selection",
+            "load_samples",
+            "batch_correction",
+            "apply_binarization",
+            "imputation",
+            "deconvolution",
+            "covariate_adjustment",
+            "write_primary_outputs",
+            "group_comparison",
+            "residual_analysis",
+        ]
+        stage_parts: list[str] = []
+        for name in stage_order:
+            sec = stage_seconds.get(name, 0.0)
+            if name in skipped_stages:
+                stage_parts.append(f"{name}=skipped({sec:.2f}s)")
+            else:
+                stage_parts.append(f"{name}={sec:.2f}s")
+        log.info(
+            "Pipeline runtime summary: %s | total=%.2fs",
+            ", ".join(stage_parts),
+            perf_counter() - t_run_start,
+        )
 
         return CohortResult(samples=adjusted_results, sample_groups=sample_groups)
 
@@ -1430,10 +1499,21 @@ def build_reference_and_markers(
     .beta parsing in ``load_beta_list`` runs in parallel for large reference
     panels.
     """
+    t_build_start = perf_counter()
     cpg_index = None
     cpg_index_path = explicit_cpg_index or config.reference.cpg_index
     if cpg_index_path is not None:
+        t0 = perf_counter()
+        log.info("Reference build: loading CpG index from %s", cpg_index_path)
         cpg_index = load_cpg_index(cpg_index_path)
+        chr_positions = cpg_index.get("chr_positions", {})
+        total_sites = int(cpg_index.get("total_sites", 0))
+        log.info(
+            "Reference build: loaded CpG index (%d chromosomes, %d CpGs) in %.2fs",
+            len(chr_positions),
+            total_sites,
+            perf_counter() - t0,
+        )
 
     # Marker regions
     marker_regions_path = explicit_markers or config.markers.marker_regions
@@ -1441,12 +1521,34 @@ def build_reference_and_markers(
 
     marker_regions: MarkerRegions
     if marker_regions_path:
+        t0 = perf_counter()
+        log.info(
+            "Reference build: loading marker regions from %s (format=%s)",
+            marker_regions_path,
+            marker_format,
+        )
         marker_regions = MarkerRegionsLoader.load(marker_regions_path, marker_format=marker_format)
+        log.info(
+            "Reference build: loaded %d marker regions in %.2fs",
+            marker_regions.n_markers,
+            perf_counter() - t0,
+        )
     elif explicit_reference or config.reference.reference_panel:
         # Coordinates can come from the matrix reference panel itself
         path = explicit_reference or config.reference.reference_panel
+        t0 = perf_counter()
+        log.info(
+            "Reference build: deriving marker regions from reference panel coordinates in %s",
+            path,
+        )
         ref_for_coords = ReferencePanelLoader.load_matrix(path)
         marker_regions = ref_for_coords.to_marker_regions()
+        log.info(
+            "Reference build: derived %d marker regions from %s in %.2fs",
+            marker_regions.n_markers,
+            path,
+            perf_counter() - t0,
+        )
     else:
         raise ValueError(
             "No marker regions: provide --marker-regions or --reference-panel"
@@ -1454,8 +1556,20 @@ def build_reference_and_markers(
 
     # Reference panel
     if explicit_reference or config.reference.reference_panel:
+        reference_panel_path = explicit_reference or config.reference.reference_panel
+        t0 = perf_counter()
+        log.info(
+            "Reference build: loading reference panel matrix from %s",
+            reference_panel_path,
+        )
         reference = ReferencePanelLoader.load_matrix(
-            explicit_reference or config.reference.reference_panel
+            reference_panel_path
+        )
+        log.info(
+            "Reference build: loaded matrix reference (%d markers x %d cell types) in %.2fs",
+            reference.n_markers,
+            reference.n_cell_types,
+            perf_counter() - t0,
         )
     elif explicit_ref_betas or config.reference.ref_betas:
         ref_betas_arg = explicit_ref_betas or config.reference.ref_betas
@@ -1466,6 +1580,13 @@ def build_reference_and_markers(
             )
         if ref_groups is None:
             raise ValueError("--ref-betas requires --ref-groups")
+        t0 = perf_counter()
+        log.info(
+            "Reference build: building reference from .beta list (%s) + groups (%s) with %d thread(s)",
+            ref_betas_arg,
+            ref_groups,
+            threads,
+        )
         reference = ReferencePanelLoader.load_beta_list(
             ref_betas_arg=ref_betas_arg,
             groups_file=ref_groups,
@@ -1473,9 +1594,16 @@ def build_reference_and_markers(
             marker_regions=marker_regions,
             threads=threads,
         )
+        log.info(
+            "Reference build: built beta-list reference (%d markers x %d cell types) in %.2fs",
+            reference.n_markers,
+            reference.n_cell_types,
+            perf_counter() - t0,
+        )
     else:
         raise ValueError("No reference panel: provide --reference-panel or --ref-betas")
 
+    log.info("Reference build: completed in %.2fs", perf_counter() - t_build_start)
     return reference, marker_regions, cpg_index
 
 
@@ -1526,12 +1654,24 @@ def load_optional_region_annotations(
     """
     path = explicit_path or config.markers.region_annotation
     if path is None:
+        log.info("Region annotations: none provided; skipping.")
         return None
     from finaleme_too.preprocessing._matched_sample_sheet import _normalize_chrom
 
+    t0 = perf_counter()
+    log.info("Region annotations: loading from %s", path)
     df = pd.read_csv(path, sep="\t", comment="#")
+    normalized = False
     if "chrom" in df.columns:
         df = _normalize_chrom(df)
+        normalized = True
+    log.info(
+        "Region annotations: loaded %d rows x %d columns in %.2fs%s",
+        int(df.shape[0]),
+        int(df.shape[1]),
+        perf_counter() - t0,
+        " (normalized chromosome labels)" if normalized else "",
+    )
     return df
 
 
