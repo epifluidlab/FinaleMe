@@ -1623,8 +1623,8 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
         ci_upper=np.array([0.55, 0.35, 0.25]),
         p_goodness=np.array([1.0, 0.98]),
         p_detection=np.array([1.0, 0.97, 0.9]),
-        effect_size=np.array([0.11, 0.07, 0.03]),
         likelihood_score=np.array([0.05, 0.03, 0.02]),
+        p_likelihood=np.array([1e-6, 1e-4, 1e-2]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([10, 10], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1644,8 +1644,8 @@ def test_per_sample_tsv_header_documents_p_value_semantics(tmp_path):
     head_text = "\n".join(head_lines)
     # The header must mention the reliability-driving fields and "high = good".
     assert "p_detection" in head_text
-    assert "effect_size" in head_text
     assert "likelihood_score" in head_text
+    assert "p_likelihood" in head_text
     # Some variant of "HIGH = GOOD" must appear (case-insensitive).
     assert "HIGH = GOOD" in head_text or "high = good" in head_text.lower()
 
@@ -1665,8 +1665,8 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
         ci_upper=np.array([0.65, 0.35, 0.15]),
         p_goodness=np.array([0.87, 0.91]),
         p_detection=np.array([0.99, 0.97, 0.85]),
-        effect_size=np.array([0.12, 0.08, 0.02]),
         likelihood_score=np.array([0.07, 0.04, 0.01]),
+        p_likelihood=np.array([1e-5, 1e-3, 0.2]),
         reliability=np.array(["HIGH", "HIGH", "MODERATE"], dtype=object),
         n_markers=np.array([42, 37], dtype=np.int32),
         coverage_tier=CoverageTier.HIGH,
@@ -1685,8 +1685,8 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
     assert abs(float(df["proportion"].iloc[0]) - 0.6) < 1e-4
     assert abs(float(df["p_detection"].iloc[0]) - 0.99) < 1e-4
     # Unknown row now carries fit metrics (no missing values).
-    assert np.isfinite(float(df["effect_size"].iloc[-1]))
     assert np.isfinite(float(df["likelihood_score"].iloc[-1]))
+    assert np.isfinite(float(df["p_likelihood"].iloc[-1]))
 
 
 # ---------------------------------------------------------------------------

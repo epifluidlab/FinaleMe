@@ -70,10 +70,12 @@ class DeconvolutionResult:
     reliability: np.ndarray  # str array (K+1,)
     n_markers: np.ndarray  # (K,)
     # New reliability metrics (K+1; unknown included as last entry):
-    #   effect_size      — practical fit improvement vs ablated-null model
     #   likelihood_score — weighted per-marker log-likelihood gain vs null
-    effect_size: np.ndarray | None = None  # (K+1,)
+    #   p_likelihood     — LRT p-value vs ablated-null (smaller is better)
     likelihood_score: np.ndarray | None = None  # (K+1,)
+    p_likelihood: np.ndarray | None = None  # (K+1,)
+    # Deprecated legacy metric (kept for backward compatibility only).
+    effect_size: np.ndarray | None = None  # (K+1,)
     bootstrap_proportions: np.ndarray | None = None  # (B, K+1)
     posterior_samples: np.ndarray | None = None  # (T, K+1)
     coverage_tier: CoverageTier = CoverageTier.HIGH

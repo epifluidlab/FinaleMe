@@ -1004,20 +1004,18 @@ class TOOPipeline:
         #
         # Reliability assignment uses:
         #   (1) p_detection
-        #   (2) effect_size
-        #   (3) likelihood_score
-        # where effect_size + likelihood_score are improvements over a
-        # cell-type-ablated null model.
+        #   (2) likelihood_score
+        #   (3) p_likelihood (LRT p-value vs ablated-null)
         K = reference.n_cell_types
-        effect_size = np.full(K + 1, np.nan, dtype=np.float64)
         likelihood_score = np.full(K + 1, np.nan, dtype=np.float64)
+        p_likelihood = np.full(K + 1, np.nan, dtype=np.float64)
         p_detection = np.zeros(K + 1, dtype=np.float64)
         for j in range(K):
             p_detection[j] = compute_p_detection(
                 boot.proportions_samples[:, j],
                 noise_floor=self.config.uncertainty.noise_floor,
             )
-            eff_j, lik_j = compute_fit_metrics(
+            lik_j, plik_j = compute_fit_metrics(
                 w_hat=w_hat,
                 reference_methylation=reference.methylation,
                 observation=observation,
@@ -1025,32 +1023,32 @@ class TOOPipeline:
                 top_n=50,
                 binarizer=self.binarization if use_binarization else None,
             )
-            effect_size[j] = eff_j
             likelihood_score[j] = lik_j
+            p_likelihood[j] = plik_j
         # Unknown component detection + fit metrics (ablation of unknown)
         p_detection[K] = compute_p_detection(
             boot.proportions_samples[:, K],
             noise_floor=self.config.uncertainty.noise_floor,
         )
-        eff_u, lik_u = compute_unknown_fit_metrics(
+        lik_u, plik_u = compute_unknown_fit_metrics(
             w_hat=w_hat,
             reference_methylation=reference.methylation,
             observation=observation,
         )
-        effect_size[K] = eff_u
         likelihood_score[K] = lik_u
+        p_likelihood[K] = plik_u
 
         reliability = np.empty(K + 1, dtype=object)
         for j in range(K):
             reliability[j] = assign_reliability(
                 p_detection=p_detection[j],
-                effect_size=effect_size[j],
                 likelihood_score=likelihood_score[j],
+                p_likelihood=p_likelihood[j],
             )
         reliability[K] = assign_reliability(
             p_detection=p_detection[K],
-            effect_size=effect_size[K],
             likelihood_score=likelihood_score[K],
+            p_likelihood=p_likelihood[K],
         )
 
         # n_markers per cell type — count valid markers contributing to that
@@ -1138,8 +1136,8 @@ class TOOPipeline:
             ci_upper=boot.ci_upper,
             p_goodness=None,
             p_detection=p_detection,
-            effect_size=effect_size,
             likelihood_score=likelihood_score,
+            p_likelihood=p_likelihood,
             reliability=reliability,
             n_markers=n_markers,
             bootstrap_proportions=bootstrap_samples_field,
@@ -1200,8 +1198,8 @@ class TOOPipeline:
             ci_upper=w.copy(),
             p_goodness=None,
             p_detection=np.zeros(K + 1, dtype=np.float64),
-            effect_size=np.full(K + 1, np.nan, dtype=np.float64),
             likelihood_score=np.full(K + 1, np.nan, dtype=np.float64),
+            p_likelihood=np.full(K + 1, np.nan, dtype=np.float64),
             reliability=reliability,
             n_markers=np.zeros(K, dtype=np.int32),
             coverage_tier=tier,

@@ -2,9 +2,9 @@
 
 Reliability combines:
   - p_detection: bootstrap stability above a noise floor.
-  - effect_size: practical fit improvement over a cell-type-ablated null.
-  - likelihood_score: weighted per-marker log-likelihood gain over the same
-    ablated null.
+  - likelihood_score: weighted per-marker log-likelihood gain over an
+    ablated-null model.
+  - p_likelihood: likelihood-ratio p-value vs the same ablated-null model.
 
 ``p_goodness`` remains available as a legacy helper function, but it is no
 longer used for reliability assignment or default output tables.
@@ -359,6 +359,24 @@ def _binarization_mismatch_tolerance(binarizer) -> float:
     return float(np.clip(tol, 0.0, 0.49))
 
 
+def _likelihood_ratio_pvalue(
+    ll_full: float,
+    ll_null: float,
+    df: int = 1,
+) -> float:
+    """Likelihood-ratio p-value for nested full vs ablated-null models.
+
+    Statistic:
+        LR = 2 * max(0, ll_full - ll_null)
+    p-value:
+        P(ChiSq_df >= LR)
+    """
+    if not np.isfinite(ll_full) or not np.isfinite(ll_null):
+        return float("nan")
+    lr = float(max(0.0, 2.0 * (ll_full - ll_null)))
+    return float(chi2.sf(lr, max(int(df), 1)))
+
+
 def compute_fit_metrics(
     w_hat: np.ndarray,
     reference_methylation: np.ndarray,
@@ -367,22 +385,23 @@ def compute_fit_metrics(
     top_n: int = 50,
     binarizer=None,
 ) -> tuple[float, float]:
-    """Return (effect_size, likelihood_score) for one cell type.
-
-    effect_size:
-      WGBS — weighted MAE improvement over an ablated-null model.
-      FinaleMe — weighted mean probability gain over an ablated-null model.
+    """Return (likelihood_score, p_likelihood) for one cell type.
 
     likelihood_score:
       Weighted mean log-likelihood gain (nats per effective marker) over the
       same ablated-null model. Positive means better fit than null.
+
+    p_likelihood:
+      Likelihood-ratio p-value for full vs ablated-null fit.
+      Lower = stronger evidence the cell type improves fit.
     """
     from finaleme_too.core.observation_model_binarization import (
         BinarizationObservationModel,
     )
+    _ = binarizer  # retained for API compatibility
 
     if isinstance(observation, BinarizationObservationModel):
-        top_idx_original, filtered_idx, R_binary = _top_discriminative_indices_binarization(
+        _top_idx_original, filtered_idx, _ = _top_discriminative_indices_binarization(
             reference_methylation=reference_methylation,
             observation=observation,
             cell_type_index=cell_type_index,
@@ -394,8 +413,6 @@ def compute_fit_metrics(
         w_full = np.asarray(w_hat, dtype=np.float64)
         w_null = _ablate_component_and_renormalize(w_full, cell_type_index)
 
-        # Continuous effect size = weighted gain in P(observed_state | w)
-        # over an ablated-null model on top discriminative markers.
         coef = np.asarray(observation.coef, dtype=np.float64)[filtered_idx]
         weights = np.asarray(observation.weights, dtype=np.float64)[filtered_idx]
         wsum = float(np.sum(weights))
@@ -404,11 +421,11 @@ def compute_fit_metrics(
             weights = np.ones_like(weights, dtype=np.float64)
         p_full = np.clip(coef @ w_full, 1e-15, 1.0)
         p_null = np.clip(coef @ w_null, 1e-15, 1.0)
-        effect_size = float(np.sum(weights * (p_full - p_null)) / wsum)
         ll_full = float(np.sum(weights * np.log(p_full)))
         ll_null = float(np.sum(weights * np.log(p_null)))
         likelihood_score = (ll_full - ll_null) / wsum
-        return float(effect_size), float(likelihood_score)
+        p_likelihood = _likelihood_ratio_pvalue(ll_full, ll_null, df=1)
+        return float(likelihood_score), float(p_likelihood)
 
     # WGBS / beta-binomial path
     top_idx = _top_discriminative_indices_betabinom(
@@ -434,10 +451,10 @@ def compute_fit_metrics(
         wsum = float(weights.size)
         weights = np.ones_like(weights, dtype=np.float64)
 
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mu_obs = np.where(n > 0, k / np.maximum(n, 1), np.nan)
     mu_full = np.clip((R_full @ w_full)[top_idx], 1e-9, 1.0 - 1e-9)
     mu_null = np.clip((R_full @ w_null)[top_idx], 1e-9, 1.0 - 1e-9)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu_obs = np.where(n > 0, k / np.maximum(n, 1), np.nan)
     valid = np.isfinite(mu_obs)
     if int(np.sum(valid)) < 5:
         return float("nan"), float("nan")
@@ -453,16 +470,13 @@ def compute_fit_metrics(
         wsum_v = float(w_v.size)
         w_v = np.ones_like(w_v, dtype=np.float64)
 
-    mae_full = float(np.sum(w_v * np.abs(mu_obs_v - mu_full_v)) / wsum_v)
-    mae_null = float(np.sum(w_v * np.abs(mu_obs_v - mu_null_v)) / wsum_v)
-    effect_size = mae_null - mae_full
-
     ll_full_vec = log_likelihood_per_marker(k_v, n_v, mu_full_v, phi_v)
     ll_null_vec = log_likelihood_per_marker(k_v, n_v, mu_null_v, phi_v)
     ll_full = float(np.sum(w_v * ll_full_vec))
     ll_null = float(np.sum(w_v * ll_null_vec))
     likelihood_score = (ll_full - ll_null) / wsum_v
-    return float(effect_size), float(likelihood_score)
+    p_likelihood = _likelihood_ratio_pvalue(ll_full, ll_null, df=1)
+    return float(likelihood_score), float(p_likelihood)
 
 
 def compute_unknown_fit_metrics(
@@ -470,7 +484,7 @@ def compute_unknown_fit_metrics(
     reference_methylation: np.ndarray,
     observation,
 ) -> tuple[float, float]:
-    """Return (effect_size, likelihood_score) for the Unknown component.
+    """Return (likelihood_score, p_likelihood) for the Unknown component.
 
     The null model removes the Unknown weight and renormalizes known
     cell types. Metrics are computed over all valid markers.
@@ -494,9 +508,11 @@ def compute_unknown_fit_metrics(
             weights = np.ones_like(weights, dtype=np.float64)
         p_full = np.clip(coef @ w_full, 1e-15, 1.0)
         p_null = np.clip(coef @ w_null, 1e-15, 1.0)
-        effect_size = float(np.sum(weights * (p_full - p_null)) / wsum)
+        ll_full = float(np.sum(weights * np.log(p_full)))
+        ll_null = float(np.sum(weights * np.log(p_null)))
         likelihood_score = float(np.sum(weights * (np.log(p_full) - np.log(p_null))) / wsum)
-        return effect_size, likelihood_score
+        p_likelihood = _likelihood_ratio_pvalue(ll_full, ll_null, df=1)
+        return likelihood_score, p_likelihood
 
     # WGBS / beta-binomial path
     R = np.asarray(reference_methylation, dtype=np.float64)
@@ -532,36 +548,36 @@ def compute_unknown_fit_metrics(
         wsum = float(w_f.size)
         w_f = np.ones_like(w_f, dtype=np.float64)
 
-    mae_full = float(np.sum(w_f * np.abs(mu_obs_v - mu_full_v)) / wsum)
-    mae_null = float(np.sum(w_f * np.abs(mu_obs_v - mu_null_v)) / wsum)
-    effect_size = mae_null - mae_full
     ll_full = np.sum(w_f * log_likelihood_per_marker(k_f, n_f, mu_full_v, phi_f))
     ll_null = np.sum(w_f * log_likelihood_per_marker(k_f, n_f, mu_null_v, phi_f))
     likelihood_score = float((ll_full - ll_null) / wsum)
-    return float(effect_size), float(likelihood_score)
+    p_likelihood = _likelihood_ratio_pvalue(float(ll_full), float(ll_null), df=1)
+    return float(likelihood_score), float(p_likelihood)
 
 
 def assign_reliability(
     p_detection: float,
-    effect_size: float | None = None,
     likelihood_score: float | None = None,
+    p_likelihood: float | None = None,
+    effect_size: float | None = None,
 ) -> str:
-    """Assign HIGH/MODERATE/LOW/UNRELIABLE from stability + fit metrics.
+    """Assign HIGH/MODERATE/LOW/UNRELIABLE from stability + likelihood metrics.
 
     Thresholds are intentionally conservative:
-      HIGH:      p_detection >= 0.95, effect_size >= 0.05, likelihood >= 0.02
-      MODERATE:  p_detection >= 0.50, effect_size >= 0.01, likelihood >= 0.005
+      HIGH:      p_detection >= 0.95, likelihood > 0, p_likelihood <= 1e-3
+      MODERATE:  p_detection >= 0.50, likelihood > 0, p_likelihood <= 0.05
       UNRELIABLE (when fit metrics unavailable): p_detection < 0.10
       UNRELIABLE (when fit metrics available):   p_detection < 0.50 and
-                                                 (effect_size <= 0 or likelihood <= 0)
+                                                 (likelihood <= 0 or p_likelihood > 0.20)
       else LOW.
     """
+    _ = effect_size  # deprecated, ignored
     if np.isnan(p_detection):
         p_detection = 0.0
 
-    eff_missing = effect_size is None or np.isnan(effect_size)
     lik_missing = likelihood_score is None or np.isnan(likelihood_score)
-    if eff_missing or lik_missing:
+    pl_missing = p_likelihood is None or np.isnan(p_likelihood)
+    if lik_missing or pl_missing:
         if p_detection >= 0.95:
             return "HIGH"
         if p_detection >= 0.50:
@@ -570,14 +586,14 @@ def assign_reliability(
             return "UNRELIABLE"
         return "LOW"
 
-    eff = float(effect_size)
     lik = float(likelihood_score)
+    pl = float(p_likelihood)
 
-    if p_detection >= 0.95 and eff >= 0.05 and lik >= 0.02:
+    if p_detection >= 0.95 and lik > 0.0 and pl <= 1e-3:
         return "HIGH"
-    if p_detection >= 0.50 and eff >= 0.01 and lik >= 0.005:
+    if p_detection >= 0.50 and lik > 0.0 and pl <= 0.05:
         return "MODERATE"
-    if p_detection < 0.50 and (eff <= 0.0 or lik <= 0.0):
+    if p_detection < 0.50 and (lik <= 0.0 or pl > 0.20):
         return "UNRELIABLE"
     return "LOW"
 
