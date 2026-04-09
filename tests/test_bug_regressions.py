@@ -850,8 +850,10 @@ def test_round4_group_comparison_runs_with_3_samples():
     """The pipeline should not hard-block group comparisons at <4 samples.
     Per-test sufficiency checks live inside run_group_comparisons; the
     pipeline should only require the bare minimum of 2 samples."""
-    from finaleme_too.config import CoverageTier, TestMethod, TOOConfig
+    import pandas as pd
+    from finaleme_too.config import CoverageTier, MeasurementMode, TestMethod, TOOConfig
     from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
     from finaleme_too.pipeline import TOOPipeline
 
     rng = np.random.default_rng(1)
@@ -885,12 +887,25 @@ def test_round4_group_comparison_runs_with_3_samples():
         _mk("s3", "B", -0.1),
     ]
     sample_groups = {"s1": "A", "s2": "A", "s3": "B"}
+    # Minimal SampleSheet for the new _run_group_comparisons signature.
+    from pathlib import Path
+    samples = [
+        Sample(
+            sample_id=sid, methylation_file=Path("/nope"),
+            mode=MeasurementMode.WGBS, group=group,
+        )
+        for sid, group in [("s1", "A"), ("s2", "A"), ("s3", "B")]
+    ]
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
 
     config = TOOConfig()
     config.testing.method = TestMethod.ILR_REGRESSION
     pipeline = TOOPipeline(config)
     pipeline.group_comparison_spec = "A:B"
-    test_results = pipeline._run_group_comparisons(results, sample_groups)
+    test_results = pipeline._run_group_comparisons(results, sample_groups, sheet)
     # A:B with n=2 vs n=1 — ILR still produces rows (may be NaN for
     # insufficient within-group variance). What we verify is that the
     # list is returned, NOT blocked outright.
@@ -1632,3 +1647,412 @@ def test_per_sample_tsv_body_parses_with_comment_hash(tmp_path):
     assert abs(float(df["p_detection"].iloc[0]) - 0.99) < 1e-4
     # Unknown row must have NaN p_goodness (no goodness-of-fit for unknown).
     assert np.isnan(float(df["p_goodness"].iloc[-1]))
+
+
+# ---------------------------------------------------------------------------
+# April 2026 — v3 post-migration review bugs (batch correction, chr norm,
+# ILR covariates, auto-populated biological covariates)
+# ---------------------------------------------------------------------------
+
+
+# CRITICAL — FinaleMe batch correction must run on predicted_beta BEFORE
+# binarization so the corrected predictions drive the U/M state calls.
+def test_v3bug_finaleme_batch_correction_runs_before_binarization(tmp_path):
+    """After the fix, combat_correct_predicted_beta rewrites obs.predicted_beta,
+    and apply_binarization subsequently runs on those corrected values.
+    The resulting called_state must reflect the post-correction bin
+    classification, NOT the pre-correction one."""
+    from finaleme_too.config import CoverageTier, MeasurementMode, TOOConfig
+    from finaleme_too.io.marker_regions import MarkerRegions
+    from finaleme_too.io.reference_panel import ReferencePanel
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+    from finaleme_too.preprocessing.binarization import (
+        STATE_M,
+        STATE_U,
+        build_identity_placeholder_params,
+    )
+
+    # Build a 2-cell-type reference with 6 markers, CT0-specific at 0-2,
+    # CT1-specific at 3-5. Simple synthetic data.
+    K = 2
+    M = 6
+    methy = np.full((M, K), 0.9, dtype=np.float32)
+    for j in range(K):
+        for i in range(3):
+            methy[j * 3 + i, j] = 0.05
+    chrom = np.array(["chr1"] * M, dtype=object)
+    starts = np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64)
+    ends = starts + 100
+    reference = ReferencePanel(
+        chrom=chrom, start=starts, end=ends,
+        cell_types=["CT0", "CT1"],
+        methylation=methy, coverage=None,
+    )
+    marker_regions = MarkerRegions(
+        chrom=chrom, start=starts, end=ends, marker_name=None,
+    )
+
+    # 10 FinaleMe samples split into 2 batches. Batch "A" has a systematic
+    # shift of +0.15 on every marker; batch "B" is unshifted. The true
+    # underlying state is the same for every sample (all pure CT0 so
+    # markers 0-2 should be U and 3-5 should be M). Without batch
+    # correction, the shifted batch-A samples would miscall many markers
+    # because 0.05 + 0.15 = 0.2 straddles the placeholder threshold.
+    samples = []
+    for sample_idx in range(10):
+        batch = "A" if sample_idx < 5 else "B"
+        shift = 0.15 if batch == "A" else 0.0
+        pred = np.array(
+            [0.05, 0.05, 0.05, 0.95, 0.95, 0.95], dtype=np.float32
+        )
+        pred = np.clip(pred + shift, 0.0, 1.0)
+
+        bed_path = tmp_path / f"s{sample_idx}.prediction.bed"
+        rows = []
+        for i in range(M):
+            methy_count = int(round(pred[i] * 20))
+            rows.append(
+                f"{chrom[i]}\t{starts[i]}\t{ends[i]}\t{pred[i] * 100:.4f}"
+                f"\t{methy_count}\t20\t0\t0\t0"
+            )
+        bed_path.write_text("\n".join(rows) + "\n")
+        samples.append(
+            Sample(
+                sample_id=f"s{sample_idx}",
+                methylation_file=bed_path,
+                mode=MeasurementMode.FINALEME,
+                input_format="finaleme_bed",
+                group="G",
+                metadata={"extraction_batch": batch},
+            )
+        )
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 3
+    cfg.uncertainty.seed = 0
+    cfg.coverage.tier_high = 0.0
+    cfg.coverage.tier_low = -1.0
+    cfg.markers.n_per_type = 0
+    # Enable batch correction on extraction_batch
+    cfg.batch_correction.technical_covariates = ["extraction_batch"]
+    cfg.batch_correction.min_levels = 2
+    cfg.batch_correction.min_samples_per_level = 3
+
+    binarization = build_identity_placeholder_params()
+    pipeline = TOOPipeline(config=cfg, binarization=binarization)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    cohort = pipeline.run(sheet, reference, marker_regions, out_dir)
+
+    # All samples are synthetic pure CT0 → every sample should have CT0
+    # as the dominant proportion after batch correction lifts the batch-A
+    # shift. If batch correction ran AFTER binarization, the batch-A
+    # samples' state calls would be frozen with the shifted predictions
+    # and the cohort average for CT0 would be visibly worse than the
+    # batch-B average.
+    for r in cohort.samples:
+        assert r.proportions[0] > 0.5, (
+            f"sample {r.sample_id}: CT0 should be dominant, got "
+            f"{r.proportions.tolist()}"
+        )
+
+
+# HIGH — region annotation chromosome normalization must work whether the
+# annotation file carries the "chr" prefix or not.
+def test_v3bug_region_annotation_chr_prefix_normalized_on_both_sides(tmp_path):
+    """apply_binarization must correctly join on (chrom, start, end)
+    regardless of whether the obs and annotation use matching chr
+    conventions. The v2 bug: annotation from compute_region_annotation
+    strips chr → rows like '1', but obs.chrom was 'chr1' → join missed
+    every marker → all fell to open_sea fallback bin."""
+    from finaleme_too.config import MeasurementMode
+    from finaleme_too.io.methylation_loader import MarkerObservations
+    from finaleme_too.preprocessing.binarization import (
+        apply_binarization,
+        build_identity_placeholder_params,
+    )
+
+    params = build_identity_placeholder_params()
+
+    n = 4
+    # obs.chrom uses "chr1" (UCSC convention)
+    obs = MarkerObservations(
+        sample_id="s1",
+        chrom=np.array(["chr1"] * n, dtype=object),
+        start=np.array([1000, 2000, 3000, 4000], dtype=np.int64),
+        end=np.array([1100, 2100, 3100, 4100], dtype=np.int64),
+        k=np.array([1, 1, 19, 19], dtype=np.int32),
+        n=np.array([20] * n, dtype=np.int32),
+        predicted_beta=np.array([0.05, 0.05, 0.95, 0.95], dtype=np.float32),
+        mode=MeasurementMode.FINALEME,
+    )
+
+    # Annotation uses stripped prefix "1" (GRCh37 convention, like what
+    # compute_region_annotation emits). Densities chosen so the first two
+    # markers go to CGI (class 0 → bin 0) and the last two go to shore
+    # (class 1 → bin 2).
+    ann_stripped = pd.DataFrame({
+        "chrom": ["1", "1", "1", "1"],
+        "start": [1000, 2000, 3000, 4000],
+        "end": [1100, 2100, 3100, 4100],
+        "cpg_density": [0.15, 0.15, 0.05, 0.05],
+        "region_class": ["CGI", "CGI", "shore", "shore"],
+    })
+    binarized = apply_binarization(obs, params, region_annotations=ann_stripped)
+    # With the fix, chr prefixes are stripped on both sides → join hits →
+    # CGI markers go to bin 0, shore markers go to bin 2
+    assert binarized.context_bin.tolist() == [0, 0, 2, 2]
+
+    # Reverse direction: annotation carries "chr" prefix, obs does not.
+    obs2 = MarkerObservations(
+        sample_id="s2",
+        chrom=np.array(["1"] * n, dtype=object),  # no prefix on obs
+        start=obs.start.copy(),
+        end=obs.end.copy(),
+        k=obs.k.copy(),
+        n=obs.n.copy(),
+        predicted_beta=obs.predicted_beta.copy(),
+        mode=MeasurementMode.FINALEME,
+    )
+    ann_prefixed = pd.DataFrame({
+        "chrom": ["chr1"] * n,  # prefix on ann
+        "start": [1000, 2000, 3000, 4000],
+        "end": [1100, 2100, 3100, 4100],
+        "cpg_density": [0.15, 0.15, 0.05, 0.05],
+        "region_class": ["CGI", "CGI", "shore", "shore"],
+    })
+    binarized2 = apply_binarization(obs2, params, region_annotations=ann_prefixed)
+    assert binarized2.context_bin.tolist() == [0, 0, 2, 2]
+
+
+def test_v3bug_load_optional_region_annotations_strips_chr_prefix(tmp_path):
+    """load_optional_region_annotations must strip any chr prefix on load
+    so the downstream join uses consistent keys."""
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import load_optional_region_annotations
+
+    ann_path = tmp_path / "region_annotation.tsv"
+    ann_path.write_text(
+        "chrom\tstart\tend\tcpg_density\tregion_class\n"
+        "chr1\t100\t200\t0.15\tCGI\n"
+        "chrX\t300\t400\t0.05\tshore\n"
+    )
+    cfg = TOOConfig()
+    loaded = load_optional_region_annotations(cfg, str(ann_path))
+    assert loaded is not None
+    # After normalization, chroms should have no prefix
+    assert loaded["chrom"].tolist() == ["1", "X"]
+
+
+# HIGH — ILR regression must use covariates when they're passed.
+def test_v3bug_ilr_regression_uses_covariates():
+    """With a confounded sample design (group and age correlated), running
+    the ILR regression WITH age as a covariate must produce a larger
+    p-value than the uncontrolled regression (i.e. adjusting for age
+    removes the spurious group effect)."""
+    from finaleme_too.postprocessing.statistical_testing import (
+        compositional_regression_test,
+    )
+
+    rng = np.random.default_rng(0)
+    # 40 samples, 2 groups × 2 cell types. Group A tends to be younger
+    # (age ~ 40) and group B older (age ~ 70). The "true" proportions
+    # depend on age, not group — so adjusting for age should neutralize
+    # the apparent group effect.
+    n_per_group = 20
+    ages = np.concatenate(
+        [rng.normal(40, 5, n_per_group), rng.normal(70, 5, n_per_group)]
+    )
+    # True CT0 proportion is a linear function of age, plus a small noise
+    ct0_raw = 0.2 + 0.005 * (ages - 55) + rng.normal(0, 0.02, size=2 * n_per_group)
+    ct0 = np.clip(ct0_raw, 0.02, 0.95)
+    ct1 = 1.0 - ct0 - 0.05
+    unknown = np.full_like(ct0, 0.05)
+    proportions = np.stack([ct0, ct1, unknown], axis=1)
+    sample_ids = [f"s{i}" for i in range(2 * n_per_group)]
+    groups = ["A"] * n_per_group + ["B"] * n_per_group
+
+    # Unadjusted: group effect is large (spurious — driven by age confound)
+    results_unadjusted = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B")],
+        covariates=None,
+    )
+    p_unadjusted = results_unadjusted[0].p_value
+    assert np.isfinite(p_unadjusted)
+
+    # Adjusted: including age should shrink the apparent group effect
+    cov_df = pd.DataFrame(
+        {"age": ages},
+        index=sample_ids,
+    )
+    cov_df.index.name = "sample_id"
+    results_adjusted = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B")],
+        covariates=cov_df,
+    )
+    p_adjusted = results_adjusted[0].p_value
+    assert np.isfinite(p_adjusted)
+
+    # After controlling for age, the p-value should be substantially higher
+    # (the group effect is spurious, so the adjusted p should be > the raw p).
+    assert p_adjusted > p_unadjusted, (
+        f"expected adjustment to increase p-value; "
+        f"unadjusted={p_unadjusted:.3g} adjusted={p_adjusted:.3g}"
+    )
+    # And the regression should report the covariate columns it used
+    extra = results_adjusted[0].extra
+    assert extra is not None
+    assert extra["n_covariates"] == 1
+    assert extra["covariate_columns"] == ["age"]
+
+
+def test_v3bug_ilr_regression_without_covariates_matches_legacy_shape():
+    """Regression without covariates should still produce a finite p-value
+    for a clean two-group comparison, matching the shape of the legacy
+    test (a sanity check that the refactor didn't break the covariate=None
+    path)."""
+    from finaleme_too.postprocessing.statistical_testing import (
+        compositional_regression_test,
+    )
+
+    rng = np.random.default_rng(1)
+    n_per_group = 10
+    # Large, clean group effect: A samples have CT0 ~ 0.7, B samples CT0 ~ 0.3
+    ct0_a = np.clip(rng.normal(0.7, 0.05, n_per_group), 0.02, 0.95)
+    ct0_b = np.clip(rng.normal(0.3, 0.05, n_per_group), 0.02, 0.95)
+    ct0 = np.concatenate([ct0_a, ct0_b])
+    ct1 = 1.0 - ct0 - 0.05
+    unknown = np.full_like(ct0, 0.05)
+    proportions = np.stack([ct0, ct1, unknown], axis=1)
+    sample_ids = [f"s{i}" for i in range(2 * n_per_group)]
+    groups = ["A"] * n_per_group + ["B"] * n_per_group
+
+    results = compositional_regression_test(
+        proportions=proportions,
+        sample_ids=sample_ids,
+        group_labels=groups,
+        cell_type_names=["CT0", "CT1"],
+        contrasts=[("A", "B")],
+        covariates=None,
+    )
+    assert len(results) == 2
+    # Strong group effect → low p-value
+    for r in results:
+        assert np.isfinite(r.p_value)
+    # At least one cell type should be significant at the 0.01 level
+    assert min(r.p_value for r in results) < 0.01
+
+
+# MEDIUM — biological covariates auto-populate from sample metadata when
+# config.covariate_adjustment.biological_covariates is empty.
+def test_v3bug_biological_covariates_auto_populated_from_metadata():
+    """TOOPipeline._resolve_biological_covariates should return the set of
+    biological keys present in sample metadata (minus user-configurable
+    ones) when config.biological_covariates is empty."""
+    from pathlib import Path
+    from finaleme_too.config import MeasurementMode, TOOConfig
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    samples = [
+        Sample(
+            sample_id="s1", methylation_file=Path("/nope"),
+            mode=MeasurementMode.WGBS, group="A",
+            metadata={"age": 50, "sex": "M", "treatment": "drug_x"},
+        ),
+        Sample(
+            sample_id="s2", methylation_file=Path("/nope"),
+            mode=MeasurementMode.WGBS, group="B",
+            metadata={"age": 60, "bmi": 25.4, "treatment": "placebo"},
+        ),
+    ]
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    cfg = TOOConfig()
+    # Empty config.biological_covariates + default user_configurable list
+    pipeline = TOOPipeline(cfg)
+    resolved = pipeline._resolve_biological_covariates(sheet)
+
+    # age, sex, bmi should be auto-populated; treatment is user-configurable
+    # and must NOT be included by default.
+    assert "age" in resolved
+    assert "sex" in resolved
+    assert "bmi" in resolved
+    assert "treatment" not in resolved
+    assert "treatment_efficacy" not in resolved
+    assert "mutation_status" not in resolved
+    # Output is sorted for stability
+    assert resolved == sorted(resolved)
+
+
+def test_v3bug_biological_covariates_explicit_config_wins():
+    """An explicit config.biological_covariates list overrides the
+    auto-population so the user can opt in to (or out of) specific
+    covariates."""
+    from pathlib import Path
+    from finaleme_too.config import MeasurementMode, TOOConfig
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    samples = [
+        Sample(
+            sample_id="s1", methylation_file=Path("/nope"),
+            mode=MeasurementMode.WGBS, group="A",
+            metadata={"age": 50, "sex": "M", "bmi": 22.0},
+        ),
+    ]
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    cfg = TOOConfig()
+    # Explicit: only adjust for age, even though sex and bmi are present
+    cfg.covariate_adjustment.biological_covariates = ["age"]
+    pipeline = TOOPipeline(cfg)
+    resolved = pipeline._resolve_biological_covariates(sheet)
+
+    assert resolved == ["age"]
+
+
+def test_v3bug_biological_covariates_empty_when_no_metadata():
+    """With no biological metadata on any sample, the auto-resolve returns
+    an empty list so the covariate-adjustment step is skipped."""
+    from pathlib import Path
+    from finaleme_too.config import MeasurementMode, TOOConfig
+    from finaleme_too.io.sample_sheet import Sample, SampleSheet
+    from finaleme_too.pipeline import TOOPipeline
+
+    samples = [
+        Sample(
+            sample_id="s1", methylation_file=Path("/nope"),
+            mode=MeasurementMode.WGBS, group="A",
+            metadata={},  # no covariates at all
+        ),
+    ]
+    sheet = SampleSheet(
+        samples=samples,
+        raw_table=pd.DataFrame([{"sample_id": s.sample_id} for s in samples]),
+    )
+
+    cfg = TOOConfig()
+    pipeline = TOOPipeline(cfg)
+    resolved = pipeline._resolve_biological_covariates(sheet)
+    assert resolved == []
