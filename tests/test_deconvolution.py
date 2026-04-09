@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from finaleme_too.config import CoverageTier, MeasurementMode
-from finaleme_too.core.deconvolution import MLEDeconvolver
+from finaleme_too.core.deconvolution import BayesianDeconvolver, MLEDeconvolver
 from finaleme_too.core.observation_model import BetaBinomialModel
 from finaleme_too.core.reliability import (
     assign_reliability,
@@ -119,6 +119,21 @@ def test_reliability_assignment_table():
     assert assign_reliability(0.99, None, None) == "HIGH"
     assert assign_reliability(0.70, None, None) == "MODERATE"
     assert assign_reliability(0.05, None, None) == "UNRELIABLE"
+
+
+def test_bayesian_effective_n_walkers_scales_with_dimension():
+    bd = BayesianDeconvolver(n_walkers=64, n_steps=200, burn_in=50)
+    # Small panel keeps configured walker count.
+    assert bd._effective_n_walkers(10) == 64
+    # Large panel auto-scales above the red-blue minimum.
+    nw = bd._effective_n_walkers(40)
+    assert nw >= (2 * 40 + 2)
+    assert nw % 2 == 0
+    # Also scales up odd/too-small configured values.
+    bd2 = BayesianDeconvolver(n_walkers=63)
+    nw2 = bd2._effective_n_walkers(32)
+    assert nw2 >= 66
+    assert nw2 % 2 == 0
 
 
 def test_p_detection_above_noise_floor():

@@ -7,6 +7,7 @@ to the reference matrix and an extra weight w_0 is fitted.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from finaleme_too.io.reference_panel import ReferencePanel
 
 UNKNOWN_PROFILE = 0.5  # flat methylation for the unknown component
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -333,6 +335,19 @@ class BayesianDeconvolver:
         self.seed = seed
         self.binarization_count_weight = max(float(binarization_count_weight), 0.0)
 
+    def _effective_n_walkers(self, k_free: int) -> int:
+        """Return a sampler-safe walker count for the current dimensionality.
+
+        emcee's default red-blue move requires at least ``2 * ndim`` walkers
+        and behaves best with an even walker count. We enforce:
+            n_walkers >= 2 * k_free + 2, and n_walkers is even.
+        """
+        required = max(2 * int(k_free) + 2, 2)
+        n_walkers = max(int(self.n_walkers), required)
+        if n_walkers % 2 != 0:
+            n_walkers += 1
+        return n_walkers
+
     def solve(
         self,
         model: ObservationModel,
@@ -409,11 +424,20 @@ class BayesianDeconvolver:
             # Jacobian of softmax (log |det J|) — improper, but cancels for paired comparison
             return log_lik + log_prior
 
+        n_walkers = self._effective_n_walkers(K_free)
+        if n_walkers != self.n_walkers:
+            log.info(
+                "BayesianDeconvolver: increasing n_walkers from %d to %d for ndim=%d",
+                self.n_walkers,
+                n_walkers,
+                K_free,
+            )
+
         rng = np.random.default_rng(self.seed)
         # Initial walkers: small noise around uniform (zero in unconstrained space)
-        p0 = rng.normal(0, 0.1, size=(self.n_walkers, K_free))
+        p0 = rng.normal(0, 0.1, size=(n_walkers, K_free))
 
-        sampler = emcee.EnsembleSampler(self.n_walkers, K_free, log_posterior)
+        sampler = emcee.EnsembleSampler(n_walkers, K_free, log_posterior)
         sampler.run_mcmc(p0, self.n_steps, progress=False)
 
         chain = sampler.get_chain(discard=self.burn_in, flat=True)  # (n_keep, K_free)
@@ -518,10 +542,19 @@ class BayesianDeconvolver:
                 )
             return log_lik + log_prior
 
-        rng = np.random.default_rng(self.seed)
-        p0 = rng.normal(0, 0.1, size=(self.n_walkers, K_free))
+        n_walkers = self._effective_n_walkers(K_free)
+        if n_walkers != self.n_walkers:
+            log.info(
+                "BayesianDeconvolver (binarization): increasing n_walkers from %d to %d for ndim=%d",
+                self.n_walkers,
+                n_walkers,
+                K_free,
+            )
 
-        sampler = emcee_module.EnsembleSampler(self.n_walkers, K_free, log_posterior)
+        rng = np.random.default_rng(self.seed)
+        p0 = rng.normal(0, 0.1, size=(n_walkers, K_free))
+
+        sampler = emcee_module.EnsembleSampler(n_walkers, K_free, log_posterior)
         sampler.run_mcmc(p0, self.n_steps, progress=False)
 
         chain = sampler.get_chain(discard=self.burn_in, flat=True)
