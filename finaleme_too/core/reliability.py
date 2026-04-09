@@ -155,18 +155,23 @@ def _p_goodness_binarization(
     from scipy.stats import binomtest
 
     from finaleme_too.preprocessing.binarization import STATE_M, STATE_U
+    from finaleme_too.core.observation_model_binarization import (
+        _binarize_reference_panel,
+    )
 
     R = np.asarray(reference_methylation, dtype=np.float64)
     M_original, K = R.shape
     if cell_type_index >= K:
         return float("nan")
 
-    # Use the soft binarized reference for both the discriminative score
-    # and the expected-state computation, so the score reflects what the
-    # binarization model actually sees.
-    R_binary = R.copy()
-    R_binary[R < 0.2] = 0.0
-    R_binary[R > 0.8] = 1.0
+    # Use the SAME reference-binarization rule as the observation model.
+    # In hard-threshold mode this avoids a solver-vs-goodness mismatch
+    # (solver used threshold t, goodness used 0.2/0.8).
+    hard_thr = getattr(observation, "hard_threshold", None)
+    R_binary = _binarize_reference_panel(
+        R,
+        hard_threshold=hard_thr,
+    )
     target = R_binary[:, cell_type_index]
     others = np.delete(R_binary, cell_type_index, axis=1)
     bg_mean = np.mean(others, axis=1)
@@ -221,6 +226,19 @@ def _p_goodness_binarization(
             np.asarray(binarizer.eps_U)[bins] + np.asarray(binarizer.eps_M)[bins]
         )
         mean_eps = float(np.clip(np.mean(bin_eps), 0.0, 0.49))
+        # Optional floor so hard-threshold mode can tolerate a controlled
+        # amount of mismatches in p_goodness (without changing the solver).
+        tol = 0.0
+        metadata = getattr(binarizer, "training_metadata", None)
+        if isinstance(metadata, dict):
+            tol_raw = metadata.get("p_goodness_mismatch_tolerance")
+            if tol_raw is not None:
+                try:
+                    tol = float(tol_raw)
+                except (TypeError, ValueError):
+                    tol = 0.0
+        tol = float(np.clip(tol, 0.0, 0.49))
+        mean_eps = max(mean_eps, tol)
         p_expected = 1.0 - mean_eps
     else:
         # Without a binarizer we have no error-rate estimate; fall back to

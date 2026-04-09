@@ -74,6 +74,10 @@ def main() -> None:
                    "Bypasses --binarization JSON and applies: sample "
                    "predicted_beta < t => U, >= t => M; reference methylation "
                    "< t => U, >= t => M.")
+@click.option("--binarizeMismatchTolerance", "--binarize-mismatch-tolerance", "binarize_mismatch_tolerance", default=0.10, type=float,
+              help="Only used with --binarizeThreshold. Sets tolerated mismatch "
+                   "rate for p_goodness (0..0.49). Example: 0.10 means "
+                   "p_goodness expects ~90% concordance, not 100%.")
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Pre-computed CpG density / region class annotations TSV "
                    "(chrom, start, end, cpg_density, [region_class]).")
@@ -125,6 +129,7 @@ def run_cmd(
     total_col: int | None,
     binarization_path: str | None,
     binarize_threshold: float | None,
+    binarize_mismatch_tolerance: float,
     region_annotation: str | None,
     strict_regions: str | None,
     n_markers_per_type: int | None,
@@ -277,6 +282,14 @@ def run_cmd(
                     "--binarizeThreshold must be within [0, 1]",
                     param_hint="--binarizeThreshold",
                 )
+            if (
+                binarize_mismatch_tolerance < 0.0
+                or binarize_mismatch_tolerance > 0.49
+            ):
+                raise click.BadParameter(
+                    "--binarizeMismatchTolerance must be within [0, 0.49]",
+                    param_hint="--binarizeMismatchTolerance",
+                )
             if binarization_path is not None:
                 log.warning(
                     "Ignoring --binarization because --binarizeThreshold was provided."
@@ -290,7 +303,21 @@ def run_cmd(
                 tau_high=float(binarize_threshold),
                 eps=0.0,
             )
+            binarization_params.training_metadata.update(
+                {
+                    "mode": "hard_threshold",
+                    "hard_threshold": float(binarize_threshold),
+                    "p_goodness_mismatch_tolerance": float(
+                        binarize_mismatch_tolerance
+                    ),
+                }
+            )
         else:
+            if binarize_mismatch_tolerance != 0.10:
+                log.warning(
+                    "Ignoring --binarizeMismatchTolerance because "
+                    "--binarizeThreshold was not provided."
+                )
             binarization_params = load_optional_binarization(
                 config, binarization_path,
                 use_default=config.binarization.use_default,

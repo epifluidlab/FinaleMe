@@ -111,6 +111,7 @@ class BinarizationObservationModel:
     mode: MeasurementMode
     coverage_tier: CoverageTier
     coverage_cap: int
+    hard_threshold: float | None = None
     kind: str = "finaleme"
 
     @property
@@ -293,6 +294,7 @@ class BinarizationModel:
             mode=obs.mode,
             coverage_tier=tier,
             coverage_cap=coverage_cap,
+            hard_threshold=self.hard_threshold,
         )
 
 

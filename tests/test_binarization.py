@@ -997,6 +997,131 @@ def test_compute_p_goodness_finaleme_low_for_wrong_mixture():
     assert p_wrong < 0.5
 
 
+def test_compute_p_goodness_hard_threshold_uses_consistent_reference_rule():
+    """Hard-threshold mode must use the same reference transform in solver
+    and goodness scoring. Regression: goodness used hard-coded 0.2/0.8."""
+    from finaleme_too.core.reliability import compute_p_goodness
+
+    K = 2
+    n_per_ct = 3
+    M = K * n_per_ct
+
+    # Values are in (0.05, 0.15) so hard-threshold=0.1 matters; with the
+    # old 0.2/0.8 scoring path these stayed continuous and goodness was
+    # inconsistent with the observation model.
+    methy = np.array(
+        [
+            [0.15, 0.05],
+            [0.15, 0.05],
+            [0.15, 0.05],
+            [0.05, 0.15],
+            [0.05, 0.15],
+            [0.05, 0.15],
+        ],
+        dtype=np.float32,
+    )
+    reference = ReferencePanel(
+        chrom=np.array(["chr1"] * M, dtype=object),
+        start=np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64),
+        end=np.array([1100 + i * 1000 for i in range(M)], dtype=np.int64),
+        cell_types=["CT0", "CT1"],
+        methylation=methy,
+        coverage=None,
+    )
+    params = build_identity_placeholder_params(tau_low=0.1, tau_high=0.1, eps=0.0)
+    pred = np.array([0.15, 0.15, 0.15, 0.05, 0.05, 0.05], dtype=np.float32)
+    obs = _mk_obs("hard_thr", pred)
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        hard_threshold=0.1,
+    )
+    model = BinarizationModel(hard_threshold=0.1).build(
+        binarized,
+        params,
+        reference,
+    )
+
+    # Pure CT0 mixture with unknown=0
+    w_hat = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    p_ct0 = compute_p_goodness(
+        w_hat=w_hat,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        binarizer=params,
+    )
+    assert p_ct0 > 0.05
+
+
+def test_compute_p_goodness_hard_threshold_honors_mismatch_tolerance():
+    """With hard-threshold mode + eps=0, one mismatch used to collapse
+    p_goodness to ~0. The mismatch-tolerance metadata should soften this."""
+    from finaleme_too.core.reliability import compute_p_goodness
+
+    K = 2
+    n_per_ct = 3
+    M = K * n_per_ct
+    methy = np.array(
+        [
+            [0.15, 0.05],
+            [0.15, 0.05],
+            [0.15, 0.05],
+            [0.05, 0.15],
+            [0.05, 0.15],
+            [0.05, 0.15],
+        ],
+        dtype=np.float32,
+    )
+    reference = ReferencePanel(
+        chrom=np.array(["chr1"] * M, dtype=object),
+        start=np.array([1000 + i * 1000 for i in range(M)], dtype=np.int64),
+        end=np.array([1100 + i * 1000 for i in range(M)], dtype=np.int64),
+        cell_types=["CT0", "CT1"],
+        methylation=methy,
+        coverage=None,
+    )
+    params = build_identity_placeholder_params(tau_low=0.1, tau_high=0.1, eps=0.0)
+    # Introduce one mismatch among otherwise CT0-consistent calls.
+    pred = np.array([0.05, 0.15, 0.15, 0.05, 0.05, 0.05], dtype=np.float32)
+    obs = _mk_obs("hard_thr_mismatch", pred)
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        hard_threshold=0.1,
+    )
+    model = BinarizationModel(hard_threshold=0.1).build(
+        binarized,
+        params,
+        reference,
+    )
+    w_hat = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    # No tolerance: eps=0 => expected concordance=1.0 (over-strict).
+    p_no_tol = compute_p_goodness(
+        w_hat=w_hat,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        binarizer=params,
+    )
+    # Apply tolerance floor for p_goodness only.
+    params.training_metadata["p_goodness_mismatch_tolerance"] = 0.10
+    p_tol = compute_p_goodness(
+        w_hat=w_hat,
+        reference_methylation=reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        binarizer=params,
+    )
+
+    assert p_no_tol < 0.05
+    assert p_tol > p_no_tol
+    assert p_tol > 0.05
+
+
 def test_pipeline_end_to_end_binarization_recovers_known_mixture(tmp_path):
     """End-to-end TOOPipeline run with binarization=BinarizationParams
     must recover the correct cell-type proportions for synthetic
@@ -1332,6 +1457,7 @@ def test_cli_run_has_binarization_flag():
     assert result.exit_code == 0
     assert "--binarization" in result.output
     assert "--binarizeThreshold" in result.output
+    assert "--binarizeMismatchTolerance" in result.output
     # The legacy v2 --calibration flag should be gone by Phase E
     assert "--calibration" not in result.output
 
