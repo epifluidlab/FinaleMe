@@ -66,6 +66,11 @@ class DeconvolutionResult:
     p_detection: np.ndarray  # (K+1,)
     reliability: np.ndarray  # str array (K+1,)
     n_markers: np.ndarray  # (K,)
+    # New reliability metrics (K only; unknown has no cell-type fit metric):
+    #   effect_size      — practical fit improvement vs ablated-null model
+    #   likelihood_score — weighted per-marker log-likelihood gain vs null
+    effect_size: np.ndarray | None = None  # (K,)
+    likelihood_score: np.ndarray | None = None  # (K,)
     bootstrap_proportions: np.ndarray | None = None  # (B, K+1)
     posterior_samples: np.ndarray | None = None  # (T, K+1)
     coverage_tier: CoverageTier = CoverageTier.HIGH

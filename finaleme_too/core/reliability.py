@@ -1,15 +1,13 @@
-"""Per-cell-type reliability p-values (math doc §5).
+"""Per-cell-type reliability metrics (math doc §5 + v3 reliability update).
 
-Two complementary p-values per cell type:
-  - p_goodness: model fit quality at the cell type's most discriminative markers.
-    WGBS mode uses a chi-squared goodness-of-fit on the read counts; FinaleMe
-    mode (v3 binarization) uses a one-sided binomial concordance test on the
-    discrete state calls vs the expected states under the estimated mixture.
+Reliability now combines:
   - p_detection: bootstrap stability above a noise floor.
+  - effect_size: practical fit improvement over a cell-type-ablated null.
+  - likelihood_score: weighted per-marker log-likelihood gain over the same
+    ablated null.
 
-Both follow the convention HIGH = GOOD: a high p_goodness means the data is
-consistent with the estimated mixture, NOT that some null hypothesis is
-rejected.
+``p_goodness`` (legacy hypothesis-test p-value) is still computed and written
+for backwards compatibility, but reliability assignment no longer depends on it.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ from scipy.stats import chi2
 
 from finaleme_too.core.deconvolution import UNKNOWN_PROFILE
 from finaleme_too.core.observation_model import ObservationModel
+from finaleme_too.utils.beta_binomial import log_likelihood_per_marker
 
 
 def compute_p_goodness(
@@ -268,21 +267,276 @@ def compute_p_detection(
     return above
 
 
-def assign_reliability(p_goodness: float, p_detection: float) -> str:
-    """Assign HIGH/MODERATE/LOW/UNRELIABLE per math doc §5.3 table."""
-    if np.isnan(p_goodness) and np.isnan(p_detection):
-        return "UNRELIABLE"
-    if np.isnan(p_goodness):
-        p_goodness = 1.0
+def _ablate_component_and_renormalize(w_hat: np.ndarray, cell_type_index: int) -> np.ndarray:
+    """Return a null mixture with one cell type removed (w_j=0)."""
+    w = np.asarray(w_hat, dtype=np.float64).copy()
+    if cell_type_index < 0 or cell_type_index >= w.size:
+        return w
+    w[cell_type_index] = 0.0
+    s = float(np.sum(w))
+    if s <= 0.0:
+        out = np.zeros_like(w)
+        out[-1] = 1.0
+        return out
+    return w / s
+
+
+def _top_discriminative_indices_betabinom(
+    reference_methylation: np.ndarray,
+    observation: ObservationModel,
+    cell_type_index: int,
+    top_n: int,
+) -> np.ndarray:
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    K = R.shape[1]
+    if cell_type_index >= K:
+        return np.zeros(0, dtype=np.int64)
+    target = R[:, cell_type_index]
+    others = np.delete(R, cell_type_index, axis=1)
+    bg_mean = np.mean(others, axis=1)
+    score = np.abs(target - bg_mean)
+    valid = (observation.n > 0) & np.isfinite(score)
+    n_top = min(top_n, int(np.sum(valid)))
+    if n_top < 5:
+        return np.zeros(0, dtype=np.int64)
+    score_valid = np.where(valid, score, -np.inf)
+    return np.argpartition(-score_valid, n_top - 1)[:n_top].astype(np.int64)
+
+
+def _top_discriminative_indices_binarization(
+    reference_methylation: np.ndarray,
+    observation,
+    cell_type_index: int,
+    top_n: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    from finaleme_too.core.observation_model_binarization import (
+        _binarize_reference_panel,
+    )
+
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    M_original, K = R.shape
+    if cell_type_index >= K:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros((M_original, K), dtype=np.float64),
+        )
+    hard_thr = getattr(observation, "hard_threshold", None)
+    R_binary = _binarize_reference_panel(R, hard_threshold=hard_thr)
+    target = R_binary[:, cell_type_index]
+    others = np.delete(R_binary, cell_type_index, axis=1)
+    bg_mean = np.mean(others, axis=1)
+    score = np.abs(target - bg_mean)
+    valid_mask = observation.valid_mask
+    candidates = valid_mask & np.isfinite(score)
+    n_top = min(top_n, int(np.sum(candidates)))
+    if n_top < 5:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            R_binary,
+        )
+    score_eligible = np.where(candidates, score, -np.inf)
+    top_idx_original = np.argpartition(-score_eligible, n_top - 1)[:n_top].astype(
+        np.int64
+    )
+    valid_to_filtered = np.cumsum(valid_mask) - 1
+    filtered_idx = valid_to_filtered[top_idx_original].astype(np.int64)
+    return top_idx_original, filtered_idx, R_binary
+
+
+def _binarization_mismatch_tolerance(binarizer) -> float:
+    tol = 0.0
+    if binarizer is not None:
+        metadata = getattr(binarizer, "training_metadata", None)
+        if isinstance(metadata, dict):
+            raw = metadata.get("p_goodness_mismatch_tolerance")
+            if raw is not None:
+                try:
+                    tol = float(raw)
+                except (TypeError, ValueError):
+                    tol = 0.0
+    return float(np.clip(tol, 0.0, 0.49))
+
+
+def compute_fit_metrics(
+    w_hat: np.ndarray,
+    reference_methylation: np.ndarray,
+    observation,
+    cell_type_index: int,
+    top_n: int = 50,
+    binarizer=None,
+) -> tuple[float, float]:
+    """Return (effect_size, likelihood_score) for one cell type.
+
+    effect_size:
+      WGBS — weighted MAE improvement over an ablated-null model.
+      FinaleMe — concordance improvement over an ablated-null model.
+
+    likelihood_score:
+      Weighted mean log-likelihood gain (nats per effective marker) over the
+      same ablated-null model. Positive means better fit than null.
+    """
+    from finaleme_too.core.observation_model_binarization import (
+        BinarizationObservationModel,
+    )
+    from finaleme_too.preprocessing.binarization import STATE_M, STATE_U
+
+    if isinstance(observation, BinarizationObservationModel):
+        top_idx_original, filtered_idx, R_binary = _top_discriminative_indices_binarization(
+            reference_methylation=reference_methylation,
+            observation=observation,
+            cell_type_index=cell_type_index,
+            top_n=top_n,
+        )
+        if filtered_idx.size < 5:
+            return float("nan"), float("nan")
+
+        w_full = np.asarray(w_hat, dtype=np.float64)
+        w_null = _ablate_component_and_renormalize(w_full, cell_type_index)
+
+        # Effect size = concordance(full) - concordance(null)
+        K = R_binary.shape[1]
+        R_aug_U = np.hstack([1.0 - R_binary, np.full((R_binary.shape[0], 1), 0.5)])
+        p_u_full = (R_aug_U @ w_full)[top_idx_original]
+        p_u_null = (R_aug_U @ w_null)[top_idx_original]
+        expected_full = np.where(p_u_full > 0.5, STATE_U, STATE_M).astype(np.uint8)
+        expected_null = np.where(p_u_null > 0.5, STATE_U, STATE_M).astype(np.uint8)
+        called = np.asarray(observation.called_state, dtype=np.uint8)[filtered_idx]
+        conc_full = float(np.mean(called == expected_full))
+        conc_null = float(np.mean(called == expected_null))
+        effect_size = conc_full - conc_null
+
+        # Likelihood gain using per-marker eps with optional tolerance floor.
+        bins = np.asarray(observation.context_bin, dtype=np.int64)[filtered_idx]
+        ref_rows = np.asarray(observation.reference_binary, dtype=np.float64)[filtered_idx]
+        weights = np.asarray(observation.weights, dtype=np.float64)[filtered_idx]
+        wsum = float(np.sum(weights))
+        if wsum <= 0:
+            wsum = float(weights.size)
+            weights = np.ones_like(weights, dtype=np.float64)
+
+        if binarizer is not None:
+            eps_u = np.asarray(binarizer.eps_U, dtype=np.float64)[bins]
+            eps_m = np.asarray(binarizer.eps_M, dtype=np.float64)[bins]
+        else:
+            eps_u = np.full(bins.size, 0.1, dtype=np.float64)
+            eps_m = np.full(bins.size, 0.1, dtype=np.float64)
+        tol = _binarization_mismatch_tolerance(binarizer)
+        eps_u = np.maximum(eps_u, tol)
+        eps_m = np.maximum(eps_m, tol)
+        eps_u_col = eps_u[:, None]
+        eps_m_col = eps_m[:, None]
+        coef_u = (1.0 - eps_u_col) * (1.0 - ref_rows) + eps_u_col * ref_rows
+        coef_m = (1.0 - eps_m_col) * ref_rows + eps_m_col * (1.0 - ref_rows)
+        coef = coef_u.copy()
+        coef[called == STATE_M] = coef_m[called == STATE_M]
+        p_full = np.clip(coef @ w_full, 1e-15, 1.0)
+        p_null = np.clip(coef @ w_null, 1e-15, 1.0)
+        ll_full = float(np.sum(weights * np.log(p_full)))
+        ll_null = float(np.sum(weights * np.log(p_null)))
+        likelihood_score = (ll_full - ll_null) / wsum
+        return float(effect_size), float(likelihood_score)
+
+    # WGBS / beta-binomial path
+    top_idx = _top_discriminative_indices_betabinom(
+        reference_methylation=reference_methylation,
+        observation=observation,
+        cell_type_index=cell_type_index,
+        top_n=top_n,
+    )
+    if top_idx.size < 5:
+        return float("nan"), float("nan")
+
+    R = np.asarray(reference_methylation, dtype=np.float64)
+    R_full = np.hstack([R, np.full((R.shape[0], 1), UNKNOWN_PROFILE, dtype=np.float64)])
+    w_full = np.asarray(w_hat, dtype=np.float64)
+    w_null = _ablate_component_and_renormalize(w_full, cell_type_index)
+
+    k = np.asarray(observation.k, dtype=np.float64)[top_idx]
+    n = np.asarray(observation.n, dtype=np.float64)[top_idx]
+    phi = np.asarray(observation.dispersion, dtype=np.float64)[top_idx]
+    weights = np.asarray(observation.weights, dtype=np.float64)[top_idx]
+    wsum = float(np.sum(weights))
+    if wsum <= 0:
+        wsum = float(weights.size)
+        weights = np.ones_like(weights, dtype=np.float64)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu_obs = np.where(n > 0, k / np.maximum(n, 1), np.nan)
+    mu_full = np.clip((R_full @ w_full)[top_idx], 1e-9, 1.0 - 1e-9)
+    mu_null = np.clip((R_full @ w_null)[top_idx], 1e-9, 1.0 - 1e-9)
+    valid = np.isfinite(mu_obs)
+    if int(np.sum(valid)) < 5:
+        return float("nan"), float("nan")
+    mu_obs_v = mu_obs[valid]
+    mu_full_v = mu_full[valid]
+    mu_null_v = mu_null[valid]
+    k_v = k[valid]
+    n_v = n[valid]
+    phi_v = phi[valid]
+    w_v = weights[valid]
+    wsum_v = float(np.sum(w_v))
+    if wsum_v <= 0:
+        wsum_v = float(w_v.size)
+        w_v = np.ones_like(w_v, dtype=np.float64)
+
+    mae_full = float(np.sum(w_v * np.abs(mu_obs_v - mu_full_v)) / wsum_v)
+    mae_null = float(np.sum(w_v * np.abs(mu_obs_v - mu_null_v)) / wsum_v)
+    effect_size = mae_null - mae_full
+
+    ll_full_vec = log_likelihood_per_marker(k_v, n_v, mu_full_v, phi_v)
+    ll_null_vec = log_likelihood_per_marker(k_v, n_v, mu_null_v, phi_v)
+    ll_full = float(np.sum(w_v * ll_full_vec))
+    ll_null = float(np.sum(w_v * ll_null_vec))
+    likelihood_score = (ll_full - ll_null) / wsum_v
+    return float(effect_size), float(likelihood_score)
+
+
+def assign_reliability(
+    p_detection: float,
+    effect_size: float | None = None,
+    likelihood_score: float | None = None,
+) -> str:
+    """Assign HIGH/MODERATE/LOW/UNRELIABLE from stability + fit metrics.
+
+    Thresholds are intentionally conservative:
+      HIGH:      p_detection >= 0.95, effect_size >= 0.05, likelihood >= 0.02
+      MODERATE:  p_detection >= 0.50, effect_size >= 0.01, likelihood >= 0.005
+      UNRELIABLE (when fit metrics unavailable): p_detection < 0.10
+      UNRELIABLE (when fit metrics available):   p_detection < 0.50 and
+                                                 (effect_size <= 0 or likelihood <= 0)
+      else LOW.
+    """
     if np.isnan(p_detection):
         p_detection = 0.0
-    if p_goodness > 0.05 and p_detection > 0.95:
+
+    eff_missing = effect_size is None or np.isnan(effect_size)
+    lik_missing = likelihood_score is None or np.isnan(likelihood_score)
+    if eff_missing or lik_missing:
+        if p_detection >= 0.95:
+            return "HIGH"
+        if p_detection >= 0.50:
+            return "MODERATE"
+        if p_detection < 0.10:
+            return "UNRELIABLE"
+        return "LOW"
+
+    eff = float(effect_size)
+    lik = float(likelihood_score)
+
+    if p_detection >= 0.95 and eff >= 0.05 and lik >= 0.02:
         return "HIGH"
-    if p_goodness > 0.05 and 0.50 <= p_detection <= 0.95:
+    if p_detection >= 0.50 and eff >= 0.01 and lik >= 0.005:
         return "MODERATE"
-    if p_goodness < 0.01 and p_detection < 0.50:
+    if p_detection < 0.50 and (eff <= 0.0 or lik <= 0.0):
         return "UNRELIABLE"
     return "LOW"
 
 
-__all__ = ["assign_reliability", "compute_p_detection", "compute_p_goodness"]
+__all__ = [
+    "assign_reliability",
+    "compute_fit_metrics",
+    "compute_p_detection",
+    "compute_p_goodness",
+]

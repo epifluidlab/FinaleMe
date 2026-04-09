@@ -34,6 +34,7 @@ from finaleme_too.core.fragment_likelihood import FragmentLevelDeconvolver
 from finaleme_too.core.observation_model import BetaBinomialModel, ObservationModel
 from finaleme_too.core.reliability import (
     assign_reliability,
+    compute_fit_metrics,
     compute_p_detection,
     compute_p_goodness,
 )
@@ -986,12 +987,19 @@ class TOOPipeline:
                 observation, reference, self.deconvolver, n_jobs=bootstrap_jobs
             )
 
-        # Reliability p-values per cell type. compute_p_goodness dispatches
-        # internally on the observation model type — WGBS / v2 paths use
-        # chi-square, v3 binarization uses a binomial concordance test
-        # against the per-bin error rates ε_U / ε_M.
+        # Reliability metrics per cell type.
+        #
+        # p_goodness is kept as a legacy hypothesis-test output for
+        # compatibility, but reliability assignment now uses:
+        #   (1) p_detection
+        #   (2) effect_size
+        #   (3) likelihood_score
+        # where effect_size + likelihood_score are improvements over a
+        # cell-type-ablated null model.
         K = reference.n_cell_types
         p_goodness = np.full(K, np.nan, dtype=np.float64)
+        effect_size = np.full(K, np.nan, dtype=np.float64)
+        likelihood_score = np.full(K, np.nan, dtype=np.float64)
         p_detection = np.zeros(K + 1, dtype=np.float64)
         for j in range(K):
             p_goodness[j] = compute_p_goodness(
@@ -1005,6 +1013,16 @@ class TOOPipeline:
                 boot.proportions_samples[:, j],
                 noise_floor=self.config.uncertainty.noise_floor,
             )
+            eff_j, lik_j = compute_fit_metrics(
+                w_hat=w_hat,
+                reference_methylation=reference.methylation,
+                observation=observation,
+                cell_type_index=j,
+                top_n=50,
+                binarizer=self.binarization if use_binarization else None,
+            )
+            effect_size[j] = eff_j
+            likelihood_score[j] = lik_j
         # Unknown component detection (no goodness)
         p_detection[K] = compute_p_detection(
             boot.proportions_samples[:, K],
@@ -1013,8 +1031,16 @@ class TOOPipeline:
 
         reliability = np.empty(K + 1, dtype=object)
         for j in range(K):
-            reliability[j] = assign_reliability(p_goodness[j], p_detection[j])
-        reliability[K] = assign_reliability(np.nan, p_detection[K])
+            reliability[j] = assign_reliability(
+                p_detection=p_detection[j],
+                effect_size=effect_size[j],
+                likelihood_score=likelihood_score[j],
+            )
+        reliability[K] = assign_reliability(
+            p_detection=p_detection[K],
+            effect_size=None,
+            likelihood_score=None,
+        )
 
         # n_markers per cell type — count valid markers contributing to that
         # cell type. For WGBS / v2 paths "valid" means n > 0; for v3
@@ -1101,6 +1127,8 @@ class TOOPipeline:
             ci_upper=boot.ci_upper,
             p_goodness=p_goodness,
             p_detection=p_detection,
+            effect_size=effect_size,
+            likelihood_score=likelihood_score,
             reliability=reliability,
             n_markers=n_markers,
             bootstrap_proportions=bootstrap_samples_field,
@@ -1161,6 +1189,8 @@ class TOOPipeline:
             ci_upper=w.copy(),
             p_goodness=np.full(K, np.nan, dtype=np.float64),
             p_detection=np.zeros(K + 1, dtype=np.float64),
+            effect_size=np.full(K, np.nan, dtype=np.float64),
+            likelihood_score=np.full(K, np.nan, dtype=np.float64),
             reliability=reliability,
             n_markers=np.zeros(K, dtype=np.int32),
             coverage_tier=tier,

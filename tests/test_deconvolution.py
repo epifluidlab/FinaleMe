@@ -9,6 +9,7 @@ from finaleme_too.core.deconvolution import MLEDeconvolver
 from finaleme_too.core.observation_model import BetaBinomialModel
 from finaleme_too.core.reliability import (
     assign_reliability,
+    compute_fit_metrics,
     compute_p_detection,
     compute_p_goodness,
 )
@@ -104,11 +105,15 @@ def test_bootstrap_ci_contains_point_estimate(
 
 
 def test_reliability_assignment_table():
-    assert assign_reliability(0.5, 0.99) == "HIGH"
-    assert assign_reliability(0.5, 0.7) == "MODERATE"
-    assert assign_reliability(0.5, 0.2) == "LOW"
-    assert assign_reliability(0.001, 0.1) == "UNRELIABLE"
-    assert assign_reliability(0.001, 0.99) == "LOW"
+    # New reliability uses p_detection + effect_size + likelihood_score.
+    assert assign_reliability(0.99, 0.10, 0.05) == "HIGH"
+    assert assign_reliability(0.70, 0.02, 0.01) == "MODERATE"
+    assert assign_reliability(0.70, 0.0, 0.0) == "LOW"
+    assert assign_reliability(0.10, -0.01, -0.01) == "UNRELIABLE"
+    # Unknown-component style call (no fit metrics): detection-only fallback.
+    assert assign_reliability(0.99, None, None) == "HIGH"
+    assert assign_reliability(0.70, None, None) == "MODERATE"
+    assert assign_reliability(0.05, None, None) == "UNRELIABLE"
 
 
 def test_p_detection_above_noise_floor():
@@ -116,3 +121,24 @@ def test_p_detection_above_noise_floor():
     p = compute_p_detection(boot, noise_floor=0.001)
     # 3 out of 5 are >= 0.001
     assert abs(p - 0.6) < 1e-9
+
+
+def test_fit_metrics_positive_for_correct_model(
+    synthetic_observations_pure_celltype, synthetic_reference
+):
+    model = BetaBinomialModel().build(
+        synthetic_observations_pure_celltype, tier=CoverageTier.HIGH
+    )
+    w_hat = MLEDeconvolver().solve(model, synthetic_reference)
+    eff, lik = compute_fit_metrics(
+        w_hat=w_hat,
+        reference_methylation=synthetic_reference.methylation,
+        observation=model,
+        cell_type_index=0,
+        top_n=50,
+        binarizer=None,
+    )
+    assert np.isfinite(eff)
+    assert np.isfinite(lik)
+    assert eff > 0.0
+    assert lik > 0.0
