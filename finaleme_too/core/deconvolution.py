@@ -82,6 +82,10 @@ class DeconvolutionResult:
     marker_chrom: np.ndarray | None = None
     marker_start: np.ndarray | None = None
     marker_end: np.ndarray | None = None
+    # Optional per-sample FinaleMe binarization diagnostics. Populated only
+    # for FinaleMe runs with binarization enabled; used by
+    # io.output_writer.write_binarization_debug for troubleshooting.
+    binarization_debug: dict | None = None
 
 
 class MLEDeconvolver:

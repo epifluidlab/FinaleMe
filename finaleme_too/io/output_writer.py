@@ -221,6 +221,36 @@ def write_qc_summary(
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.4f")
 
 
+def write_binarization_debug(
+    results: list[DeconvolutionResult],
+    sample_groups: dict[str, str | None],
+    path: str | Path,
+) -> None:
+    """Write a per-sample FinaleMe binarization debug report.
+
+    This report is intentionally compact and focused on answering:
+    "why did this sample end up with n_markers_used == 0 / unknown == 1?"
+
+    Rows are emitted only for samples where ``result.binarization_debug`` is
+    populated (i.e. FinaleMe + binarization path). Non-FinaleMe samples are
+    skipped.
+    """
+    rows = []
+    for r in results:
+        dbg = r.binarization_debug
+        if not isinstance(dbg, dict) or not dbg:
+            continue
+        row = {
+            "sample_id": r.sample_id,
+            "group": sample_groups.get(r.sample_id),
+        }
+        row.update(dbg)
+        rows.append(row)
+    if not rows:
+        return
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.6g")
+
+
 def write_group_comparison(
     test_results: list,  # list[TestResult]
     path: str | Path,
@@ -312,6 +342,7 @@ def _json_default(obj):
 
 
 __all__ = [
+    "write_binarization_debug",
     "write_calibration_report",
     "write_cohort_proportions",
     "write_group_comparison",

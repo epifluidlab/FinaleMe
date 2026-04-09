@@ -42,6 +42,7 @@ from finaleme_too.io.pat_loader import load_fragments_from_pat
 from finaleme_too.io.marker_regions import MarkerRegions, MarkerRegionsLoader
 from finaleme_too.io.methylation_loader import MarkerObservations, MethylationLoader
 from finaleme_too.io.output_writer import (
+    write_binarization_debug,
     write_cohort_proportions,
     write_group_comparison,
     write_per_sample_too,
@@ -338,6 +339,9 @@ class TOOPipeline:
             adjusted_results, sample_groups, out_dir / "cohort_proportions.tsv"
         )
         write_qc_summary(adjusted_results, sample_groups, out_dir / "qc_summary.tsv")
+        write_binarization_debug(
+            adjusted_results, sample_groups, out_dir / "binarization_debug.tsv"
+        )
 
         # Group comparison (P1): delegate sample-sufficiency checks to the
         # per-test helpers in run_group_comparisons. Bayesian comparisons
@@ -690,11 +694,19 @@ class TOOPipeline:
             and obs.called_state is not None
             and obs.context_bin is not None
         )
+        tier = self.tier_assigner.assign(obs)
 
         binarization_flag: str | None = None
+        binarization_debug: dict | None = None
         if use_binarization:
             from finaleme_too.preprocessing.binarization_eval import (
                 compute_inference_qc as _binarization_inference_qc,
+            )
+            from finaleme_too.preprocessing.binarization import (
+                STATE_AMBIGUOUS,
+                STATE_EXCLUDED,
+                STATE_M,
+                STATE_U,
             )
             qc = _binarization_inference_qc(
                 called_state=obs.called_state,
@@ -703,7 +715,47 @@ class TOOPipeline:
             )
             binarization_flag = qc.get("flag")
 
-        tier = self.tier_assigner.assign(obs)
+            # Per-sample debug scaffold for troubleshooting cases where the
+            # deconvolution falls back to Unknown=1 due to having no callable
+            # markers after filtering/binarization.
+            raw_state = np.asarray(obs.called_state, dtype=np.int64)
+            raw_bin = np.asarray(obs.context_bin, dtype=np.int64)
+            usable_bins_mask = np.asarray(self.binarization.usable, dtype=bool)
+            raw_usable_per_marker = (
+                usable_bins_mask[raw_bin]
+                if raw_bin.size
+                else np.zeros(0, dtype=bool)
+            )
+            raw_bins_hit = np.unique(raw_bin) if raw_bin.size else np.zeros(0, dtype=np.int64)
+            raw_usable_bins_hit = np.unique(raw_bin[raw_usable_per_marker]) if raw_bin.size else np.zeros(0, dtype=np.int64)
+            binarization_debug = {
+                "coverage_tier": tier.value if hasattr(tier, "value") else str(tier),
+                "binarization_flag": binarization_flag or "NA",
+                "fraction_called_qc": float(qc.get("fraction_called", float("nan"))),
+                "bin_balance_qc": float(qc.get("bin_balance", float("nan"))),
+                "state_distribution_kl_qc": float(qc.get("state_distribution_kl", float("nan"))),
+                "n_bins_total": int(self.binarization.n_bins),
+                "n_usable_bins_total": int(np.sum(usable_bins_mask)),
+                "n_markers_before_coverage_filter": int(raw_state.size),
+                "called_u_before_filter": int(np.sum(raw_state == STATE_U)),
+                "called_m_before_filter": int(np.sum(raw_state == STATE_M)),
+                "ambiguous_before_filter": int(np.sum(raw_state == STATE_AMBIGUOUS)),
+                "excluded_before_filter": int(np.sum(raw_state == STATE_EXCLUDED)),
+                "n_bins_hit_before_filter": int(raw_bins_hit.size),
+                "n_usable_bins_hit_before_filter": int(raw_usable_bins_hit.size),
+                # Fields below are updated after the coverage + observation-model
+                # filtering steps.
+                "n_markers_after_coverage_filter": 0,
+                "called_u_after_filter": 0,
+                "called_m_after_filter": 0,
+                "ambiguous_after_filter": 0,
+                "excluded_after_filter": 0,
+                "n_bins_hit_after_filter": 0,
+                "n_usable_bins_hit_after_filter": 0,
+                "n_unusable_bins_hit_after_filter": 0,
+                "n_markers_used_for_likelihood": 0,
+                "fail_reason": "",
+            }
 
         # -------- Per-marker effective-coverage filtering --------
         # A marker with below-expected coverage is down-tiered to the next
@@ -718,6 +770,11 @@ class TOOPipeline:
         valid_mask = np.asarray(obs.n, dtype=np.int64) >= min_reads_vec
         if not np.any(valid_mask):
             # No usable markers at this tier — return an all-unknown result
+            if binarization_debug is not None:
+                binarization_debug["coverage_tier"] = (
+                    tier.value if hasattr(tier, "value") else str(tier)
+                )
+                binarization_debug["fail_reason"] = "no_markers_pass_coverage_filter"
             return self._emit_fallback_result(
                 sample=sample,
                 obs=obs,
@@ -726,6 +783,7 @@ class TOOPipeline:
                 binarization_flag=binarization_flag,
                 pre_impute_n=pre_impute_n,
                 out_dir=out_dir,
+                binarization_debug=binarization_debug,
             )
         obs_filtered = _subset_observations(obs, valid_mask)
         reference_filtered = _subset_reference_rows(reference, valid_mask)
@@ -733,6 +791,37 @@ class TOOPipeline:
             pre_impute_n_filtered = pre_impute_n[valid_mask]
         else:
             pre_impute_n_filtered = None
+
+        if use_binarization and binarization_debug is not None:
+            from finaleme_too.preprocessing.binarization import (
+                STATE_AMBIGUOUS,
+                STATE_EXCLUDED,
+                STATE_M,
+                STATE_U,
+            )
+
+            st = np.asarray(obs_filtered.called_state, dtype=np.int64)
+            bn = np.asarray(obs_filtered.context_bin, dtype=np.int64)
+            usable_bins_mask = np.asarray(self.binarization.usable, dtype=bool)
+            usable_per_marker = (
+                usable_bins_mask[bn] if bn.size else np.zeros(0, dtype=bool)
+            )
+            bins_hit = np.unique(bn) if bn.size else np.zeros(0, dtype=np.int64)
+            usable_bins_hit = np.unique(bn[usable_per_marker]) if bn.size else np.zeros(0, dtype=np.int64)
+            unusable_bins_hit = np.unique(bn[~usable_per_marker]) if bn.size else np.zeros(0, dtype=np.int64)
+            binarization_debug.update(
+                {
+                    "coverage_tier": tier.value if hasattr(tier, "value") else str(tier),
+                    "n_markers_after_coverage_filter": int(st.size),
+                    "called_u_after_filter": int(np.sum(st == STATE_U)),
+                    "called_m_after_filter": int(np.sum(st == STATE_M)),
+                    "ambiguous_after_filter": int(np.sum(st == STATE_AMBIGUOUS)),
+                    "excluded_after_filter": int(np.sum(st == STATE_EXCLUDED)),
+                    "n_bins_hit_after_filter": int(bins_hit.size),
+                    "n_usable_bins_hit_after_filter": int(usable_bins_hit.size),
+                    "n_unusable_bins_hit_after_filter": int(unusable_bins_hit.size),
+                }
+            )
 
         if use_binarization:
             # v3 path: build a BinarizationObservationModel from the filtered
@@ -755,6 +844,16 @@ class TOOPipeline:
                 coverage_cap=self.config.coverage.coverage_cap,
             )
         reference = reference_filtered  # downstream code operates on the filtered reference
+        if use_binarization and binarization_debug is not None:
+            n_used = int(observation.n_markers)
+            binarization_debug["n_markers_used_for_likelihood"] = n_used
+            if n_used == 0 and not binarization_debug.get("fail_reason"):
+                binarization_debug["fail_reason"] = "no_callable_markers_after_binarization"
+                log.warning(
+                    "Sample %s: no callable markers after binarization "
+                    "(all ambiguous/excluded or unusable bins).",
+                    sample.sample_id,
+                )
 
         # -------- Gap 6a: fragment-level dispatch for ULTRALOW tier --------
         # When the sample is ULTRALOW, attempt to load a .pat.gz companion
@@ -1005,6 +1104,7 @@ class TOOPipeline:
             marker_chrom=np.asarray(obs_filtered.chrom, dtype=object),
             marker_start=np.asarray(obs_filtered.start, dtype=np.int64),
             marker_end=np.asarray(obs_filtered.end, dtype=np.int64),
+            binarization_debug=binarization_debug,
         )
         result.qc_flags = compute_qc_flags(
             result=result,
@@ -1033,6 +1133,7 @@ class TOOPipeline:
         binarization_flag: str | None,
         pre_impute_n: np.ndarray | None,
         out_dir: Path,
+        binarization_debug: dict | None = None,
     ) -> DeconvolutionResult:
         """Return an all-unknown result when no markers pass the tier filter."""
         K = reference.n_cell_types
@@ -1061,6 +1162,7 @@ class TOOPipeline:
             binarization_flag=binarization_flag,
             hemolysis_flag=None,
             overall_qc="FAIL",
+            binarization_debug=binarization_debug,
         )
         write_per_sample_too(result, out_dir / f"{sample.sample_id}.too.tsv")
         return result
