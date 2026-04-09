@@ -732,10 +732,13 @@ def test_round3_uncertainty_method_bayesian_without_model_bayesian():
     config = TOOConfig()
     config.model.deconvolution = SolverMethod.MLE
     config.uncertainty.method = "bayesian"
+    config.uncertainty.seed = 123
     pipeline = TOOPipeline(config)
     assert pipeline.bayesian_deconvolver is not None
     assert pipeline._wants_bayesian_uncertainty is True
     assert pipeline._point_estimate_is_bayesian is False
+    # Regression: Bayesian MCMC must use the same seed knob as bootstrap.
+    assert pipeline.bayesian_deconvolver.seed == 123
 
 
 def test_round3_uncertainty_method_both_sets_both_flags():

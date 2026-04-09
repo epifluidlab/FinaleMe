@@ -164,6 +164,7 @@ class TOOPipeline:
                 n_steps=max(config.uncertainty.bayesian_n_samples // 64, 1) + 100,
                 burn_in=100,
                 prior_alpha=config.uncertainty.bayesian_prior_alpha,
+                seed=config.uncertainty.seed,
             )
             if needs_bayesian
             else None
