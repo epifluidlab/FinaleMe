@@ -122,3 +122,87 @@ def test_load_cpg_index(tmp_path: Path):
     assert idx["chr_offsets"]["chr1"] == 0
     assert idx["chr_offsets"]["chr2"] == 2
     np.testing.assert_array_equal(idx["chr_positions"]["chr1"], [100, 200])
+
+
+def test_finaleme_bed_loader_tabix_bgzip_path(tmp_path: Path):
+    """When a bgzip+tabix file is provided, the loader should parse via tabix."""
+    pysam = pytest.importorskip("pysam")
+
+    plain = tmp_path / "sample.prediction.bed"
+    rows = [
+        ("chr1", 110, 111, 50.0, 5, 10),
+        ("chr1", 130, 131, 100.0, 10, 10),
+        ("chr1", 150, 151, 0.0, 0, 10),
+        ("chr1", 510, 511, 100.0, 10, 10),
+        ("chr1", 550, 551, 50.0, 5, 10),
+    ]
+    with open(plain, "wt") as fh:
+        fh.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\n"
+        )
+        for r in rows:
+            fh.write("\t".join(str(x) for x in r) + "\n")
+
+    bgz = tmp_path / "sample.prediction.bed.gz"
+    pysam.tabix_compress(str(plain), str(bgz), force=True)
+    pysam.tabix_index(str(bgz), preset="bed", force=True)
+
+    mr = MarkerRegions(
+        chrom=np.array(["chr1", "chr1"], dtype=object),
+        start=np.array([100, 500], dtype=np.int64),
+        end=np.array([200, 600], dtype=np.int64),
+        marker_name=None,
+    )
+    obs = MethylationLoader.load(
+        filepath=bgz,
+        sample_id="s1",
+        mode=MeasurementMode.FINALEME,
+        marker_regions=mr,
+        input_format="finaleme_bed",
+    )
+    assert int(obs.k[0]) == 15
+    assert int(obs.n[0]) == 30
+    assert int(obs.k[1]) == 15
+    assert int(obs.n[1]) == 20
+
+
+def test_finaleme_bed_loader_auto_rebuilds_non_tabix_gzip(tmp_path: Path):
+    """Non-bgzip/non-tabix FinaleMe .gz should be normalized automatically."""
+    pytest.importorskip("pysam")
+
+    bad_gz = tmp_path / "sample.prediction.bed.gz"
+    rows = [
+        # intentionally unsorted to force cache rebuild path
+        ("chr1", 550, 551, 50.0, 5, 10),
+        ("chr1", 510, 511, 100.0, 10, 10),
+        ("chr1", 130, 131, 100.0, 10, 10),
+        ("chr1", 110, 111, 50.0, 5, 10),
+    ]
+    with gzip.open(bad_gz, "wt") as fh:
+        fh.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\n"
+        )
+        for r in rows:
+            fh.write("\t".join(str(x) for x in r) + "\n")
+
+    mr = MarkerRegions(
+        chrom=np.array(["chr1", "chr1"], dtype=object),
+        start=np.array([100, 500], dtype=np.int64),
+        end=np.array([200, 600], dtype=np.int64),
+        marker_name=None,
+    )
+    obs = MethylationLoader.load(
+        filepath=bad_gz,
+        sample_id="s1",
+        mode=MeasurementMode.FINALEME,
+        marker_regions=mr,
+        input_format="finaleme_bed",
+    )
+    assert int(obs.k[0]) == 15
+    assert int(obs.n[0]) == 20
+    assert int(obs.k[1]) == 15
+    assert int(obs.n[1]) == 20
+
+    cache_dir = tmp_path / ".finaleme_too_tabix_cache"
+    assert cache_dir.exists()
+    assert any(p.name.endswith(".tbi") for p in cache_dir.iterdir())

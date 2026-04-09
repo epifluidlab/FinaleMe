@@ -9,6 +9,10 @@ package edu.northwestern.epifluidlab.finaleme.hmm;
 
 import htsjdk.samtools.util.IntervalTree;
 import htsjdk.samtools.util.BlockCompressedOutputStream;
+import htsjdk.tribble.Tribble;
+import htsjdk.tribble.bed.BEDCodec;
+import htsjdk.tribble.index.IndexFactory;
+import htsjdk.tribble.index.tabix.TabixFormat;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
@@ -45,7 +49,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.nio.charset.StandardCharsets;
 import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.lang3.tuple.Triple;
 import org.apache.commons.math3.random.MersenneTwister;
@@ -1178,33 +1181,7 @@ public class FinaleMe {
 		}
 		executor.shutdown();
 
-		FileOutputStream output = new FileOutputStream(outputFile);
-		OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
-		
-		writer.write("#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n");
-		
-		
-		double[][] predData = new double[methySummary.size()][2];
-		int i = 0;
-		for(String loc : methySummary.keySet()){
-			int methyPred = methySummary.get(loc).getFirst().getFirst();
-			int totalPred = methySummary.get(loc).getFirst().getSecond();
-			int methyObs = methySummary.get(loc).getSecond().getFirst();
-			int totalObs = methySummary.get(loc).getSecond().getSecond();
-			String[] locTmp = loc.split(":");
-			String chr = locTmp[0];
-			int start = Integer.parseInt(locTmp[1]);
-			int end = Integer.parseInt(locTmp[2]);
-			double pred = 100*(double)methyPred/(double)totalPred;
-			double obs = 100*(double)methyObs/(double)totalObs;
-			writer.write(chr + "\t" + start + "\t" + end + "\t" + pred + "\t" + methyPred + "\t" + totalPred + 
-					"\t" + obs + "\t" + methyObs + "\t" + totalObs + "\n");
-			predData[i][0]=pred;
-			predData[i][1]=obs;
-			i++;
-		}
-		writer.close();
-		output.close();
+		double[][] predData = writeDecodePredictionOutputWithTabix(methySummary, outputFile, chromOrder);
 
 		if (patRecords != null) {
 			String patFile = derivePatFile(outputFile);
@@ -1396,32 +1373,7 @@ public class FinaleMe {
 		log.info("Number of point in total is loaded : " + points);
 
 		// Phase 3: Write outputs
-		FileOutputStream output = new FileOutputStream(outputFile);
-		OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
-
-		writer.write("#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n");
-
-		double[][] predData = new double[methySummary.size()][2];
-		int idx = 0;
-		for (String loc : methySummary.keySet()) {
-			int methyPred = methySummary.get(loc).getFirst().getFirst();
-			int totalPred = methySummary.get(loc).getFirst().getSecond();
-			int methyObs = methySummary.get(loc).getSecond().getFirst();
-			int totalObs = methySummary.get(loc).getSecond().getSecond();
-			String[] locTmp = loc.split(":");
-			String chr = locTmp[0];
-			int start = Integer.parseInt(locTmp[1]);
-			int end = Integer.parseInt(locTmp[2]);
-			double pred = 100 * (double) methyPred / (double) totalPred;
-			double obs = 100 * (double) methyObs / (double) totalObs;
-			writer.write(chr + "\t" + start + "\t" + end + "\t" + pred + "\t" + methyPred + "\t" + totalPred +
-					"\t" + obs + "\t" + methyObs + "\t" + totalObs + "\n");
-			predData[idx][0] = pred;
-			predData[idx][1] = obs;
-			idx++;
-		}
-		writer.close();
-		output.close();
+		double[][] predData = writeDecodePredictionOutputWithTabix(methySummary, outputFile, chromOrder);
 
 		if (patRecords != null) {
 			String patFile = derivePatFile(outputFile);
@@ -1865,6 +1817,63 @@ public class FinaleMe {
 		return chromSizes;
 	}
 
+	private double[][] writeDecodePredictionOutputWithTabix(
+			HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary,
+			String outputFile,
+			LinkedHashMap<String, Integer> chromOrder) throws IOException {
+		ArrayList<DecodeSummaryRow> rows = toSortedDecodeRowsForPrediction(methySummary, chromOrder);
+		File bgzfOutput = new File(outputFile);
+		log.info("Writing decode prediction output as BGZF: " + bgzfOutput.getPath());
+		try (BlockCompressedOutputStream output = new BlockCompressedOutputStream(bgzfOutput);
+				OutputStreamWriter writer = new OutputStreamWriter(output, StandardCharsets.UTF_8)) {
+			writer.write("#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n");
+			for (DecodeSummaryRow row : rows) {
+				writer.write(row.chr);
+				writer.write('\t');
+				writer.write(Integer.toString(row.start));
+				writer.write('\t');
+				writer.write(Integer.toString(row.end));
+				writer.write('\t');
+				writer.write(Double.toString(row.predictMethyPercent()));
+				writer.write('\t');
+				writer.write(Integer.toString(row.methyPred));
+				writer.write('\t');
+				writer.write(Integer.toString(row.totalPred));
+				writer.write('\t');
+				writer.write(Double.toString(row.observedMethyPercent()));
+				writer.write('\t');
+				writer.write(Integer.toString(row.methyObs));
+				writer.write('\t');
+				writer.write(Integer.toString(row.totalObs));
+				writer.write('\n');
+			}
+		}
+
+		if (!rows.isEmpty()) {
+			createTabixIndexForDecodeOutput(bgzfOutput);
+		} else {
+			log.warn("Decode summary has no valid rows. Skipping tabix index generation for " + bgzfOutput.getPath());
+		}
+
+		double[][] predData = new double[rows.size()][2];
+		for (int i = 0; i < rows.size(); i++) {
+			predData[i][0] = rows.get(i).predictMethyPercent();
+			predData[i][1] = rows.get(i).observedMethyPercent();
+		}
+		return predData;
+	}
+
+	private void createTabixIndexForDecodeOutput(File bgzfOutput) {
+		try {
+			IndexFactory.createTabixIndex(bgzfOutput, new BEDCodec(), TabixFormat.BED, null)
+					.write(Tribble.tabixIndexFile(bgzfOutput).toPath());
+			log.info("Wrote tabix index for decode output: " + Tribble.tabixIndexFile(bgzfOutput).getPath());
+		} catch (Exception e) {
+			log.warn("Failed to create tabix index for decode output " + bgzfOutput.getPath()
+					+ ". You can run 'tabix -p bed " + bgzfOutput.getPath() + "' manually.", e);
+		}
+	}
+
 	private void writeDecodeBigWigOutputs(HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary, String outputFile, LinkedHashMap<String, Integer> chromOrder) throws Exception {
 		if (methySummary == null || methySummary.isEmpty()) {
 			log.info("Skip bigWig output because decode summary is empty.");
@@ -1932,7 +1941,20 @@ public class FinaleMe {
 		}
 	}
 
+	private ArrayList<DecodeSummaryRow> toSortedDecodeRowsForPrediction(
+			HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary,
+			LinkedHashMap<String, Integer> chromOrder) {
+		return toSortedDecodeRows(methySummary, chromOrder, false);
+	}
+
 	private ArrayList<DecodeSummaryRow> toSortedDecodeRowsForBigWig(HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary, LinkedHashMap<String, Integer> chromOrder) {
+		return toSortedDecodeRows(methySummary, chromOrder, true);
+	}
+
+	private ArrayList<DecodeSummaryRow> toSortedDecodeRows(
+			HashMap<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> methySummary,
+			LinkedHashMap<String, Integer> chromOrder,
+			boolean normalizeChr) {
 		ArrayList<DecodeSummaryRow> rows = new ArrayList<DecodeSummaryRow>(methySummary.size());
 		for (Map.Entry<String, Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> entry : methySummary.entrySet()) {
 			String[] locTmp = entry.getKey().split(":");
@@ -1950,14 +1972,21 @@ public class FinaleMe {
 			Pair<Pair<Integer, Integer>, Pair<Integer, Integer>> counts = entry.getValue();
 			int methyPred = counts.getFirst().getFirst();
 			int totalPred = counts.getFirst().getSecond();
+			int methyObs = counts.getSecond().getFirst();
+			int totalObs = counts.getSecond().getSecond();
 			if (totalPred <= 0) {
 				continue;
 			}
-			String normalizedChr = normalizeChrForBigWig(locTmp[0]);
-			rows.add(new DecodeSummaryRow(normalizedChr, start, end, methyPred, totalPred));
+			String chr = normalizeChr ? normalizeChrForBigWig(locTmp[0]) : locTmp[0];
+			rows.add(new DecodeSummaryRow(chr, start, end, methyPred, totalPred, methyObs, totalObs));
 		}
 
-		Collections.sort(rows, (a, b) -> {
+		Collections.sort(rows, (a, b) -> compareDecodeRows(a, b, chromOrder));
+		return rows;
+	}
+
+	private int compareDecodeRows(DecodeSummaryRow a, DecodeSummaryRow b, LinkedHashMap<String, Integer> chromOrder) {
+		if (chromOrder != null) {
 			Integer aOrder = chromOrder.get(a.chr);
 			Integer bOrder = chromOrder.get(b.chr);
 			if (aOrder != null && bOrder != null) {
@@ -1970,17 +1999,16 @@ public class FinaleMe {
 			} else if (bOrder != null) {
 				return 1;
 			}
-			int cmp = a.chr.compareTo(b.chr);
-			if (cmp != 0) {
-				return cmp;
-			}
-			cmp = Integer.compare(a.start, b.start);
-			if (cmp != 0) {
-				return cmp;
-			}
-			return Integer.compare(a.end, b.end);
-		});
-		return rows;
+		}
+		int cmp = a.chr.compareTo(b.chr);
+		if (cmp != 0) {
+			return cmp;
+		}
+		cmp = Integer.compare(a.start, b.start);
+		if (cmp != 0) {
+			return cmp;
+		}
+		return Integer.compare(a.end, b.end);
 	}
 
 	private void writeDecodeBedGraph(File bedGraphFile, List<DecodeSummaryRow> rows, int metricMode) throws IOException {
@@ -2474,17 +2502,28 @@ public class FinaleMe {
 		final int end;
 		final int methyPred;
 		final int totalPred;
+		final int methyObs;
+		final int totalObs;
 
-		DecodeSummaryRow(String chr, int start, int end, int methyPred, int totalPred) {
+		DecodeSummaryRow(String chr, int start, int end, int methyPred, int totalPred, int methyObs, int totalObs) {
 			this.chr = chr;
 			this.start = start;
 			this.end = end;
 			this.methyPred = methyPred;
 			this.totalPred = totalPred;
+			this.methyObs = methyObs;
+			this.totalObs = totalObs;
 		}
 
 		double predictMethyPercent() {
 			return 100.0 * (double) methyPred / (double) totalPred;
+		}
+
+		double observedMethyPercent() {
+			if (totalObs <= 0) {
+				return Double.NaN;
+			}
+			return 100.0 * (double) methyObs / (double) totalObs;
 		}
 	}
 

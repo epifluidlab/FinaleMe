@@ -10,6 +10,7 @@ Supported formats (architecture §3.2):
 from __future__ import annotations
 
 import gzip
+import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -19,6 +20,8 @@ import pandas as pd
 from finaleme_too.config import MeasurementMode
 from finaleme_too.exceptions import InvalidInputFormatError
 from finaleme_too.io.marker_regions import MarkerRegions
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,12 @@ class MethylationLoader:
             methy_perc_obs methy_count_obs total_count_obs
         Per-CpG records are aggregated into the supplied marker regions.
         """
+        # Fast path: tabix region queries. If unavailable, fall back to the
+        # legacy full-file scan below.
+        tabix_obs = _parse_finaleme_bed_with_tabix(path, sample_id, marker_regions, mode)
+        if tabix_obs is not None:
+            return tabix_obs
+
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
             df = pd.read_csv(
@@ -357,6 +366,222 @@ class MethylationLoader:
             mode=mode,
             keep_pct=False,
         )
+
+
+def _parse_finaleme_bed_with_tabix(
+    path: Path,
+    sample_id: str,
+    marker_regions: MarkerRegions,
+    mode: MeasurementMode,
+) -> MarkerObservations | None:
+    """Attempt tabix-backed region loading for FinaleMe BED files.
+
+    Returns ``None`` when tabix is unavailable or setup fails.
+    """
+    try:
+        import pysam
+    except Exception:
+        return None
+
+    tabix_path = _ensure_tabix_ready(path)
+    if tabix_path is None:
+        return None
+
+    try:
+        tbx = pysam.TabixFile(str(tabix_path))
+    except Exception as exc:
+        log.warning(
+            "Failed to open tabix file %s (%s). Falling back to full-file parser.",
+            tabix_path,
+            exc,
+        )
+        return None
+
+    try:
+        contigs = set(tbx.contigs)
+        n_markers = marker_regions.n_markers
+        k_arr = np.zeros(n_markers, dtype=np.int64)
+        n_arr = np.zeros(n_markers, dtype=np.int64)
+
+        for mi in range(n_markers):
+            chrom = str(marker_regions.chrom[mi])
+            start = int(marker_regions.start[mi])
+            end = int(marker_regions.end[mi])
+
+            k_sum = 0.0
+            n_sum = 0.0
+            query_chrom = _resolve_query_chrom(chrom, contigs)
+            if query_chrom is not None:
+                try:
+                    for line in tbx.fetch(query_chrom, max(0, start), max(0, end)):
+                        parts = line.split("\t")
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            cpg_start = int(parts[1])
+                            # prediction.bed.gz is BED-like (0-based, half-open).
+                            if cpg_start < start or cpg_start >= end:
+                                continue
+                            k_sum += float(parts[4])
+                            n_sum += float(parts[5])
+                        except ValueError:
+                            continue
+                except ValueError:
+                    # fetch() can still throw for malformed contig names.
+                    pass
+
+            k_arr[mi] = int(k_sum)
+            n_arr[mi] = int(n_sum)
+    finally:
+        tbx.close()
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        predicted_beta = np.where(
+            n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+        ).astype(np.float32)
+
+    return MarkerObservations(
+        sample_id=sample_id,
+        chrom=marker_regions.chrom,
+        start=marker_regions.start,
+        end=marker_regions.end,
+        k=k_arr.astype(np.int32),
+        n=n_arr.astype(np.int32),
+        predicted_beta=predicted_beta,
+        mode=mode,
+    )
+
+
+def _resolve_query_chrom(chrom: str, contigs: set[str]) -> str | None:
+    """Resolve chr/no-chr naming differences for tabix queries."""
+    if chrom in contigs:
+        return chrom
+    if chrom.startswith("chr"):
+        alt = chrom[3:]
+        if alt in contigs:
+            return alt
+    else:
+        alt = f"chr{chrom}"
+        if alt in contigs:
+            return alt
+    return None
+
+
+def _has_tabix_index(path: Path) -> bool:
+    return path.with_suffix(path.suffix + ".tbi").exists() or path.with_suffix(
+        path.suffix + ".csi"
+    ).exists()
+
+
+def _ensure_tabix_ready(path: Path) -> Path | None:
+    """Return a tabix-ready path, creating a cached bgzip+tabix copy if needed."""
+    try:
+        import pysam
+    except Exception:
+        return None
+
+    # Already indexed and readable.
+    if _has_tabix_index(path):
+        try:
+            with pysam.TabixFile(str(path)):
+                return path
+        except Exception:
+            pass
+
+    # Try indexing in place (works when file is already sorted bgzip).
+    try:
+        pysam.tabix_index(str(path), preset="bed", force=True, keep_original=True)
+        with pysam.TabixFile(str(path)):
+            return path
+    except Exception:
+        pass
+
+    # Otherwise build a sorted bgzip+tabix cache.
+    cache_path = _build_tabix_cache(path)
+    if cache_path is None:
+        return None
+    if _has_tabix_index(cache_path):
+        try:
+            with pysam.TabixFile(str(cache_path)):
+                return cache_path
+        except Exception:
+            return None
+    return None
+
+
+def _build_tabix_cache(path: Path) -> Path | None:
+    """Build a sorted bgzip/tabix cache copy from an arbitrary FinaleMe BED source."""
+    try:
+        import hashlib
+        import pysam
+    except Exception:
+        return None
+
+    stat = path.stat()
+    sig = hashlib.sha1(
+        f"{path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    cache_dir = path.parent / ".finaleme_too_tabix_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_bgz = cache_dir / f"{path.stem}.{sig}.prediction.bed.gz"
+
+    if _has_tabix_index(out_bgz):
+        return out_bgz
+
+    tmp_plain = cache_dir / f"{path.stem}.{sig}.prediction.bed"
+    opener = gzip.open if path.name.endswith(".gz") else open
+    rows: list[tuple[str, int, int, float, float, float]] = []
+
+    try:
+        with opener(path, "rt") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s or s.startswith("#") or s.startswith("track"):
+                    continue
+                parts = s.split("\t")
+                if len(parts) < 6:
+                    continue
+                try:
+                    rows.append(
+                        (
+                            str(parts[0]),
+                            int(parts[1]),
+                            int(parts[2]),
+                            float(parts[3]),
+                            float(parts[4]),
+                            float(parts[5]),
+                        )
+                    )
+                except ValueError:
+                    continue
+    except OSError as exc:
+        log.warning("Failed reading %s for tabix cache build (%s).", path, exc)
+        return None
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda x: (x[0], x[1], x[2]))
+    with open(tmp_plain, "wt") as out:
+        out.write(
+            "#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\n"
+        )
+        for chrom, start, end, pct, meth, total in rows:
+            out.write(f"{chrom}\t{start}\t{end}\t{pct}\t{meth}\t{total}\n")
+
+    try:
+        pysam.tabix_compress(str(tmp_plain), str(out_bgz), force=True)
+        pysam.tabix_index(str(out_bgz), preset="bed", force=True)
+        log.info("Built tabix cache for %s at %s", path, out_bgz)
+        return out_bgz
+    except Exception as exc:
+        log.warning("Failed building tabix cache for %s (%s).", path, exc)
+        return None
+    finally:
+        try:
+            tmp_plain.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _aggregate_per_cpg_to_markers(
