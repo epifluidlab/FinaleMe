@@ -322,12 +322,14 @@ class BayesianDeconvolver:
         burn_in: int = 500,
         prior_alpha: float = 1.0,
         seed: int | None = None,
+        binarization_count_weight: float = 1.0,
     ):
         self.n_walkers = n_walkers
         self.n_steps = n_steps
         self.burn_in = burn_in
         self.prior_alpha = prior_alpha
         self.seed = seed
+        self.binarization_count_weight = max(float(binarization_count_weight), 0.0)
 
     def solve(
         self,
@@ -342,6 +344,19 @@ class BayesianDeconvolver:
             raise DeconvolutionFailedError(
                 "emcee not installed; install with `pip install finaleme-too[bayesian]`"
             ) from exc
+
+        # Local import to avoid top-level circular imports.
+        from finaleme_too.core.observation_model_binarization import (
+            BinarizationObservationModel,
+        )
+
+        if isinstance(model, BinarizationObservationModel):
+            return self._solve_hybrid_binarization(
+                model=model,
+                reference=reference,
+                marker_subset=marker_subset,
+                emcee_module=emcee,
+            )
 
         R_full = MLEDeconvolver._augmented_reference(reference)
         k_arr = model.k
@@ -401,6 +416,113 @@ class BayesianDeconvolver:
 
         chain = sampler.get_chain(discard=self.burn_in, flat=True)  # (n_keep, K_free)
         # Convert to (K+1)-simplex
+        n_keep = chain.shape[0]
+        out = np.empty((n_keep, K_total), dtype=np.float64)
+        for i in range(n_keep):
+            full_z = np.concatenate([chain[i], np.array([0.0])])
+            out[i] = softmax(full_z)
+        return out
+
+    def _solve_hybrid_binarization(
+        self,
+        model,  # BinarizationObservationModel
+        reference: "ReferencePanel",
+        marker_subset: np.ndarray | None,
+        emcee_module,
+    ) -> np.ndarray:
+        """Hybrid Bayesian inference for v3 binarization mode.
+
+        Posterior combines:
+          1) state likelihood: log P(called_state_i | w) from coef @ w
+          2) count likelihood: beta-binomial log L(k_i, n_i | mu_i(w), phi_i)
+
+        The count term is normalized per read and weighted by
+        ``self.binarization_count_weight`` to keep scales compatible.
+        """
+        coef = np.asarray(model.coef, dtype=np.float64)
+        weights = np.asarray(model.weights, dtype=np.float64)
+        if model.k is None or model.n is None or model.dispersion is None:
+            raise DeconvolutionFailedError(
+                "BinarizationObservationModel is missing k/n/dispersion for "
+                "hybrid Bayesian inference."
+            )
+        k = np.asarray(model.k, dtype=np.float64)
+        n = np.asarray(model.n, dtype=np.float64)
+        phi = np.asarray(model.dispersion, dtype=np.float64)
+
+        # Continuous reference (not binarized) for the count-likelihood term.
+        R_full = MLEDeconvolver._augmented_reference(reference)
+        valid_mask = np.asarray(model.valid_mask, dtype=bool)
+        R = R_full[valid_mask]
+
+        if marker_subset is not None:
+            coef = coef[marker_subset]
+            weights = weights[marker_subset]
+            k = k[marker_subset]
+            n = n[marker_subset]
+            phi = phi[marker_subset]
+            R = R[marker_subset]
+
+        valid = (
+            np.all(np.isfinite(coef), axis=1)
+            & np.all(np.isfinite(R), axis=1)
+            & np.isfinite(k)
+            & np.isfinite(n)
+            & np.isfinite(phi)
+            & (n > 0)
+        )
+        if int(np.sum(valid)) < R.shape[1]:
+            raise DeconvolutionFailedError(
+                "Not enough valid markers for hybrid Bayesian binarization solve."
+            )
+
+        coef_v = coef[valid]
+        weights_v = weights[valid]
+        k_v = k[valid]
+        n_v = n[valid]
+        phi_v = phi[valid]
+        R_v = R[valid]
+
+        K_total = coef_v.shape[1]
+        K_free = K_total - 1
+
+        def softmax(z: np.ndarray) -> np.ndarray:
+            z_max = np.max(z)
+            ez = np.exp(z - z_max)
+            return ez / ez.sum()
+
+        def log_posterior(z: np.ndarray) -> float:
+            full_z = np.concatenate([z, np.array([0.0])])
+            w = softmax(full_z)
+
+            # Binarization state likelihood
+            p_obs = np.clip(coef_v @ w, 1e-15, 1.0)
+            ll_state = float(np.sum(weights_v * np.log(p_obs)))
+
+            # Count likelihood (beta-binomial), normalized per read to
+            # avoid overwhelming the state term at deep coverage.
+            mu = np.clip(R_v @ w, 1e-9, 1.0 - 1e-9)
+            ll_count_vec = log_likelihood_per_marker(k_v, n_v, mu, phi_v)
+            ll_count_per_read = ll_count_vec / np.maximum(n_v, 1.0)
+            ll_count = float(np.sum(weights_v * ll_count_per_read))
+
+            log_lik = ll_state + self.binarization_count_weight * ll_count
+
+            if abs(self.prior_alpha - 1.0) < 1e-12:
+                log_prior = 0.0
+            else:
+                log_prior = float(
+                    (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
+                )
+            return log_lik + log_prior
+
+        rng = np.random.default_rng(self.seed)
+        p0 = rng.normal(0, 0.1, size=(self.n_walkers, K_free))
+
+        sampler = emcee_module.EnsembleSampler(self.n_walkers, K_free, log_posterior)
+        sampler.run_mcmc(p0, self.n_steps, progress=False)
+
+        chain = sampler.get_chain(discard=self.burn_in, flat=True)
         n_keep = chain.shape[0]
         out = np.empty((n_keep, K_total), dtype=np.float64)
         for i in range(n_keep):

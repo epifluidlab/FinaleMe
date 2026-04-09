@@ -112,6 +112,11 @@ class BinarizationObservationModel:
     coverage_tier: CoverageTier
     coverage_cap: int
     hard_threshold: float | None = None
+    # Optional count-level fields for hybrid Bayesian inference. These are
+    # aligned to the same valid-marker subset as coef/called_state.
+    k: np.ndarray | None = None  # int64 (M_valid,)
+    n: np.ndarray | None = None  # int64 (M_valid,)
+    dispersion: np.ndarray | None = None  # float64 (M_valid,)
     kind: str = "finaleme"
 
     @property
@@ -236,6 +241,9 @@ class BinarizationModel:
                 mode=obs.mode,
                 coverage_tier=tier,
                 coverage_cap=coverage_cap,
+                k=np.zeros(empty_k, dtype=np.int64),
+                n=np.zeros(empty_k, dtype=np.int64),
+                dispersion=np.zeros(empty_k, dtype=np.float64),
             )
 
         # Binarize the reference panel (full shape M_original × K) and
@@ -283,6 +291,18 @@ class BinarizationModel:
             balance = np.asarray(balance_weights, dtype=np.float64)[valid_mask]
         weights = capped * balance
 
+        # Count-level view for optional hybrid Bayesian inference. We keep
+        # the same FinaleMe tier defaults as the beta-binomial path.
+        finaleme_phi_defaults = {
+            CoverageTier.HIGH: 15.0,
+            CoverageTier.LOW: 8.0,
+            CoverageTier.ULTRALOW: 3.0,
+        }
+        phi_default = finaleme_phi_defaults.get(tier, 8.0)
+        k_valid = np.asarray(obs.k, dtype=np.int64)[valid_mask]
+        n_valid_i64 = np.asarray(obs.n, dtype=np.int64)[valid_mask]
+        phi_valid = np.full(k_valid.size, float(phi_default), dtype=np.float64)
+
         return BinarizationObservationModel(
             sample_id=obs.sample_id,
             called_state=state_valid.astype(np.uint8),
@@ -295,6 +315,9 @@ class BinarizationModel:
             coverage_tier=tier,
             coverage_cap=coverage_cap,
             hard_threshold=self.hard_threshold,
+            k=k_valid,
+            n=n_valid_i64,
+            dispersion=phi_valid,
         )
 
 
