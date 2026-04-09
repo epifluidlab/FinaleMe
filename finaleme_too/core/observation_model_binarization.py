@@ -140,16 +140,31 @@ def _binarize_reference_panel(
     reference_methylation: np.ndarray,
     low_threshold: float = 0.2,
     high_threshold: float = 0.8,
+    hard_threshold: float | None = None,
 ) -> np.ndarray:
     """Apply the soft reference binarization rule (math doc §2B.2).
 
-    Entries below ``low_threshold`` are set to 0 (U), entries above
-    ``high_threshold`` are set to 1 (M), and intermediate values are kept
-    as-is to encode partial support for both states.
+    Default (soft) mode:
+      * entries below ``low_threshold`` are set to 0 (U)
+      * entries above ``high_threshold`` are set to 1 (M)
+      * intermediate values are kept as-is to encode partial support
+
+    Hard-threshold mode (when ``hard_threshold`` is set):
+      * entries ``< hard_threshold`` become 0 (U)
+      * entries ``>= hard_threshold`` become 1 (M)
+      * no intermediate values remain for finite entries
 
     Returns a new ``float64`` array of the same shape.
     """
     ref = np.asarray(reference_methylation, dtype=np.float64)
+    if hard_threshold is not None:
+        thr = float(hard_threshold)
+        out = ref.copy()
+        finite = np.isfinite(ref)
+        out[finite & (ref < thr)] = 0.0
+        out[finite & (ref >= thr)] = 1.0
+        return out
+
     out = ref.copy()
     out[ref < low_threshold] = 0.0
     out[ref > high_threshold] = 1.0
@@ -173,6 +188,11 @@ class BinarizationModel:
     Mode / tier / coverage_cap plumbing matches ``BetaBinomialModel.build``
     so the pipeline dispatcher can treat the two builders interchangeably.
     """
+
+    def __init__(self, hard_threshold: float | None = None):
+        # Optional universal hard threshold used by
+        # ``finaleme-too run --binarizeThreshold``.
+        self.hard_threshold = hard_threshold
 
     def build(
         self,
@@ -219,7 +239,10 @@ class BinarizationModel:
 
         # Binarize the reference panel (full shape M_original × K) and
         # append the 0.5 unknown column.
-        ref_binary_full = _binarize_reference_panel(reference.methylation)
+        ref_binary_full = _binarize_reference_panel(
+            reference.methylation,
+            hard_threshold=self.hard_threshold,
+        )
         K = ref_binary_full.shape[1]
         unknown_col = np.full((ref_binary_full.shape[0], 1), 0.5, dtype=np.float64)
         ref_full = np.hstack([ref_binary_full, unknown_col])  # (M_original, K+1)

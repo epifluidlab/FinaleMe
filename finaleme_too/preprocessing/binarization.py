@@ -267,6 +267,7 @@ def apply_binarization(
     obs: MarkerObservations,
     params: BinarizationParams,
     region_annotations: pd.DataFrame | None = None,
+    hard_threshold: float | None = None,
 ) -> MarkerObservations:
     """Apply a trained binarization model to one sample's observations.
 
@@ -283,6 +284,12 @@ def apply_binarization(
         When ``None`` or when a marker has no matching row, the marker
         falls back to ``cpg_density=NaN`` which routes it to the
         open_sea class + lowest sub-bin (see ``assign_bin``).
+    hard_threshold
+        Optional universal threshold mode used by ``finaleme-too run
+        --binarizeThreshold``. When set, marker calls are:
+        ``predicted_beta < hard_threshold -> U`` and
+        ``predicted_beta >= hard_threshold -> M`` for usable bins.
+        Ambiguous calls are disabled in this mode.
 
     Returns
     -------
@@ -349,15 +356,25 @@ def apply_binarization(
     # Start: everything defaults to Excluded
     # Usable bins: classify by predicted_beta
     finite = np.isfinite(pred)
-    # U call
-    u_mask = usable_per & finite & (pred < tau_low_per)
-    called_state[u_mask] = STATE_U
-    # M call
-    m_mask = usable_per & finite & (pred > tau_high_per)
-    called_state[m_mask] = STATE_M
-    # Ambiguous: usable + finite + in [τ_low, τ_high]
-    amb_mask = usable_per & finite & ~u_mask & ~m_mask
-    called_state[amb_mask] = STATE_AMBIGUOUS
+    if hard_threshold is not None:
+        thr = float(hard_threshold)
+        # Hard-threshold mode: no Ambiguous state. This is used when users
+        # request a universal cutoff (e.g. 0.1) rather than trained per-bin
+        # thresholds.
+        u_mask = usable_per & finite & (pred < thr)
+        called_state[u_mask] = STATE_U
+        m_mask = usable_per & finite & (pred >= thr)
+        called_state[m_mask] = STATE_M
+    else:
+        # U call
+        u_mask = usable_per & finite & (pred < tau_low_per)
+        called_state[u_mask] = STATE_U
+        # M call
+        m_mask = usable_per & finite & (pred > tau_high_per)
+        called_state[m_mask] = STATE_M
+        # Ambiguous: usable + finite + in [τ_low, τ_high]
+        amb_mask = usable_per & finite & ~u_mask & ~m_mask
+        called_state[amb_mask] = STATE_AMBIGUOUS
     # Markers in unusable bins or with NaN predicted_beta stay EXCLUDED.
 
     return obs.with_binarization(called_state=called_state, context_bin=bin_idx)

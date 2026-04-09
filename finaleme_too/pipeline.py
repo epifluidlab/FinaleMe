@@ -110,12 +110,22 @@ class TOOPipeline:
         group_comparison_spec: str | None = None,
         cpg_index: dict | None = None,
         binarization=None,  # BinarizationParams | None — v3 FinaleMe path
+        binarize_threshold: float | None = None,  # universal hard threshold mode
     ):
         from finaleme_too.config import SolverMethod
         from finaleme_too.core.observation_model_binarization import BinarizationModel
 
         self.config = config
         self.binarization = binarization
+        if binarize_threshold is not None:
+            thr = float(binarize_threshold)
+            if thr < 0.0 or thr > 1.0:
+                raise ValueError(
+                    f"binarize_threshold must be within [0, 1], got {thr}"
+                )
+            self.binarize_threshold = thr
+        else:
+            self.binarize_threshold = None
         self.region_annotations = region_annotations
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
@@ -124,7 +134,9 @@ class TOOPipeline:
         # v3 binarization observation-model builder. Cheap to construct
         # whether or not binarization is provided; the actual dispatch in
         # _deconvolve_sample only uses it when self.binarization is not None.
-        self._binarization_builder = BinarizationModel()
+        self._binarization_builder = BinarizationModel(
+            hard_threshold=self.binarize_threshold,
+        )
 
         # Decouple uncertainty source from the point-estimate solver.
         # ``uncertainty.method`` selects bootstrap / bayesian / both / none;
@@ -653,6 +665,7 @@ class TOOPipeline:
             obs,
             params=self.binarization,
             region_annotations=self.region_annotations,
+            hard_threshold=self.binarize_threshold,
         )
 
     # Backwards-compat aliases so any stale caller finding the old method
