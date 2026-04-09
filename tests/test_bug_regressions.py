@@ -592,13 +592,48 @@ def test_round3_high_residual_analysis_not_skipped_when_first_sample_empty(tmp_p
     import pandas as pd
 
     df = pd.read_csv(residual_tsv, sep="\t")
-    assert set(df["sample_id"]) == {"s1", "s2", "s3"}
+    assert list(df.columns) == ["metric", "s1", "s2", "s3"]
     # s1 (no residuals) should have NaN stats
-    s1_row = df[df["sample_id"] == "s1"].iloc[0]
-    assert np.isnan(float(s1_row["mean_residual"]))
+    s1_mean = float(df.loc[df["metric"] == "mean_residual", "s1"].iloc[0])
+    assert np.isnan(s1_mean)
     # s2/s3 should have finite stats
-    s2_row = df[df["sample_id"] == "s2"].iloc[0]
-    assert np.isfinite(float(s2_row["mean_residual"]))
+    s2_mean = float(df.loc[df["metric"] == "mean_residual", "s2"].iloc[0])
+    assert np.isfinite(s2_mean)
+
+
+def test_round3_hard_threshold_mode_skips_binarization_fail_qc_flag():
+    """Hard-threshold mode should not emit BINARIZATION_WARN/FAIL flags."""
+    from finaleme_too.config import CoverageTier, QCConfig
+    from finaleme_too.core.deconvolution import DeconvolutionResult
+    from finaleme_too.postprocessing.qc import compute_qc_flags
+
+    prop = np.array([0.7, 0.3], dtype=np.float64)  # one cell type + unknown
+    result = DeconvolutionResult(
+        sample_id="s1",
+        cell_types=["CT1"],
+        proportions=prop,
+        ci_lower=prop - 0.05,
+        ci_upper=prop + 0.05,
+        p_goodness=None,
+        p_detection=np.array([0.95, 0.95], dtype=np.float64),
+        reliability=np.array(["HIGH", "HIGH"], dtype=object),
+        n_markers=np.array([10], dtype=np.int32),
+        coverage_tier=CoverageTier.HIGH,
+        qc_flags=[],
+        mean_dispersion=np.array([50.0], dtype=np.float64),
+        mean_coverage=25.0,
+        n_markers_used=10,
+        overall_qc="PASS",
+    )
+    flags = compute_qc_flags(
+        result=result,
+        observation=None,  # not used by compute_qc_flags
+        qc_config=QCConfig(),
+        binarization_flag="HARD_THRESHOLD",
+        hemolysis=None,
+    )
+    assert "BINARIZATION_FAIL" not in flags
+    assert "BINARIZATION_WARN" not in flags
 
 
 # MEDIUM — sample sheet must require the group column
@@ -1547,13 +1582,17 @@ def test_pipeline_writes_consistent_qc_summary_for_high_coverage_sample(tmp_path
     qc_path = out_dir / "qc_summary.tsv"
     assert qc_path.exists(), "qc_summary.tsv must be written"
     qc = pd.read_csv(qc_path, sep="\t")
-    assert len(qc) == len(sheet.samples)
+    assert list(qc.columns[1:]) == [s.sample_id for s in sheet.samples]
     # _build_synth_cohort uses 500bp markers (start, start+500). Per-marker
     # n=120 → effective coverage = 120 * 167 / 500 ≈ 40.08× → HIGH.
     expected_cov = 120 * FRAGMENT_LENGTH_BP / 500
-    assert all(qc["coverage_tier"] == "HIGH"), \
-        f"Expected all HIGH, got {qc['coverage_tier'].tolist()}"
-    for mc in qc["mean_coverage"]:
+    cov_row = qc.loc[qc["metric"] == "coverage_tier"].iloc[0, 1:].tolist()
+    assert all(str(v) == "HIGH" for v in cov_row), \
+        f"Expected all HIGH, got {cov_row}"
+    mean_cov_values = [
+        float(v) for v in qc.loc[qc["metric"] == "mean_coverage"].iloc[0, 1:].tolist()
+    ]
+    for mc in mean_cov_values:
         # Allow ±5% slack for the tier-filter and bootstrap noise.
         assert abs(float(mc) - expected_cov) < 2.0, \
             f"mean_coverage {mc} not close to expected {expected_cov}"

@@ -722,12 +722,25 @@ class TOOPipeline:
                 STATE_M,
                 STATE_U,
             )
-            qc = _binarization_inference_qc(
-                called_state=obs.called_state,
-                context_bin=obs.context_bin,
-                params=self.binarization,
-            )
-            binarization_flag = qc.get("flag")
+            # In universal hard-threshold mode (--binarizeThreshold),
+            # binarization inference-QC calibration diagnostics are not
+            # meaningful; treat the binarization stage as bypassed for QC
+            # flagging so users do not get BINARIZATION_FAIL from this mode.
+            if self.binarize_threshold is not None:
+                qc = {
+                    "flag": "HARD_THRESHOLD",
+                    "fraction_called": float("nan"),
+                    "bin_balance": float("nan"),
+                    "state_distribution_kl": float("nan"),
+                }
+                binarization_flag = "HARD_THRESHOLD"
+            else:
+                qc = _binarization_inference_qc(
+                    called_state=obs.called_state,
+                    context_bin=obs.context_bin,
+                    params=self.binarization,
+                )
+                binarization_flag = qc.get("flag")
 
             # Per-sample debug scaffold for troubleshooting cases where the
             # deconvolution falls back to Unknown=1 due to having no callable

@@ -49,6 +49,8 @@ def compute_qc_flags(
             flags.append("WBC_DOMINANT")
 
     # Binarization flag (FinaleMe mode). Renamed from CALIBRATION_* in v3.
+    # In hard-threshold mode, pipeline sets "HARD_THRESHOLD" which is treated
+    # as non-failing/bypassed here.
     if binarization_flag in ("WARN", "FAIL"):
         flags.append(f"BINARIZATION_{binarization_flag}")
 

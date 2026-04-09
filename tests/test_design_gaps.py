@@ -225,8 +225,8 @@ def _mk_decon_result(sample_id: str, unknown: float, residuals: np.ndarray) -> D
 
 
 def test_gap6b_residual_analysis_writer(tmp_path: Path):
-    """write_residual_analysis should emit one row per sample with the
-    expected columns and use any provided NMF summary."""
+    """write_residual_analysis should emit transposed output with one
+    column per sample and include the expected metrics."""
     rng = np.random.default_rng(0)
     residuals_a = rng.normal(0, 0.05, size=30)
     residuals_b = rng.normal(0.1, 0.05, size=30)
@@ -244,15 +244,20 @@ def test_gap6b_residual_analysis_writer(tmp_path: Path):
     out_path = tmp_path / "residual_analysis.tsv"
     write_residual_analysis(results, sample_groups, out_path, nmf_summary=nmf_summary)
     df = pd.read_csv(out_path, sep="\t")
-    assert list(df["sample_id"]) == ["s1", "s2"]
-    assert "unexplained_fraction" in df.columns
-    assert "mean_residual" in df.columns
-    assert "residual_sd" in df.columns
-    assert "nmf_top_component_loading" in df.columns
-    assert "qc_flag" in df.columns
+    assert list(df.columns) == ["metric", "s1", "s2"]
+    metrics = set(df["metric"])
+    assert "unexplained_fraction" in metrics
+    assert "mean_residual" in metrics
+    assert "residual_sd" in metrics
+    assert "nmf_top_component_loading" in metrics
+    assert "qc_flag" in metrics
     # s2 should have the higher NMF loading
-    s2_loading = float(df.loc[df["sample_id"] == "s2", "nmf_top_component_loading"].iloc[0])
-    s1_loading = float(df.loc[df["sample_id"] == "s1", "nmf_top_component_loading"].iloc[0])
+    s2_loading = float(
+        df.loc[df["metric"] == "nmf_top_component_loading", "s2"].iloc[0]
+    )
+    s1_loading = float(
+        df.loc[df["metric"] == "nmf_top_component_loading", "s1"].iloc[0]
+    )
     assert s2_loading > s1_loading
 
 
@@ -264,8 +269,10 @@ def test_gap6b_residual_analysis_without_nmf(tmp_path: Path):
     out_path = tmp_path / "residual_analysis.tsv"
     write_residual_analysis(results, {"s1": "A"}, out_path, nmf_summary=None)
     df = pd.read_csv(out_path, sep="\t")
-    assert len(df) == 1
-    assert np.isnan(float(df["nmf_top_component_loading"].iloc[0]))
+    assert list(df.columns) == ["metric", "s1"]
+    assert np.isnan(
+        float(df.loc[df["metric"] == "nmf_top_component_loading", "s1"].iloc[0])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +303,8 @@ def test_gap7_cohort_tsv_has_enriched_columns(tmp_path: Path):
     out = tmp_path / "cohort_proportions.tsv"
     write_cohort_proportions(results, {"s1": "A", "s2": "B"}, out)
     df = pd.read_csv(out, sep="\t")
+    assert list(df.columns) == ["metric", "s1", "s2"]
+    metrics = set(df["metric"])
     for col in (
         "mean_coverage",
         "n_markers_used",
@@ -304,8 +313,13 @@ def test_gap7_cohort_tsv_has_enriched_columns(tmp_path: Path):
         "hemolysis",
         "overall_qc",
     ):
-        assert col in df.columns, f"missing column: {col}"
-    assert list(df["overall_qc"]) == ["PASS", "PASS"]
+        assert col in metrics, f"missing metric row: {col}"
+    assert (
+        df.loc[df["metric"] == "overall_qc", "s1"].iloc[0] == "PASS"
+    )
+    assert (
+        df.loc[df["metric"] == "overall_qc", "s2"].iloc[0] == "PASS"
+    )
 
 
 def test_gap7_qc_summary_has_architecture_columns(tmp_path: Path):
@@ -316,8 +330,9 @@ def test_gap7_qc_summary_has_architecture_columns(tmp_path: Path):
     out = tmp_path / "qc.tsv"
     write_qc_summary(results, {"s1": "A", "s2": "B"}, out)
     df = pd.read_csv(out, sep="\t")
+    assert list(df.columns) == ["metric", "s1", "s2"]
+    metrics = set(df["metric"])
     for col in (
-        "sample_id",
         "group",
         "coverage_tier",
         "mean_coverage",
@@ -330,4 +345,4 @@ def test_gap7_qc_summary_has_architecture_columns(tmp_path: Path):
         "qc_flags",
         "overall_qc",
     ):
-        assert col in df.columns, f"missing column: {col}"
+        assert col in metrics, f"missing metric row: {col}"

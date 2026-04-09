@@ -15,6 +15,33 @@ def _format_proportion(x: float) -> float:
     return float(round(x, 4))
 
 
+def _write_sample_transposed(
+    df_samples: pd.DataFrame,
+    path: str | Path,
+) -> None:
+    """Write a sample-keyed dataframe as metric rows × sample columns.
+
+    Input shape is expected to be one row per sample with a ``sample_id``
+    column. Output shape is transposed with:
+      - first column: ``metric``
+      - one subsequent column per sample id.
+    """
+    if df_samples.empty:
+        pd.DataFrame(columns=["metric"]).to_csv(path, sep="\t", index=False)
+        return
+    if "sample_id" not in df_samples.columns:
+        df_samples.to_csv(path, sep="\t", index=False, float_format="%.4f")
+        return
+
+    sample_order = [str(s) for s in df_samples["sample_id"].tolist()]
+    tsv = df_samples.set_index("sample_id").T
+    # Keep the original sample order from the rows.
+    tsv = tsv.loc[:, sample_order]
+    tsv.insert(0, "metric", tsv.index.astype(str))
+    tsv = tsv.reset_index(drop=True)
+    tsv.to_csv(path, sep="\t", index=False, float_format="%.4f")
+
+
 # Header comment prepended to every per-sample .too.tsv file.
 # ``pandas.read_csv(..., sep='\t', comment='#')`` reads these files without
 # any extra arguments.
@@ -104,14 +131,13 @@ def write_cohort_proportions(
     sample_groups: dict[str, str | None],
     path: str | Path,
 ) -> None:
-    """Write cohort_proportions.tsv with one row per sample.
+    """Write cohort_proportions.tsv with one column per sample.
 
-    Each cell type contributes proportion + ci_lo + ci_hi + p_detection +
-    effect_size + likelihood_score + reliability columns; the unknown
-    component is appended at the end.
+    Internal table is built as one row per sample, then transposed to
+    metrics-as-rows so each sample is a dedicated output column.
     """
     if not results:
-        pd.DataFrame().to_csv(path, sep="\t", index=False)
+        pd.DataFrame(columns=["metric"]).to_csv(path, sep="\t", index=False)
         return
 
     base = results[0]
@@ -176,9 +202,7 @@ def write_cohort_proportions(
         row["overall_qc"] = r.overall_qc
         rows.append(row)
 
-    pd.DataFrame(rows, columns=columns).to_csv(
-        path, sep="\t", index=False, float_format="%.4f"
-    )
+    _write_sample_transposed(pd.DataFrame(rows, columns=columns), path)
 
 
 def write_qc_summary(
@@ -186,7 +210,7 @@ def write_qc_summary(
     sample_groups: dict[str, str | None],
     path: str | Path,
 ) -> None:
-    """Write a per-sample QC summary (architecture §10.6).
+    """Write a transposed QC summary (metrics rows, samples columns).
 
     Columns:
         sample_id group coverage_tier mean_coverage n_markers_used
@@ -226,7 +250,7 @@ def write_qc_summary(
                 "overall_qc": r.overall_qc,
             }
         )
-    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.4f")
+    _write_sample_transposed(pd.DataFrame(rows), path)
 
 
 def write_binarization_debug(
@@ -290,7 +314,7 @@ def write_residual_analysis(
     path: str | Path,
     nmf_summary: dict | None = None,
 ) -> None:
-    """Write residual_analysis.tsv (architecture §9.4 / §10.5).
+    """Write residual_analysis.tsv (metrics rows, samples columns).
 
     Columns:
         sample_id group coverage_tier unexplained_fraction mean_residual
@@ -334,7 +358,7 @@ def write_residual_analysis(
                 "qc_flag": r.overall_qc,
             }
         )
-    pd.DataFrame(rows).to_csv(path, sep="\t", index=False, float_format="%.4f")
+    _write_sample_transposed(pd.DataFrame(rows), path)
 
 
 def write_calibration_report(report: dict, path: str | Path) -> None:
