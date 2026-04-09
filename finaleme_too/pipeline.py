@@ -132,7 +132,9 @@ class TOOPipeline:
         self._region_annotation_lookup: pd.DataFrame | None = None
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
-        self.deconvolver = MLEDeconvolver()
+        self.deconvolver = MLEDeconvolver(
+            binarization_count_weight=config.model.binarization_count_weight
+        )
         self.fragment_deconvolver = FragmentLevelDeconvolver()
         # v3 binarization observation-model builder. Cheap to construct
         # whether or not binarization is provided; the actual dispatch in
@@ -165,6 +167,7 @@ class TOOPipeline:
                 burn_in=100,
                 prior_alpha=config.uncertainty.bayesian_prior_alpha,
                 seed=config.uncertainty.seed,
+                binarization_count_weight=config.model.binarization_count_weight,
             )
             if needs_bayesian
             else None

@@ -105,9 +105,18 @@ class DeconvolutionResult:
 class MLEDeconvolver:
     """Constrained MLE deconvolution via SLSQP."""
 
-    def __init__(self, max_iter: int = 200, tol: float = 1e-8):
+    def __init__(
+        self,
+        max_iter: int = 200,
+        tol: float = 1e-8,
+        binarization_count_weight: float = 1.0,
+    ):
         self.max_iter = max_iter
         self.tol = tol
+        # Hybrid FinaleMe-v3 objective weight:
+        #   logL = logL_state + binarization_count_weight * logL_count
+        # Set to 0.0 to recover the legacy state-only solver.
+        self.binarization_count_weight = max(float(binarization_count_weight), 0.0)
 
     def solve(
         self,
@@ -138,7 +147,7 @@ class MLEDeconvolver:
         )
 
         if isinstance(model, BinarizationObservationModel):
-            return self._solve_binarization(model, marker_subset)
+            return self._solve_binarization(model, reference, marker_subset)
         return self._solve_betabinom(model, reference, marker_subset)
 
     def _solve_betabinom(
@@ -198,51 +207,140 @@ class MLEDeconvolver:
     def _solve_binarization(
         self,
         model,  # BinarizationObservationModel
+        reference: "ReferencePanel",
         marker_subset: np.ndarray | None = None,
     ) -> np.ndarray:
-        """v3 FinaleMe MLE solver: binomial likelihood with error rates.
+        """v3 FinaleMe hybrid MLE solver.
 
-        The per-marker likelihood is
+        Objective combines:
 
-            P(observed_state_i | w) = coef[i] @ w
+          1) state likelihood from called U/M states:
+               P(observed_state_i | w) = coef[i] @ w
 
-        which is linear in ``w``. The negative log-likelihood and gradient
-        are therefore much cheaper than the beta-binomial path (no digamma):
+          2) count likelihood from (k_i, n_i) under beta-binomial with
+             per-marker means mu_i(w) built from the continuous reference.
 
-            neg_ll(w)   = -Σ_i ω_i · log(coef[i] @ w)
-            neg_grad(w) = -(ω_i / (coef[i] @ w)) @ coef
+        The count term is normalized per read so deep-coverage markers do
+        not dominate purely due to larger ``n_i``:
+
+            ll_count = Σ_i ω_i * [ log P(k_i | n_i, mu_i(w), phi_i) / n_i ]
+
+        Full objective:
+
+            ll_total = ll_state + binarization_count_weight * ll_count
         """
-        coef = model.coef          # (M_valid, K+1) — already augmented with unknown
-        weights = model.weights    # (M_valid,)
+        coef = np.asarray(model.coef, dtype=np.float64)       # (M_valid, K+1)
+        weights = np.asarray(model.weights, dtype=np.float64)  # (M_valid,)
+        K_total = coef.shape[1]
+
+        use_count_term = (
+            self.binarization_count_weight > 0.0
+            and model.k is not None
+            and model.n is not None
+            and model.dispersion is not None
+        )
+
+        if use_count_term:
+            k = np.asarray(model.k, dtype=np.float64)
+            n = np.asarray(model.n, dtype=np.float64)
+            phi = np.asarray(model.dispersion, dtype=np.float64)
+            R_full = self._augmented_reference(reference)
+            valid_mask = getattr(model, "valid_mask", None)
+            if valid_mask is None:
+                # Defensive fallback for legacy in-memory models that may
+                # predate valid_mask; if shapes already align, consume full R.
+                if R_full.shape[0] == coef.shape[0]:
+                    R = R_full
+                else:
+                    log.warning(
+                        "Sample %s: missing valid_mask for binarization count term; "
+                        "falling back to state-only MLE.",
+                        model.sample_id,
+                    )
+                    use_count_term = False
+                    R = np.zeros((0, K_total), dtype=np.float64)
+            else:
+                vm = np.asarray(valid_mask, dtype=bool)
+                if vm.shape[0] != R_full.shape[0]:
+                    log.warning(
+                        "Sample %s: valid_mask length (%d) != reference markers (%d); "
+                        "falling back to state-only MLE.",
+                        model.sample_id,
+                        vm.shape[0],
+                        R_full.shape[0],
+                    )
+                    use_count_term = False
+                    R = np.zeros((0, K_total), dtype=np.float64)
+                else:
+                    R = R_full[vm]
 
         if marker_subset is not None:
             coef = coef[marker_subset]
             weights = weights[marker_subset]
+            if use_count_term:
+                k = k[marker_subset]
+                n = n[marker_subset]
+                phi = phi[marker_subset]
+                R = R[marker_subset]
 
-        # Filter rows with NaN coefficients defensively (shouldn't happen
-        # under normal binarization but matches the betabinom guard).
+        # Filter invalid rows defensively; requires non-zero coverage for
+        # the count term when enabled.
         valid = np.all(np.isfinite(coef), axis=1)
-        if int(np.sum(valid)) < coef.shape[1]:
-            uniform = np.zeros(coef.shape[1], dtype=np.float64)
+        if use_count_term:
+            valid = (
+                valid
+                & np.all(np.isfinite(R), axis=1)
+                & np.isfinite(k)
+                & np.isfinite(n)
+                & np.isfinite(phi)
+                & (n > 0)
+            )
+
+        if int(np.sum(valid)) < K_total:
+            uniform = np.zeros(K_total, dtype=np.float64)
             uniform[-1] = 1.0
             return uniform
 
         coef_v = coef[valid]
         w_obj = weights[valid]
-        K_total = coef_v.shape[1]
+        if use_count_term:
+            k_v = k[valid]
+            n_v = n[valid]
+            phi_v = phi[valid]
+            R_v = R[valid]
 
         def neg_ll(w: np.ndarray) -> float:
             p_obs = coef_v @ w
             p_obs = np.clip(p_obs, 1e-15, 1.0)
-            return -float(np.sum(w_obj * np.log(p_obs)))
+            ll_state = float(np.sum(w_obj * np.log(p_obs)))
+            if not use_count_term:
+                return -ll_state
+
+            mu = R_v @ w
+            mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+            ll_count_vec = log_likelihood_per_marker(k_v, n_v, mu, phi_v)
+            ll_count_per_read = ll_count_vec / np.maximum(n_v, 1.0)
+            ll_count = float(np.sum(w_obj * ll_count_per_read))
+            return -(ll_state + self.binarization_count_weight * ll_count)
 
         def neg_grad(w: np.ndarray) -> np.ndarray:
             p_obs = coef_v @ w
             p_obs = np.clip(p_obs, 1e-15, 1.0)
-            # ∂(-log p_i)/∂w_j = -coef[i,j] / p_i
-            # weighted: -ω_i · coef[i,j] / p_i
-            # sum over i: -((ω/p) @ coef)
-            return -((w_obj / p_obs) @ coef_v)
+            grad_state = (w_obj / p_obs) @ coef_v
+            if not use_count_term:
+                return -grad_state
+
+            mu = R_v @ w
+            mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+            grad_count = gradient_w(
+                k_v,
+                n_v,
+                mu,
+                phi_v,
+                R_v,
+                weights=(w_obj / np.maximum(n_v, 1.0)),
+            )
+            return -(grad_state + self.binarization_count_weight * grad_count)
 
         return self._run_slsqp(
             neg_ll, neg_grad, K_total, sample_id=model.sample_id

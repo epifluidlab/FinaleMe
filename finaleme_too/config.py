@@ -50,6 +50,11 @@ class ModelConfig:
     deconvolution: SolverMethod = SolverMethod.MLE
     unknown_component: bool = True  # always on; flag kept for documentation
     fragment_level: str = "auto"  # "auto", "always", "never"
+    # FinaleMe v3 binarization hybrid objective weight:
+    #   logL = logL_state + binarization_count_weight * logL_count
+    # where logL_count is a per-read normalized beta-binomial term.
+    # Set to 0.0 to recover the pure state-only v3 objective.
+    binarization_count_weight: float = 1.0
 
 
 @dataclass
