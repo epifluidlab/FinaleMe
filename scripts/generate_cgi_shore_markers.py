@@ -536,12 +536,52 @@ def stage3_find_markers(args, blocks_path):
         eprint(f'  Sample names now: {fixed_df[name_col].iloc[0]}')
         groups_df = fixed_df
 
-    # Verify group names match beta file names
+    # Verify group names match beta file names.
+    #
+    # CRITICAL: wgbstools find_markers strips ONLY the `.beta` extension
+    # from the beta file basename to get the sample name, then looks for
+    # that name in the groups file. So the groups file names must match
+    # the beta basename minus `.beta` EXACTLY.
+    #
+    # Common naming conventions that cause mismatches:
+    #   hg19: beta = "Sample1.beta"       → wgbstools name = "Sample1"       ✓ matches groups
+    #   hg38: beta = "Sample1.hg38.beta"  → wgbstools name = "Sample1.hg38" ✗ groups says "Sample1"
+    #
+    # We must match using the SINGLE-split basename (what wgbstools sees),
+    # not the double-split one (which would hide the `.hg38` mismatch and
+    # let the user think everything is fine while find_markers silently
+    # produces 0 results).
     group_names = set(groups_df[name_col])
-    beta_basenames = {op.splitext(op.splitext(op.basename(b))[0])[0]
-                      for b in args.betas}
-    matched = group_names & beta_basenames
-    unmatched = group_names - beta_basenames
+    # Single-split: strip .beta only, keeping any genome suffix
+    beta_basenames_wgbstools = {
+        op.splitext(op.basename(b))[0]  # "Sample1.hg38.beta" → "Sample1.hg38"
+        for b in args.betas
+    }
+    matched = group_names & beta_basenames_wgbstools
+
+    if not matched:
+        # Check if appending the genome suffix (.hg38 / .hg19) to the group
+        # names produces a match — this is the most common hg38 naming issue.
+        for suffix in [f'.{args.genome}', '.hg38', '.hg19']:
+            test_names = {n + suffix for n in group_names}
+            test_matched = test_names & beta_basenames_wgbstools
+            if test_matched:
+                eprint(f'  Auto-fixing: appending "{suffix}" to group names to match beta files...')
+                eprint(f'    Group name:    {sorted(group_names)[0]}')
+                eprint(f'    Beta basename: {sorted(beta_basenames_wgbstools)[0]}')
+                eprint(f'    After fix:     {sorted(test_names)[0]}')
+                fixed_groups_path = op.join(args.out_dir, 'groups_genome_suffix_fixed.csv')
+                fixed_df = groups_df.copy()
+                fixed_df[name_col] = fixed_df[name_col] + suffix
+                fixed_df.to_csv(fixed_groups_path, index=False)
+                args.groups = fixed_groups_path
+                groups_df = fixed_df
+                group_names = set(fixed_df[name_col])
+                matched = group_names & beta_basenames_wgbstools
+                eprint(f'  Fixed groups file written: {fixed_groups_path}')
+                break
+
+    unmatched = group_names - beta_basenames_wgbstools
     if unmatched:
         eprint(f'  WARNING: {len(unmatched)} group names not found in beta files:')
         for name in sorted(list(unmatched)[:5]):
@@ -551,11 +591,13 @@ def stage3_find_markers(args, blocks_path):
     if not matched:
         eprint(f'  ERROR: No group names match any beta file!')
         eprint(f'    Group names (first 3): {sorted(list(group_names))[:3]}')
-        eprint(f'    Beta basenames (first 3): {sorted(list(beta_basenames))[:3]}')
-        raise RuntimeError('Groups file names do not match beta file names. '
-                           'The "name" column should contain sample names '
-                           'WITHOUT file extensions (e.g., "Sample1" not '
-                           '"Sample1.pat.gz" or "Sample1.beta").')
+        eprint(f'    Beta basenames (first 3): {sorted(list(beta_basenames_wgbstools))[:3]}')
+        raise RuntimeError(
+            'Groups file names do not match beta file names. '
+            f'wgbstools strips only ".beta" from the filename — if your '
+            f'beta files are named like "Sample.{args.genome}.beta", the '
+            f'groups file "name" column must be "Sample.{args.genome}" '
+            f'(not just "Sample").')
     eprint(f'  Matched samples: {len(matched)}/{len(group_names)}')
 
     # Adaptive threshold relaxation
