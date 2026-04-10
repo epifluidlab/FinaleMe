@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
 """
-Generate CGI+Shore restricted tissue-specific methylation markers for UXM deconvolution.
+Generate CGI+Shore restricted tissue-specific methylation markers and a
+pre-aggregated reference panel for cfDNA tissue-of-origin deconvolution.
 
-This script creates tissue-specific methylation markers restricted to CpG Island (CGI)
-and CGI shore regions (±2kb around CGI), then builds a UXM-compatible atlas for
-tissues-of-origin deconvolution from FinaleMe cfDNA predictions.
+This script creates tissue-specific methylation markers restricted to CpG Island
+(CGI) and CGI shore regions (±2kb around CGI), then builds a reference panel TSV
+that ``finaleme-too run --reference-panel`` and ``BetaValueDeconvolution`` can
+load directly without re-parsing every .beta file at runtime.
 
 Pipeline stages:
   Stage 0: Download reference WGBS data (optional, if not user-provided)
   Stage 1: Generate CGI+shore BED regions
   Stage 2: Generate candidate blocks within CGI+shore
   Stage 3: Find tissue-specific markers with adaptive thresholds
-  Stage 4: Build UXM atlas
+  Stage 4: Build reference panel (per-marker methylated_count/total_count per cell type)
   Stage 5: Generate validation report
 
+The Stage 4 output is a TSV with format:
+
+    chrom  start  end  CellType1     CellType2     ...
+    chr1   1000   1500 125/250       30/250        ...
+
+Each cell value is ``methylated_count/total_count`` aggregated across all
+reference samples in that cell type's group. The downstream loader detects
+this format and produces both a methylation matrix (k/n ratios) and a
+coverage matrix (n values) for reference uncertainty weighting.
+
 Usage:
-  python generate_cgi_shore_markers.py --genome hg19 --num-markers 250 \
-    --out-dir results/ --wgbstools-path /path/to/wgbs_tools \
+  python generate_cgi_shore_markers.py --genome hg19 --num-markers 250 \\
+    --out-dir results/ --wgbstools-path /path/to/wgbs_tools \\
     --uxm-path /path/to/UXM_deconv
 
 Requirements:
   - Python 3.8+ with pandas, numpy, scipy
   - wgbs_tools (https://github.com/nloyfer/wgbs_tools)
-  - UXM_deconv (https://github.com/nloyfer/UXM_deconv)
+  - UXM_deconv (https://github.com/nloyfer/UXM_deconv) [for marker selection only]
   - bedtools (for BED intersection)
+  - finaleme_too (optional; provides faster .beta parsing for Stage 4)
 """
 
 import argparse
@@ -654,52 +667,264 @@ def stage3_find_markers(args, blocks_path):
 
 ###############################################################################
 #                                                                             #
-#   Stage 4: Build UXM Atlas                                                 #
+#   Stage 4: Build Reference Panel                                           #
 #                                                                             #
 ###############################################################################
 
-def stage4_build_atlas(args, markers_path):
-    """Build UXM atlas from markers and reference pat files."""
-    eprint('\n=== Stage 4: Build UXM Atlas ===')
+def stage4_build_reference_panel(args, markers_path):
+    """Build a reference panel TSV from markers and reference .beta files.
 
-    atlas_path = op.join(args.out_dir,
-                         f'Atlas.CGI_shore.U{args.num_markers}.l{args.rlen}.{args.genome}.tsv')
+    The output is a TSV directly consumable by ``finaleme-too run
+    --reference-panel`` and ``BetaValueDeconvolution -refPanel``:
 
-    if op.isfile(atlas_path) and not args.force:
-        eprint(f'  Output exists: {atlas_path}')
-        return atlas_path
+        chrom  start  end  CellType1       CellType2       ...
+        chr1   1000   1500 125/250         30/250          ...
+        chr1   5000   5800 5/180           160/180         ...
 
-    build_py = op.join(args.uxm_path, 'src', 'build.py')
-    if not op.isfile(build_py):
-        raise RuntimeError(f'UXM_deconv build.py not found at {build_py}')
+    Each cell value is ``methylated_count/total_count`` aggregated across
+    all reference samples in that cell type's group. This pre-computed
+    format eliminates the need to reload all .beta files at runtime,
+    which is the dominant startup cost for large reference panels.
 
-    pat_str = ' '.join(args.pats)
+    The downstream loader (``ReferencePanelLoader.load_matrix``) detects
+    the ``k/n`` format and produces both a ``methylation`` matrix
+    (``k/n`` ratios) and a ``coverage`` matrix (``n`` values) that the
+    observation model uses for reference uncertainty weighting (math doc
+    §2.4).
+    """
+    eprint('\n=== Stage 4: Build Reference Panel ===')
 
-    cmd = (f'python3 {build_py} '
-           f'--markers {markers_path} '
-           f'--groups {args.groups} '
-           f'--pats {pat_str} '
-           f'--output {atlas_path} '
-           f'-l {args.rlen} '
-           f'--use_um')  # Use both U and M directions
-    if args.threads:
-        cmd += f' -@ {args.threads}'
-    if args.verbose:
-        cmd += ' -v'
+    panel_path = op.join(args.out_dir,
+                         f'ReferencePanel.CGI_shore.U{args.num_markers}.{args.genome}.tsv')
 
-    eprint(f'  Building atlas...')
-    run_cmd(cmd, verbose=args.verbose)
+    if op.isfile(panel_path) and not args.force:
+        eprint(f'  Output exists: {panel_path}')
+        return panel_path
 
-    # Validate atlas format
-    if op.isfile(atlas_path):
-        atlas_df = pd.read_csv(atlas_path, sep='\t', nrows=5)
-        eprint(f'  Atlas created: {atlas_path}')
-        eprint(f'  Shape: {atlas_df.shape[0]}+ markers x {atlas_df.shape[1]} columns')
-        eprint(f'  Cell types: {list(atlas_df.columns[8:])}')
-    else:
-        eprint(f'  WARNING: Atlas file not created!')
+    # Load marker regions
+    markers_df = pd.read_csv(markers_path, sep='\t')
+    chr_col = '#chr' if '#chr' in markers_df.columns else 'chr'
+    if chr_col not in markers_df.columns:
+        raise RuntimeError(f'Markers file missing chromosome column; '
+                           f'columns: {list(markers_df.columns)}')
 
-    return atlas_path
+    marker_chroms = markers_df[chr_col].to_numpy(dtype=str)
+    marker_starts = markers_df['start'].to_numpy(dtype=np.int64)
+    marker_ends = markers_df['end'].to_numpy(dtype=np.int64)
+    n_markers = len(markers_df)
+    eprint(f'  Marker regions: {n_markers}')
+
+    # Build a MarkerRegions-like struct for the .beta reader
+    # (we import lazily to avoid a hard dependency on the finaleme_too
+    # package in the standalone script)
+    try:
+        from finaleme_too.io.marker_regions import MarkerRegions
+        from finaleme_too.io.reference_panel import (
+            _beta_basename_to_sample_name,
+            _load_beta_file_to_markers,
+            _load_groups_file,
+            load_cpg_index,
+        )
+        marker_regions = MarkerRegions(
+            chrom=marker_chroms,
+            start=marker_starts,
+            end=marker_ends,
+            marker_name=None,
+        )
+        has_finaleme_too = True
+    except ImportError:
+        has_finaleme_too = False
+
+    if not has_finaleme_too:
+        eprint('  WARNING: finaleme_too not installed — using fallback .beta parser.')
+        eprint('  Install finaleme_too for faster, validated .beta parsing.')
+        return _stage4_fallback_slow(args, markers_df, chr_col, panel_path)
+
+    # Load CpG index
+    cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
+                             'CpG.bed.gz')
+    if not op.isfile(cpg_index_path):
+        # Try alternate location
+        cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
+                                 'CpG.bed')
+    if not op.isfile(cpg_index_path):
+        raise RuntimeError(f'CpG index not found at {cpg_index_path}. '
+                           f'Run wgbstools init to create it.')
+    eprint(f'  CpG index: {cpg_index_path}')
+    cpg_index = load_cpg_index(cpg_index_path)
+
+    # Load groups
+    groups_df = _load_groups_file(args.groups)
+    groups_df['name_stripped'] = (
+        groups_df['name'].astype(str)
+        .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
+    )
+    sample_to_group = dict(zip(groups_df['name_stripped'], groups_df['group']))
+    cell_types = sorted(set(groups_df['group']))
+    ct_to_index = {c: i for i, c in enumerate(cell_types)}
+    n_ct = len(cell_types)
+    eprint(f'  Cell types: {n_ct} — {cell_types}')
+
+    # Aggregate per-marker (methylated, total) counts per cell type
+    agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
+    agg_total = np.zeros((n_markers, n_ct), dtype=np.int64)
+    n_matched = 0
+
+    for beta_path_str in args.betas:
+        beta_path = Path(beta_path_str)
+        sample_name = _beta_basename_to_sample_name(beta_path)
+        group = sample_to_group.get(sample_name)
+        if group is None:
+            continue
+        ci = ct_to_index[group]
+        counts = _load_beta_file_to_markers(beta_path, marker_regions, cpg_index)
+        agg_methy[:, ci] += counts[:, 0]
+        agg_total[:, ci] += counts[:, 1]
+        n_matched += 1
+
+    eprint(f'  Matched beta files: {n_matched}/{len(args.betas)}')
+
+    if n_matched == 0:
+        eprint('  ERROR: No beta files matched the groups file!')
+        raise RuntimeError('No beta files matched — check groups file sample names.')
+
+    # Build the output DataFrame
+    out_df = pd.DataFrame({
+        'chrom': marker_chroms,
+        'start': marker_starts,
+        'end': marker_ends,
+    })
+    for ci, ct in enumerate(cell_types):
+        # Format as "methylated_count/total_count"
+        col_values = []
+        for mi in range(n_markers):
+            col_values.append(f'{agg_methy[mi, ci]}/{agg_total[mi, ci]}')
+        out_df[ct] = col_values
+
+    out_df.to_csv(panel_path, sep='\t', index=False)
+
+    eprint(f'  Reference panel written: {panel_path}')
+    eprint(f'  Shape: {n_markers} markers x {n_ct} cell types')
+    eprint(f'  Format: methylated_count/total_count per cell')
+    eprint(f'  Usage:')
+    eprint(f'    finaleme-too run --reference-panel {panel_path} ...')
+    eprint(f'    BetaValueDeconvolution -refPanel {panel_path} ...')
+
+    return panel_path
+
+
+def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
+    """Fallback .beta parser when finaleme_too is not installed.
+
+    Reads each .beta file as raw binary (uint8 pairs), looks up CpG
+    positions from the wgbstools CpG index, and aggregates to marker
+    regions with a double binary search. Much slower than the finaleme_too
+    version (no numpy vectorization of the CpG index) but works without
+    the package installed.
+    """
+    eprint('  [fallback] Loading CpG index...')
+    cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
+                             'CpG.bed.gz')
+    if not op.isfile(cpg_index_path):
+        cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
+                                 'CpG.bed')
+    if not op.isfile(cpg_index_path):
+        raise RuntimeError(f'CpG index not found at {cpg_index_path}')
+
+    # Load CpG positions per chromosome
+    chr_positions = defaultdict(list)
+    opener = gzip.open if cpg_index_path.endswith('.gz') else open
+    with opener(cpg_index_path, 'rt') as fh:
+        for line in fh:
+            if not line.strip() or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                try:
+                    chr_positions[parts[0]].append(int(parts[1]))
+                except ValueError:
+                    continue
+    chr_arrays = {c: np.array(sorted(set(v)), dtype=np.int64)
+                  for c, v in chr_positions.items()}
+    chr_offsets = {}
+    total = 0
+    for c in sorted(chr_arrays.keys()):
+        chr_offsets[c] = total
+        total += len(chr_arrays[c])
+    eprint(f'  [fallback] CpG sites: {total:,}')
+
+    # Load groups
+    groups_df = pd.read_csv(args.groups)
+    name_col = 'name' if 'name' in groups_df.columns else groups_df.columns[0]
+    groups_df['name_stripped'] = (
+        groups_df[name_col].astype(str)
+        .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
+    )
+    sample_to_group = dict(zip(groups_df['name_stripped'], groups_df['group']))
+    cell_types = sorted(set(groups_df['group']))
+    ct_to_index = {c: i for i, c in enumerate(cell_types)}
+
+    marker_chroms = markers_df[chr_col].to_numpy(dtype=str)
+    marker_starts = markers_df['start'].to_numpy(dtype=np.int64)
+    marker_ends = markers_df['end'].to_numpy(dtype=np.int64)
+    n_markers = len(markers_df)
+    n_ct = len(cell_types)
+    agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
+    agg_total = np.zeros((n_markers, n_ct), dtype=np.int64)
+    n_matched = 0
+
+    for beta_path_str in args.betas:
+        beta_path = Path(beta_path_str)
+        name = beta_path.name
+        for ext in ('.beta', '.lbeta'):
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+                break
+        group = sample_to_group.get(name)
+        if group is None:
+            continue
+        ci = ct_to_index[group]
+
+        with open(beta_path, 'rb') as fh:
+            data = np.frombuffer(fh.read(), dtype=np.uint8)
+        per_cpg = data.reshape((-1, 2)).astype(np.int64)
+
+        for mi in range(n_markers):
+            chrom = str(marker_chroms[mi])
+            start = int(marker_starts[mi])
+            end = int(marker_ends[mi])
+            positions = chr_arrays.get(chrom)
+            offset = chr_offsets.get(chrom)
+            if positions is None or offset is None:
+                continue
+            lo = int(np.searchsorted(positions, start, side='left'))
+            hi = int(np.searchsorted(positions, end, side='left'))
+            if hi <= lo:
+                continue
+            global_lo = offset + lo
+            global_hi = min(offset + hi, total, per_cpg.shape[0])
+            if global_lo >= global_hi:
+                continue
+            block = per_cpg[global_lo:global_hi]
+            agg_methy[mi, ci] += int(block[:, 0].sum())
+            agg_total[mi, ci] += int(block[:, 1].sum())
+        n_matched += 1
+
+    eprint(f'  [fallback] Matched beta files: {n_matched}/{len(args.betas)}')
+
+    out_df = pd.DataFrame({
+        'chrom': marker_chroms,
+        'start': marker_starts,
+        'end': marker_ends,
+    })
+    for ci, ct in enumerate(cell_types):
+        col_values = [f'{agg_methy[mi, ci]}/{agg_total[mi, ci]}'
+                      for mi in range(n_markers)]
+        out_df[ct] = col_values
+
+    out_df.to_csv(panel_path, sep='\t', index=False)
+    eprint(f'  [fallback] Reference panel written: {panel_path}')
+    return panel_path
 
 
 ###############################################################################
@@ -709,7 +934,7 @@ def stage4_build_atlas(args, markers_path):
 ###############################################################################
 
 def stage5_validation_report(args, cgi_shore_bed, blocks_path, markers_path,
-                             atlas_path):
+                             panel_path):
     """Generate validation report."""
     eprint('\n=== Stage 5: Validation Report ===')
 
@@ -786,15 +1011,19 @@ def stage5_validation_report(args, cgi_shore_bed, blocks_path, markers_path,
         lines.append(f'  Original markers file not found at {orig_markers_path}')
     lines.append('')
 
-    # Atlas info
-    lines.append('--- Atlas ---')
-    if op.isfile(atlas_path):
-        atlas_df = pd.read_csv(atlas_path, sep='\t')
-        lines.append(f'Atlas shape: {atlas_df.shape[0]} markers x '
-                     f'{atlas_df.shape[1] - 8} cell types')
-        lines.append(f'Atlas file: {atlas_path}')
+    # Reference panel info
+    lines.append('--- Reference Panel ---')
+    if op.isfile(panel_path):
+        panel_df = pd.read_csv(panel_path, sep='\t', nrows=5)
+        n_ct = panel_df.shape[1] - 3  # subtract chrom, start, end
+        lines.append(f'Reference panel: {panel_path}')
+        lines.append(f'Format: methylated_count/total_count per cell type')
+        lines.append(f'Cell types ({n_ct}): {list(panel_df.columns[3:])}')
+        # Count total markers by reading just the row count
+        full_panel = pd.read_csv(panel_path, sep='\t', usecols=[0])
+        lines.append(f'Markers: {len(full_panel)}')
     else:
-        lines.append('  Atlas file not found!')
+        lines.append('  Reference panel file not found!')
     lines.append('')
 
     lines.append('=' * 70)
@@ -934,18 +1163,20 @@ def main():
     # Stage 3: Find tissue-specific markers
     markers_path = stage3_find_markers(args, blocks_path)
 
-    # Stage 4: Build UXM atlas
-    atlas_path = stage4_build_atlas(args, markers_path)
+    # Stage 4: Build reference panel
+    panel_path = stage4_build_reference_panel(args, markers_path)
 
     # Stage 5: Validation report
     stage5_validation_report(args, cgi_shore_bed, blocks_path,
-                            markers_path, atlas_path)
+                            markers_path, panel_path)
 
     eprint('\n' + '=' * 70)
     eprint('Pipeline complete!')
     eprint(f'  Markers: {markers_path}')
-    eprint(f'  Atlas: {atlas_path}')
-    eprint(f'  Use with: uxm deconv -a {atlas_path} sample.pat.gz')
+    eprint(f'  Reference panel: {panel_path}')
+    eprint(f'  Use with:')
+    eprint(f'    finaleme-too run --reference-panel {panel_path} \\')
+    eprint(f'      --marker-regions {markers_path} ...')
     eprint('=' * 70)
 
 
