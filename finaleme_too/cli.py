@@ -90,6 +90,16 @@ def main() -> None:
     ">= tau_high => M. Disables Ambiguous calls.",
 )
 @click.option(
+    "--binarizeUseAllBins",
+    "--binarize-use-all-bins",
+    "binarize_use_all_bins",
+    is_flag=True,
+    default=False,
+    help="Only for --binarizeThresholdFromParams mode. By default only bins "
+    "marked usable in the JSON participate; set this flag to force use of "
+    "all bins' learned thresholds.",
+)
+@click.option(
     "--binarization-model",
     "binarization_model",
     default=None,
@@ -167,6 +177,7 @@ def run_cmd(
     binarize_threshold: float | None,
     binarize_mismatch_tolerance: float,
     binarize_threshold_from_params: bool,
+    binarize_use_all_bins: bool,
     binarization_model: str | None,
     hierarchical_call_weight: float | None,
     hierarchical_quadrature_points: int | None,
@@ -384,6 +395,11 @@ def run_cmd(
                     "Ignoring --binarizeThresholdFromParams because "
                     "--binarizeThreshold was provided."
                 )
+            if binarize_use_all_bins:
+                log.warning(
+                    "Ignoring --binarizeUseAllBins because "
+                    "--binarizeThreshold was provided."
+                )
             from finaleme_too.preprocessing.binarization import (
                 build_identity_placeholder_params,
             )
@@ -418,6 +434,11 @@ def run_cmd(
                     "params JSON is available; this run will proceed without "
                     "FinaleMe binarization."
                 )
+            if binarize_use_all_bins and not binarize_threshold_from_params:
+                log.warning(
+                    "Ignoring --binarizeUseAllBins because "
+                    "--binarizeThresholdFromParams was not provided."
+                )
         region_annotations = load_optional_region_annotations(config, region_annotation)
     _mark_stage("finaleme_aux_inputs", t0, skipped=not has_finaleme)
 
@@ -431,6 +452,7 @@ def run_cmd(
         binarization=binarization_params,
         binarize_threshold=binarize_threshold,
         binarize_threshold_from_params=binarize_threshold_from_params,
+        binarize_use_all_bins=binarize_use_all_bins,
         region_annotations=region_annotations,
         group_comparison_spec=effective_group_comparison,
         cpg_index=cpg_idx,

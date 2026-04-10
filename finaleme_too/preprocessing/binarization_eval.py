@@ -99,9 +99,8 @@ def fit_binarization_bin(
     ``n_markers_U ≥ min_markers_per_state`` AND
     ``n_markers_M ≥ min_markers_per_state``.
 
-    When the bin has < ``min_markers_per_state`` total or no valid
-    ground-truth states, returns a fallback dict marked ``usable=False``
-    with placeholder thresholds.
+    When the bin has < ``min_markers_per_state`` total valid rows, returns a
+    fallback dict marked ``usable=False`` with placeholder thresholds.
     """
     predicted = np.asarray(predicted, dtype=np.float64)
     truth_beta = np.asarray(truth_beta, dtype=np.float64)
@@ -109,12 +108,7 @@ def fit_binarization_bin(
     predicted = predicted[valid]
     truth_beta = truth_beta[valid]
 
-    # Binarize ground truth (WGBS) at the canonical 0.2 / 0.8 thresholds
-    # (math doc §6.2 / §2B.2).
-    true_U = truth_beta < 0.2
-    true_M = truth_beta > 0.8
-
-    if predicted.size < min_markers_per_state or (int(np.sum(true_U)) == 0 and int(np.sum(true_M)) == 0):
+    if predicted.size < min_markers_per_state:
         return {
             "tau_low": 0.2,
             "tau_high": 0.8,
@@ -131,6 +125,13 @@ def fit_binarization_bin(
     # Grid-search the (τ_low, τ_high) pair maximizing classification accuracy
     # on non-ambiguous calls (math doc §6.2). We require
     # ``tau_low < tau_high`` so Ambiguous is a real category.
+    #
+    # WGBS truth is re-thresholded at each candidate (tau_low, tau_high):
+    #   true_U := truth_beta < tau_low
+    #   true_M := truth_beta > tau_high
+    #
+    # This keeps error-rate estimation and usability gating aligned with the
+    # learned bin-specific cutoffs.
     best_acc = -1.0
     best_tau_l = float(tau_low_grid[0])
     best_tau_h = float(tau_high_grid[-1])
@@ -140,6 +141,8 @@ def fit_binarization_bin(
                 continue
             called_U = predicted < tau_l
             called_M = predicted > tau_h
+            true_U = truth_beta < tau_l
+            true_M = truth_beta > tau_h
             n_called = int(np.sum(called_U) + np.sum(called_M))
             if n_called == 0:
                 continue
@@ -150,9 +153,12 @@ def fit_binarization_bin(
                 best_tau_l = float(tau_l)
                 best_tau_h = float(tau_h)
 
-    # At optimal thresholds, compute error rates and marker counts.
+    # At optimal thresholds, compute error rates and marker counts using the
+    # same learned thresholds on both FinaleMe calls and WGBS truth.
     called_U = predicted < best_tau_l
     called_M = predicted > best_tau_h
+    true_U = truth_beta < best_tau_l
+    true_M = truth_beta > best_tau_h
     n_U = int(np.sum(called_U))
     n_M = int(np.sum(called_M))
     n_called = n_U + n_M

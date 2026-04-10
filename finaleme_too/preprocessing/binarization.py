@@ -429,6 +429,7 @@ def apply_binarization(
     region_annotations: pd.DataFrame | None = None,
     hard_threshold: float | None = None,
     learned_threshold_from_params: bool = False,
+    learned_threshold_use_all_bins: bool = False,
 ) -> MarkerObservations:
     """Apply a trained binarization model to one sample's observations.
 
@@ -456,8 +457,13 @@ def apply_binarization(
         ``hard_threshold`` is None), each marker uses its learned
         ``tau_high`` from ``params`` as a binary cutoff:
         ``predicted_beta < tau_high -> U`` and
-        ``predicted_beta >= tau_high -> M`` for usable bins.
+        ``predicted_beta >= tau_high -> M``.
+        By default only bins with ``params.usable=True`` are used; set
+        ``learned_threshold_use_all_bins=True`` to force using all bins.
         Ambiguous calls are disabled in this mode.
+    learned_threshold_use_all_bins
+        Only used with ``learned_threshold_from_params=True``. When True,
+        includes bins marked unusable in ``params.usable`` for binary calls.
 
     Returns
     -------
@@ -536,10 +542,16 @@ def apply_binarization(
     elif learned_threshold_from_params:
         # Per-bin learned-threshold mode: no Ambiguous state. Uses each
         # marker's context-bin learned tau_high as the M cutoff.
-        u_mask = usable_per & finite & (pred < tau_high_per)
-        called_state[u_mask] = STATE_U
-        m_mask = usable_per & finite & (pred >= tau_high_per)
-        called_state[m_mask] = STATE_M
+        if learned_threshold_use_all_bins:
+            u_mask = finite & (pred < tau_high_per)
+            called_state[u_mask] = STATE_U
+            m_mask = finite & (pred >= tau_high_per)
+            called_state[m_mask] = STATE_M
+        else:
+            u_mask = usable_per & finite & (pred < tau_high_per)
+            called_state[u_mask] = STATE_U
+            m_mask = usable_per & finite & (pred >= tau_high_per)
+            called_state[m_mask] = STATE_M
     else:
         # U call
         u_mask = usable_per & finite & (pred < tau_low_per)

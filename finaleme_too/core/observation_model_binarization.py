@@ -241,6 +241,7 @@ class BinarizationModel:
         binarization_model: str = "legacy",
         call_weight_override: float | None = None,
         learned_threshold_from_params: bool = False,
+        learned_threshold_use_all_bins: bool = False,
     ):
         # Optional universal hard threshold used by
         # ``finaleme-too run --binarizeThreshold``.
@@ -248,6 +249,7 @@ class BinarizationModel:
         self.binarization_model = str(binarization_model or "legacy").lower()
         self.call_weight_override = call_weight_override
         self.learned_threshold_from_params = bool(learned_threshold_from_params)
+        self.learned_threshold_use_all_bins = bool(learned_threshold_use_all_bins)
 
     def build(
         self,
@@ -272,6 +274,9 @@ class BinarizationModel:
         #   legacy       -> called U/M and usable
         #   hierarchical -> any non-excluded call (U/M/A) and usable
         usable_mask = binarization.usable[context_bin]
+        if self.learned_threshold_from_params and self.learned_threshold_use_all_bins:
+            # Optional threshold-from-params "all bins" mode.
+            usable_mask = np.ones_like(usable_mask, dtype=bool)
         if self.binarization_model == "hierarchical":
             called_valid = called_state != STATE_EXCLUDED
         else:

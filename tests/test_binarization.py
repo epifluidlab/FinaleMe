@@ -302,6 +302,50 @@ def test_apply_binarization_respects_usable_flag():
     assert binarized.called_state[2] == STATE_EXCLUDED
 
 
+def test_apply_binarization_learned_threshold_respects_usable_by_default():
+    """Threshold-from-params mode uses usable bins by default."""
+    params = build_identity_placeholder_params()
+    # open_sea bin (6) is where NaN density markers route by default.
+    params.usable[6] = False
+    params.tau_high[6] = 0.40
+
+    pred = np.array([0.30, 0.50, np.nan], dtype=np.float32)
+    obs = _mk_obs("s1", pred)
+    out = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        learned_threshold_from_params=True,
+    )
+
+    assert out.context_bin.tolist() == [6, 6, 6]
+    assert out.called_state[0] == STATE_EXCLUDED
+    assert out.called_state[1] == STATE_EXCLUDED
+    assert out.called_state[2] == STATE_EXCLUDED
+
+
+def test_apply_binarization_learned_threshold_use_all_bins_includes_unusable():
+    """Threshold-from-params mode can opt in to use all bins."""
+    params = build_identity_placeholder_params()
+    params.usable[6] = False
+    params.tau_high[6] = 0.40
+
+    pred = np.array([0.30, 0.50, np.nan], dtype=np.float32)
+    obs = _mk_obs("s1", pred)
+    out = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        learned_threshold_from_params=True,
+        learned_threshold_use_all_bins=True,
+    )
+
+    assert out.context_bin.tolist() == [6, 6, 6]
+    assert out.called_state[0] == STATE_U
+    assert out.called_state[1] == STATE_M
+    assert out.called_state[2] == STATE_EXCLUDED
+
+
 def test_apply_binarization_with_no_region_annotation_does_not_crash():
     """Regression: apply_binarization with region_annotations=None must
     produce a valid output (NaN density → open_sea fallback)."""
@@ -421,6 +465,27 @@ def test_fit_binarization_bin_marks_unusable_when_signal_is_poor():
     pred = rng.uniform(0.0, 1.0, size=n)    # random
     fit = fit_binarization_bin(pred, truth)
     assert fit["usable"] is False
+
+
+def test_fit_binarization_bin_uses_learned_thresholds_for_wgbs_truth():
+    """Regression: WGBS truth states should be re-thresholded by the learned
+    (tau_low, tau_high), not fixed at 0.2/0.8."""
+    rng = np.random.default_rng(123)
+    n = 400
+    # All truths are outside the legacy 0.2/0.8 truth zones:
+    # old behavior would have yielded no valid truth states.
+    truth = np.concatenate([
+        np.full(n // 2, 0.25),  # should map to U if tau_low > 0.25
+        np.full(n // 2, 0.75),  # should map to M if tau_high < 0.75
+    ])
+    pred = np.clip(truth + rng.normal(0, 0.01, size=n), 0.0, 1.0)
+
+    fit = fit_binarization_bin(pred, truth)
+    # Old behavior (fixed WGBS 0.2/0.8 truth) would trigger an early fallback
+    # with n_markers_U=n_markers_M=0 and eps_U=eps_M=0.5.
+    assert fit["n_total"] == n
+    assert fit["n_markers_U"] + fit["n_markers_M"] > 0
+    assert not (fit["eps_U"] == 0.5 and fit["eps_M"] == 0.5)
 
 
 def test_fit_binarization_bin_handles_empty_input():
@@ -873,6 +938,63 @@ def test_binarization_model_learned_threshold_reference_binarization_per_bin():
     # row0 threshold=0.20 => 0.30 -> 1
     # row1 threshold=0.80 => 0.30 -> 0
     np.testing.assert_array_equal(model.reference_binary[:, 0], np.array([1.0, 0.0]))
+
+
+def test_binarization_model_learned_threshold_respects_usable_by_default():
+    """By default, threshold-from-params mode still drops unusable bins."""
+    params = build_identity_placeholder_params()
+    # NaN-density fallback routes to open_sea bin 6; mark it unusable.
+    params.usable[6] = False
+    params.tau_high[6] = 0.40
+
+    reference = ReferencePanel(
+        chrom=np.array(["chr1", "chr1"], dtype=object),
+        start=np.array([1000, 2000], dtype=np.int64),
+        end=np.array([1100, 2100], dtype=np.int64),
+        cell_types=["CT0"],
+        methylation=np.array([[0.30], [0.30]], dtype=np.float32),
+        coverage=None,
+    )
+    obs = _mk_obs("s1", np.array([0.30, 0.50], dtype=np.float32))
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        learned_threshold_from_params=True,
+    )
+    model = BinarizationModel(learned_threshold_from_params=True).build(
+        binarized, params, reference
+    )
+    assert model.n_markers == 0
+
+
+def test_binarization_model_learned_threshold_use_all_bins_keeps_unusable():
+    """Opt-in all-bins mode should keep markers from bins marked unusable."""
+    params = build_identity_placeholder_params()
+    params.usable[6] = False
+    params.tau_high[6] = 0.40
+
+    reference = ReferencePanel(
+        chrom=np.array(["chr1", "chr1"], dtype=object),
+        start=np.array([1000, 2000], dtype=np.int64),
+        end=np.array([1100, 2100], dtype=np.int64),
+        cell_types=["CT0"],
+        methylation=np.array([[0.30], [0.30]], dtype=np.float32),
+        coverage=None,
+    )
+    obs = _mk_obs("s1", np.array([0.30, 0.50], dtype=np.float32))
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=None,
+        learned_threshold_from_params=True,
+        learned_threshold_use_all_bins=True,
+    )
+    model = BinarizationModel(
+        learned_threshold_from_params=True,
+        learned_threshold_use_all_bins=True,
+    ).build(binarized, params, reference)
+    assert model.n_markers == 2
 
 
 def test_binarization_model_raises_when_no_binarization_applied():

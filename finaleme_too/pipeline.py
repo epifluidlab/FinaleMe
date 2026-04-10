@@ -114,6 +114,7 @@ class TOOPipeline:
         binarization=None,  # BinarizationParams | None — v3 FinaleMe path
         binarize_threshold: float | None = None,  # universal hard threshold mode
         binarize_threshold_from_params: bool = False,  # per-bin tau_high mode
+        binarize_use_all_bins: bool = False,  # include unusable bins in tau_high mode
     ):
         from finaleme_too.config import SolverMethod
         from finaleme_too.core.observation_model_binarization import BinarizationModel
@@ -130,6 +131,7 @@ class TOOPipeline:
         else:
             self.binarize_threshold = None
         self.binarize_threshold_from_params = bool(binarize_threshold_from_params)
+        self.binarize_use_all_bins = bool(binarize_use_all_bins)
         self.region_annotations = region_annotations
         self._region_annotation_lookup: pd.DataFrame | None = None
         self.group_comparison_spec = group_comparison_spec
@@ -148,6 +150,7 @@ class TOOPipeline:
             binarization_model=config.model.binarization_model,
             call_weight_override=config.model.hierarchical_call_weight,
             learned_threshold_from_params=self.binarize_threshold_from_params,
+            learned_threshold_use_all_bins=self.binarize_use_all_bins,
         )
 
         # Decouple uncertainty source from the point-estimate solver.
@@ -772,6 +775,7 @@ class TOOPipeline:
             ),
             hard_threshold=self.binarize_threshold,
             learned_threshold_from_params=self.binarize_threshold_from_params,
+            learned_threshold_use_all_bins=self.binarize_use_all_bins,
         )
 
     # Backwards-compat aliases so any stale caller finding the old method
