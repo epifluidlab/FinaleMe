@@ -40,7 +40,8 @@ public class BetaValueDeconvolution {
     @Option(name = "-markerRegions", usage = "Pre-defined marker regions file (atlas TSV or BED with startCpG/endCpG). "
             + "Uses these regions instead of tiling CGI+shore into windows. "
             + "Skips window generation and variability filtering. "
-            + "Still requires -refBetas and -refGroups to compute actual methylation levels.")
+            + "If the file contains embedded per-cell-type values (e.g., count ratios), "
+            + "it can be used directly without -refBetas/-refGroups.")
     public String markerRegionsFile = null;
 
     @Option(name = "-cgiShoreRegions", usage = "CGI+shore BED file (chr, start, end). Required unless -markerRegions is used.")
@@ -90,7 +91,7 @@ public class BetaValueDeconvolution {
 
     private static final String USAGE =
             "BetaValueDeconvolution [opts] "
-                    + "{-refPanel <TSV> | -refBetas <betas> -refGroups <CSV> -cpgIndex <BED>} "
+                    + "{-refPanel <TSV> | (-markerRegions with embedded values) | -refBetas <betas> -refGroups <CSV>} "
                     + "{-markerRegions <TSV/BED> | -cgiShoreRegions <BED>} "
                     + "sample1.beta [sample2.prediction.bed.gz ...]";
 
@@ -176,15 +177,14 @@ public class BetaValueDeconvolution {
             return;
         }
 
-        // Validate: need either -refPanel or (-refBetas + -refGroups + -cpgIndex)
+        // Validate top-level mode.
         boolean useRefPanel = (refPanelFile != null);
-        if (!useRefPanel) {
-            if (refBetasArg == null || refGroupsFile == null || cpgIndexFile == null) {
-                System.err.println("Error: provide either -refPanel <TSV> or "
-                        + "-refBetas <betas> -refGroups <CSV> -cpgIndex <BED>.");
-                System.err.println(USAGE);
-                return;
-            }
+        boolean haveRefBetasAndGroups = (refBetasArg != null && refGroupsFile != null);
+        boolean haveOneOfRefInputs = (refBetasArg != null || refGroupsFile != null);
+        if (haveOneOfRefInputs && !haveRefBetasAndGroups) {
+            System.err.println("Error: provide both -refBetas and -refGroups together.");
+            System.err.println(USAGE);
+            return;
         }
 
         // Validate mode: either -markerRegions or -cgiShoreRegions
@@ -228,25 +228,40 @@ public class BetaValueDeconvolution {
             }
 
         } else {
-            // ===== Legacy mode: load .beta files + groups =====
-
-            // Load reference beta files and groups
-            List<String> refBetaPaths = parseRefBetas(refBetasArg);
-            Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
-            log.info("Loaded {} reference beta files, {} groups",
-                    refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
-            cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
-
             if (markerRegionsFile != null) {
-                // ===== Marker regions mode: use pre-defined regions as markers =====
-                log.info("Marker regions mode: loading regions from {}", markerRegionsFile);
-                selectedWindows = loadMarkerRegions(markerRegionsFile);
-                log.info("Loaded {} marker regions", selectedWindows.size());
+                // ===== Marker regions mode =====
+                double[][] refMatrix;
+                if (haveRefBetasAndGroups) {
+                    // Legacy behavior: compute reference from .beta files.
+                    List<String> refBetaPaths = parseRefBetas(refBetasArg);
+                    Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
+                    log.info("Loaded {} reference beta files, {} groups",
+                            refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
+                    cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
 
-                // Compute actual methylation from reference .beta files at these regions
-                log.info("Computing reference methylation at marker regions (mode: {})...", replicateMode);
-                double[][] refMatrix = loadReferenceMethylation(
-                        refBetaPaths, sampleToGroup, cellTypes, selectedWindows, cpgIndex);
+                    log.info("Marker regions mode: loading regions from {}", markerRegionsFile);
+                    selectedWindows = loadMarkerRegions(markerRegionsFile);
+                    log.info("Loaded {} marker regions", selectedWindows.size());
+
+                    log.info("Computing reference methylation at marker regions (mode: {})...", replicateMode);
+                    refMatrix = loadReferenceMethylation(
+                            refBetaPaths, sampleToGroup, cellTypes, selectedWindows, cpgIndex);
+                } else {
+                    // New behavior: if marker atlas has embedded values, use directly.
+                    log.info("Marker regions mode: trying embedded reference values from {}", markerRegionsFile);
+                    Object[] panelData = loadReferencePanel(markerRegionsFile, cpgIndex);
+                    selectedWindows = (List<Window>) panelData[0];
+                    refMatrix = (double[][]) panelData[1];
+                    cellTypes = (List<String>) panelData[2];
+                    if (cellTypes == null || cellTypes.isEmpty()) {
+                        System.err.println("Error: -markerRegions file has no embedded cell-type value columns. "
+                                + "Provide -refBetas/-refGroups or a marker atlas with per-cell-type values.");
+                        System.err.println(USAGE);
+                        return;
+                    }
+                    log.info("Embedded marker atlas reference: {} markers x {} cell types",
+                            selectedWindows.size(), cellTypes.size());
+                }
 
                 // Binarize reference
                 refSelected = new double[selectedWindows.size()][cellTypes.size()];
@@ -259,6 +274,17 @@ public class BetaValueDeconvolution {
 
             } else {
                 // ===== Original mode: tile CGI+shore, filter by variability =====
+                if (!haveRefBetasAndGroups) {
+                    System.err.println("Error: -cgiShoreRegions mode requires -refBetas and -refGroups.");
+                    System.err.println(USAGE);
+                    return;
+                }
+                List<String> refBetaPaths = parseRefBetas(refBetasArg);
+                Map<String, String> sampleToGroup = loadGroupsFile(refGroupsFile);
+                log.info("Loaded {} reference beta files, {} groups",
+                        refBetaPaths.size(), new HashSet<>(sampleToGroup.values()).size());
+                cellTypes = new ArrayList<>(new TreeSet<>(sampleToGroup.values()));
+
                 log.info("Generating {}bp windows within CGI+shore regions...", windowSize);
                 List<Window> windows = generateWindows(cgiShoreBed, cpgIndex);
                 log.info("Generated {} windows", windows.size());
@@ -411,6 +437,19 @@ public class BetaValueDeconvolution {
      *   [1] refMatrix — (nMarkers x nCellTypes) methylation matrix
      *   [2] cellTypes — ordered list of cell type names from the header
      */
+    private int findHeaderColumnIndex(String[] header, String... names) {
+        Set<String> target = new HashSet<>();
+        for (String n : names) {
+            target.add(n.toLowerCase(Locale.ROOT));
+        }
+        for (int i = 0; i < header.length; i++) {
+            String h = header[i].trim().toLowerCase(Locale.ROOT);
+            if (h.startsWith("#")) h = h.substring(1);
+            if (target.contains(h)) return i;
+        }
+        return -1;
+    }
+
     private Object[] loadReferencePanel(String path, CpgIndex cpgIndex) throws IOException {
         BufferedReader br;
         if (path.endsWith(".gz")) {
@@ -428,6 +467,14 @@ public class BetaValueDeconvolution {
         int skippedDuplicate = 0;
         int skippedNoCpg = 0;
         int parsedRows = 0;
+        int coordParseErrors = 0;
+
+        int chrCol = 0;
+        int startCol = 1;
+        int endCol = 2;
+        int startCpgCol = -1;
+        int endCpgCol = -1;
+        int firstValueCol = 3;
 
         try {
             String line;
@@ -439,27 +486,55 @@ public class BetaValueDeconvolution {
                 String[] parts = line.split("\t");
 
                 if (first) {
-                    // Header row: chrom start end CellType1 CellType2 ...
+                    // Header row: either panel-style (chrom/start/end/...) or
+                    // atlas-style (chr/start/end/startCpG/endCpG/target/name/direction/...).
                     first = false;
                     // Check if first column is numeric (headerless BED) or a label
                     try {
                         Integer.parseInt(parts[1]);
                         // Looks numeric → no header, parse as data
                     } catch (NumberFormatException e) {
-                        // Has a header — extract cell type names and skip
+                        // Header present: detect coordinate and value columns.
+                        int tmpChr = findHeaderColumnIndex(parts, "chrom", "chr", "#chr");
+                        int tmpStart = findHeaderColumnIndex(parts, "start");
+                        int tmpEnd = findHeaderColumnIndex(parts, "end");
+                        if (tmpChr >= 0 && tmpStart >= 0 && tmpEnd >= 0) {
+                            chrCol = tmpChr;
+                            startCol = tmpStart;
+                            endCol = tmpEnd;
+                        }
+
+                        startCpgCol = findHeaderColumnIndex(parts, "startcpg", "start_cpg");
+                        endCpgCol = findHeaderColumnIndex(parts, "endcpg", "end_cpg");
+                        int directionCol = findHeaderColumnIndex(parts, "direction");
+                        if (directionCol >= 0 && directionCol + 1 < parts.length) {
+                            firstValueCol = directionCol + 1;
+                        } else {
+                            firstValueCol = Math.max(Math.max(chrCol, startCol), endCol) + 1;
+                        }
+
+                        // Extract cell-type names from the value columns.
                         cellTypes = new ArrayList<>();
-                        for (int i = 3; i < parts.length; i++) {
+                        for (int i = firstValueCol; i < parts.length; i++) {
                             cellTypes.add(parts[i]);
                         }
                         continue;
                     }
                 }
 
-                if (parts.length < 4) continue;
+                if (parts.length <= Math.max(endCol, firstValueCol)) continue;
 
-                String chr = parts[0];
-                int start = Integer.parseInt(parts[1]);
-                int end = Integer.parseInt(parts[2]);
+                String chr;
+                int start;
+                int end;
+                try {
+                    chr = parts[chrCol];
+                    start = Integer.parseInt(parts[startCol]);
+                    end = Integer.parseInt(parts[endCol]);
+                } catch (Exception ex) {
+                    coordParseErrors++;
+                    continue;
+                }
                 parsedRows++;
 
                 // Keep refPanel behavior consistent with -markerRegions mode:
@@ -474,23 +549,47 @@ public class BetaValueDeconvolution {
                     continue;
                 }
 
-                // Populate start/end CpG indices so query .beta inputs behave
-                // consistently with marker-regions mode.
-                int startCpgIdx = cpgIndex.getFirstCpgIndexAtOrAfter(chr, start);
-                int endCpgLast = cpgIndex.getLastCpgIndexBefore(chr, end);
-                int endCpgExclusive = (startCpgIdx > 0 && endCpgLast >= startCpgIdx)
-                        ? (endCpgLast + 1)
-                        : 0;
+                int startCpgIdx = -1;
+                int endCpgExclusive = 0;
+                // If atlas carries startCpG/endCpG, use them directly to keep
+                // marker-based behavior consistent.
+                if (startCpgCol >= 0 && endCpgCol >= 0
+                        && startCpgCol < parts.length && endCpgCol < parts.length) {
+                    try {
+                        int s = Integer.parseInt(parts[startCpgCol]);
+                        int e = Integer.parseInt(parts[endCpgCol]);
+                        if (s > 0 && e >= s) {
+                            startCpgIdx = s;
+                            endCpgExclusive = e;
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // fall through to coordinate-derived CpG indices
+                    }
+                }
+
+                // Otherwise derive CpG indices from coordinates.
+                if (endCpgExclusive == 0) {
+                    int endCpgLast = cpgIndex.getLastCpgIndexBefore(chr, end);
+                    int s = cpgIndex.getFirstCpgIndexAtOrAfter(chr, start);
+                    if (s > 0 && endCpgLast >= s) {
+                        startCpgIdx = s;
+                        endCpgExclusive = endCpgLast + 1;
+                    }
+                }
+
                 if (endCpgExclusive == 0) {
                     skippedNoCpg++;
                     continue;
                 }
                 windows.add(new Window(chr, start, end, startCpgIdx, endCpgExclusive));
 
-                int nCt = parts.length - 3;
+                int nCt = (cellTypes != null) ? cellTypes.size() : Math.max(0, parts.length - firstValueCol);
                 double[] vals = new double[nCt];
+                Arrays.fill(vals, Double.NaN);
                 for (int i = 0; i < nCt; i++) {
-                    String cell = parts[i + 3].trim();
+                    int col = firstValueCol + i;
+                    if (col >= parts.length) break;
+                    String cell = parts[col].trim();
                     if (cell.contains("/")) {
                         // Count ratio format: "125/250"
                         String[] kn = cell.split("/", 2);
@@ -538,8 +637,8 @@ public class BetaValueDeconvolution {
 
         log.info(
                 "Reference panel parsing: {} data rows -> {} kept "
-                        + "(skipped {} non-autosome, {} duplicate, {} no-CpG)",
-                parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate, skippedNoCpg
+                        + "(skipped {} non-autosome, {} duplicate, {} no-CpG, {} coord-parse)",
+                parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate, skippedNoCpg, coordParseErrors
         );
 
         return new Object[]{windows, refMatrix, cellTypes};
