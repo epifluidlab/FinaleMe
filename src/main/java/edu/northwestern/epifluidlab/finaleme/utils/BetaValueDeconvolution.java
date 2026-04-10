@@ -150,6 +150,43 @@ public class BetaValueDeconvolution {
         }
     }
 
+    static class WindowCpgLookup {
+        final int[] startsInclusive; // 1-based global CpG index
+        final int[] endsExclusive;   // 1-based global CpG index
+        final int[] windowIndices;   // index into selected windows
+
+        WindowCpgLookup(List<int[]> entries) {
+            // entries: [startCpgInclusive, endCpgExclusive, windowIndex]
+            entries.sort(Comparator.comparingInt(a -> a[0]));
+            startsInclusive = new int[entries.size()];
+            endsExclusive = new int[entries.size()];
+            windowIndices = new int[entries.size()];
+            for (int i = 0; i < entries.size(); i++) {
+                int[] e = entries.get(i);
+                startsInclusive[i] = e[0];
+                endsExclusive[i] = e[1];
+                windowIndices[i] = e[2];
+            }
+        }
+
+        int findWindowIndex(int globalCpgIdx) {
+            // Rightmost interval start <= globalCpgIdx
+            int lo = 0, hi = startsInclusive.length - 1;
+            int pos = -1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >>> 1;
+                if (startsInclusive[mid] <= globalCpgIdx) {
+                    pos = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (pos < 0) return -1;
+            return globalCpgIdx < endsExclusive[pos] ? windowIndices[pos] : -1;
+        }
+    }
+
     // ========================= Main =========================
 
     public static void main(String[] args) throws Exception {
@@ -973,11 +1010,11 @@ public class BetaValueDeconvolution {
         if (queryFile.endsWith(".beta") || queryFile.endsWith(".lbeta")) {
             return loadQueryFromBeta(queryFile, windows, cpgIndex);
         } else if (queryFile.endsWith(".bed.gz") || queryFile.endsWith(".bed")) {
-            return loadQueryFromPrediction(queryFile, windows);
+            return loadQueryFromBed(queryFile, windows, cpgIndex);
         } else {
             throw new IllegalArgumentException(
                     "Unknown query file format: " + queryFile
-                            + ". Expected .beta or .prediction.bed.gz");
+                            + ". Expected .beta, .prediction.bed.gz, or 6+2 BED.");
         }
     }
 
@@ -995,58 +1032,135 @@ public class BetaValueDeconvolution {
         return result;
     }
 
-    /**
-     * Load query from FinaleMe prediction.bed.gz.
-     * Format: chr, start, end, methy_perc_predict, methy_count_predict, total_count_predict, ...
-     * Columns 4 (methy_count) and 5 (total_count) are 0-indexed from the data columns.
-     */
-    private double[] loadQueryFromPrediction(String predFile, List<Window> windows)
+    private String resolveChrForCpgIndex(String chr, CpgIndex cpgIndex) {
+        if (cpgIndex.chrPositions.containsKey(chr)) {
+            return chr;
+        }
+        if (chr.startsWith("chr")) {
+            String alt = chr.substring(3);
+            if (cpgIndex.chrPositions.containsKey(alt)) {
+                return alt;
+            }
+        } else {
+            String alt = "chr" + chr;
+            if (cpgIndex.chrPositions.containsKey(alt)) {
+                return alt;
+            }
+        }
+        return chr;
+    }
+
+    private int getGlobalCpgIndexExact(CpgIndex cpgIndex, String chr, int pos) {
+        String resolvedChr = resolveChrForCpgIndex(chr, cpgIndex);
+        int[] positions = cpgIndex.chrPositions.get(resolvedChr);
+        Integer offset = cpgIndex.chrOffsets.get(resolvedChr);
+        if (positions == null || offset == null) {
+            return -1;
+        }
+        int idx = Arrays.binarySearch(positions, pos);
+        if (idx < 0) {
+            return -1;
+        }
+        return offset + idx + 1; // 1-based global CpG index
+    }
+
+    private Map<String, WindowCpgLookup> buildWindowCpgLookups(List<Window> windows, CpgIndex cpgIndex) {
+        Map<String, List<int[]>> byChr = new HashMap<>();
+        for (int w = 0; w < windows.size(); w++) {
+            Window win = windows.get(w);
+            if (win.startCpgIdx <= 0 || win.endCpgIdx <= win.startCpgIdx) {
+                continue;
+            }
+            String chr = resolveChrForCpgIndex(win.chr, cpgIndex);
+            byChr.computeIfAbsent(chr, k -> new ArrayList<>())
+                    .add(new int[]{win.startCpgIdx, win.endCpgIdx, w});
+        }
+
+        Map<String, WindowCpgLookup> out = new HashMap<>();
+        for (Map.Entry<String, List<int[]>> e : byChr.entrySet()) {
+            out.put(e.getKey(), new WindowCpgLookup(e.getValue()));
+        }
+        return out;
+    }
+
+    private double[] loadQueryFromBed(String bedFile, List<Window> windows, CpgIndex cpgIndex)
             throws IOException {
         int numWindows = windows.size();
         long[] methyCounts = new long[numWindows];
         long[] totalCounts = new long[numWindows];
+        Map<String, WindowCpgLookup> windowLookups = buildWindowCpgLookups(windows, cpgIndex);
 
-        // Build interval lookup: chr -> sorted list of (start, windowIndex)
-        Map<String, List<int[]>> chrWindowMap = new HashMap<>();
-        for (int w = 0; w < numWindows; w++) {
-            Window win = windows.get(w);
-            chrWindowMap.computeIfAbsent(win.chr, k -> new ArrayList<>())
-                    .add(new int[]{win.start, win.end, w});
-        }
-
-        InputStream input = predFile.endsWith(".gz")
-                ? new GZIPInputStream(new FileInputStream(predFile))
-                : new FileInputStream(predFile);
+        InputStream input = bedFile.endsWith(".gz")
+                ? new GZIPInputStream(new FileInputStream(bedFile))
+                : new FileInputStream(bedFile);
         try (BufferedReader br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
             String line;
             while ((line = br.readLine()) != null) {
                 if (line.startsWith("#") || line.isEmpty()) continue;
                 String[] parts = line.split("\t");
-                if (parts.length < 6) continue;
+                if (parts.length < 3) continue;
 
                 String chr = parts[0];
                 int pos;
                 double methyCount, totalCount;
                 try {
                     pos = Integer.parseInt(parts[1]);
-                    methyCount = Double.parseDouble(parts[4]); // methy_count_predict
-                    totalCount = Double.parseDouble(parts[5]); // total_count_predict
                 } catch (NumberFormatException e) {
                     continue;
                 }
 
-                List<int[]> chrWindows = chrWindowMap.get(chr);
-                if (chrWindows == null) continue;
+                boolean parsedCounts = false;
+                methyCount = 0.0;
+                totalCount = 0.0;
 
-                // Find which window this CpG falls in (linear scan; windows are sorted)
-                for (int[] wInfo : chrWindows) {
-                    if (pos >= wInfo[0] && pos < wInfo[1]) {
-                        int wIdx = wInfo[2];
-                        methyCounts[wIdx] += (long) methyCount;
-                        totalCounts[wIdx] += (long) totalCount;
-                        break;
+                // FinaleMe prediction.bed(.gz):
+                // chr start end methy_perc_predict methy_count_predict total_count_predict ...
+                if (parts.length >= 6) {
+                    try {
+                        methyCount = Double.parseDouble(parts[4]);
+                        totalCount = Double.parseDouble(parts[5]);
+                        parsedCounts = Double.isFinite(methyCount) && Double.isFinite(totalCount);
+                    } catch (NumberFormatException ignored) {
+                        parsedCounts = false;
                     }
                 }
+
+                // Bis-SNP 6+2 BED fallback:
+                // col7 = methylation_pct (0..100), col8 = total_count
+                if (!parsedCounts && parts.length >= 8) {
+                    try {
+                        double methyPct = Double.parseDouble(parts[6]);
+                        totalCount = Double.parseDouble(parts[7]);
+                        if (Double.isFinite(methyPct) && Double.isFinite(totalCount)) {
+                            // Accept both percent (0..100) and fraction (0..1) forms.
+                            if (methyPct >= 0.0 && methyPct <= 1.0) {
+                                methyCount = Math.round(methyPct * totalCount);
+                            } else {
+                                methyCount = Math.round((methyPct / 100.0) * totalCount);
+                            }
+                            parsedCounts = true;
+                        }
+                    } catch (NumberFormatException ignored) {
+                        parsedCounts = false;
+                    }
+                }
+
+                if (!parsedCounts || totalCount < 0.0 || methyCount < 0.0) {
+                    continue;
+                }
+
+                int globalCpgIdx = getGlobalCpgIndexExact(cpgIndex, chr, pos);
+                if (globalCpgIdx <= 0) continue;
+
+                String resolvedChr = resolveChrForCpgIndex(chr, cpgIndex);
+                WindowCpgLookup lookup = windowLookups.get(resolvedChr);
+                if (lookup == null) continue;
+
+                int wIdx = lookup.findWindowIndex(globalCpgIdx);
+                if (wIdx < 0) continue;
+
+                methyCounts[wIdx] += Math.round(methyCount);
+                totalCounts[wIdx] += Math.round(totalCount);
             }
         }
 

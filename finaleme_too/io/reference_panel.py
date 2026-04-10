@@ -49,6 +49,8 @@ class ReferencePanel:
             chrom=self.chrom,
             start=self.start,
             end=self.end,
+            start_cpg=None,
+            end_cpg=None,
             marker_name=None,
         )
 
@@ -387,23 +389,46 @@ def _load_beta_file_to_markers(
     chr_positions = cpg_index["chr_positions"]
     chr_offsets = cpg_index["chr_offsets"]
     total_sites = cpg_index["total_sites"]
+    max_sites = min(int(total_sites), int(per_cpg.shape[0]))
+    start_cpg = marker_regions.start_cpg
+    end_cpg = marker_regions.end_cpg
+    has_cpg_indices = start_cpg is not None and end_cpg is not None
 
     n_markers = marker_regions.n_markers
     out = np.zeros((n_markers, 2), dtype=np.int64)
     for mi in range(n_markers):
-        chrom = str(marker_regions.chrom[mi])
-        start = int(marker_regions.start[mi])
-        end = int(marker_regions.end[mi])
-        positions = chr_positions.get(chrom)
-        offset = chr_offsets.get(chrom)
-        if positions is None or offset is None:
-            continue
-        lo = int(np.searchsorted(positions, start, side="left"))
-        hi = int(np.searchsorted(positions, end, side="left"))
-        if hi <= lo:
-            continue
-        global_lo = offset + lo
-        global_hi = min(offset + hi, total_sites, per_cpg.shape[0])
+        used_cpg_slice = False
+        if has_cpg_indices:
+            sc = int(start_cpg[mi])  # 1-based inclusive
+            ec = int(end_cpg[mi])  # 1-based exclusive in Java window loop
+            if sc > 0 and ec > sc:
+                global_lo = max(0, sc - 1)
+                global_hi = min(ec - 1, max_sites)
+                used_cpg_slice = True
+            else:
+                global_lo = 0
+                global_hi = 0
+        else:
+            global_lo = 0
+            global_hi = 0
+
+        # Fallback for plain BED markers without CpG indices (or invalid rows):
+        # aggregate by coordinate overlap against CpG index positions.
+        if not used_cpg_slice:
+            chrom = str(marker_regions.chrom[mi])
+            start = int(marker_regions.start[mi])
+            end = int(marker_regions.end[mi])
+            positions = chr_positions.get(chrom)
+            offset = chr_offsets.get(chrom)
+            if positions is None or offset is None:
+                continue
+            lo = int(np.searchsorted(positions, start, side="left"))
+            hi = int(np.searchsorted(positions, end, side="left"))
+            if hi <= lo:
+                continue
+            global_lo = offset + lo
+            global_hi = min(offset + hi, max_sites)
+
         if global_lo >= global_hi:
             continue
         block = per_cpg[global_lo:global_hi]

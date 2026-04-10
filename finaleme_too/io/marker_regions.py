@@ -23,6 +23,10 @@ class MarkerRegions:
     chrom: np.ndarray  # shape (M,) dtype=object (str)
     start: np.ndarray  # shape (M,) dtype=int64
     end: np.ndarray  # shape (M,) dtype=int64
+    # Optional 1-based global CpG indices (Java-compatible marker slicing).
+    # When present, Beta aggregation should prefer [start_cpg-1 : end_cpg-1).
+    start_cpg: np.ndarray | None = None  # shape (M,) dtype=int64 or None
+    end_cpg: np.ndarray | None = None  # shape (M,) dtype=int64 or None
     marker_name: np.ndarray | None = None  # shape (M,) dtype=object or None
 
     def __len__(self) -> int:
@@ -83,6 +87,9 @@ class MarkerRegionsLoader:
         chroms: list[str] = []
         starts: list[int] = []
         ends: list[int] = []
+        start_cpgs: list[int] = []
+        end_cpgs: list[int] = []
+        has_any_cpg_index = False
         names: list[str] = []
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
@@ -101,6 +108,19 @@ class MarkerRegionsLoader:
                 chroms.append(parts[0])
                 starts.append(start)
                 ends.append(end)
+                # Optional BED extension: col4/5 are startCpG/endCpG.
+                start_cpg = -1
+                end_cpg = -1
+                if len(parts) >= 5:
+                    try:
+                        start_cpg = int(parts[3])
+                        end_cpg = int(parts[4])
+                        has_any_cpg_index = True
+                    except ValueError:
+                        start_cpg = -1
+                        end_cpg = -1
+                start_cpgs.append(start_cpg)
+                end_cpgs.append(end_cpg)
                 names.append(parts[3] if len(parts) >= 4 else "")
         if not chroms:
             raise InvalidMarkerRegionsError(f"No valid BED records found in {path}")
@@ -109,10 +129,16 @@ class MarkerRegionsLoader:
             marker_name_arr = np.array(names, dtype=object)
         else:
             marker_name_arr = None
+        start_cpg_arr = (
+            np.array(start_cpgs, dtype=np.int64) if has_any_cpg_index else None
+        )
+        end_cpg_arr = np.array(end_cpgs, dtype=np.int64) if has_any_cpg_index else None
         return MarkerRegions(
             chrom=np.array(chroms, dtype=object),
             start=np.array(starts, dtype=np.int64),
             end=np.array(ends, dtype=np.int64),
+            start_cpg=start_cpg_arr,
+            end_cpg=end_cpg_arr,
             marker_name=marker_name_arr,
         )
 
@@ -126,6 +152,8 @@ class MarkerRegionsLoader:
         chroms: list[str] = []
         starts: list[int] = []
         ends: list[int] = []
+        start_cpgs: list[int] = []
+        end_cpgs: list[int] = []
         names: list[str] = []
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
@@ -147,6 +175,14 @@ class MarkerRegionsLoader:
                 chroms.append(parts[0])
                 starts.append(start)
                 ends.append(end)
+                try:
+                    start_cpg = int(parts[3])
+                    end_cpg = int(parts[4])
+                except ValueError:
+                    start_cpg = -1
+                    end_cpg = -1
+                start_cpgs.append(start_cpg)
+                end_cpgs.append(end_cpg)
                 if len(parts) >= 7:
                     names.append(parts[6])
                 else:
@@ -162,6 +198,8 @@ class MarkerRegionsLoader:
             chrom=np.array(chroms, dtype=object),
             start=np.array(starts, dtype=np.int64),
             end=np.array(ends, dtype=np.int64),
+            start_cpg=np.array(start_cpgs, dtype=np.int64),
+            end_cpg=np.array(end_cpgs, dtype=np.int64),
             marker_name=marker_name_arr,
         )
 

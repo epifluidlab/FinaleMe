@@ -1380,6 +1380,8 @@ def _subset_marker_regions(mr: MarkerRegions, indices: np.ndarray) -> MarkerRegi
         chrom=mr.chrom[indices],
         start=mr.start[indices],
         end=mr.end[indices],
+        start_cpg=mr.start_cpg[indices] if mr.start_cpg is not None else None,
+        end_cpg=mr.end_cpg[indices] if mr.end_cpg is not None else None,
         marker_name=mr.marker_name[indices] if mr.marker_name is not None else None,
     )
 
