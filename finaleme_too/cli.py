@@ -19,6 +19,8 @@ from finaleme_too.config import (
     TestMethod,
     TOOConfig,
 )
+from finaleme_too.io.marker_regions import MarkerRegionsLoader
+from finaleme_too.io.reference_panel import ReferencePanelLoader
 from finaleme_too.io.sample_sheet import SampleSheet
 from finaleme_too.pipeline import (
     TOOPipeline,
@@ -604,6 +606,101 @@ def train_binarization_cmd(
     click.echo(
         f"finaleme-too: trained binarization with B={params.n_bins} → {output} "
         f"(report: {report})"
+    )
+
+
+@main.command("build-reference-panel")
+@click.option(
+    "--ref-betas",
+    required=True,
+    help="Comma-separated reference .beta files OR .txt file listing one path per line.",
+)
+@click.option(
+    "--ref-groups",
+    required=True,
+    type=click.Path(exists=True),
+    help="CSV file mapping reference sample names to groups (columns: name, group).",
+)
+@click.option(
+    "--cpg-index",
+    "cpg_index_path",
+    required=True,
+    type=click.Path(exists=True),
+    help="CpG index BED file used to map .beta CpG rows to marker regions.",
+)
+@click.option(
+    "--marker-regions",
+    required=True,
+    type=click.Path(exists=True),
+    help="BED or UXM atlas file specifying marker region coordinates.",
+)
+@click.option(
+    "--marker-format",
+    default="auto",
+    type=click.Choice(["auto", "bed", "uxm_atlas"]),
+    help="Marker region file format.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    required=True,
+    type=click.Path(),
+    help="Output matrix TSV path (.tsv or .tsv.gz).",
+)
+@click.option("--threads", default=1, type=int)
+@click.option("--verbose", is_flag=True, default=False)
+def build_reference_panel_cmd(
+    ref_betas: str,
+    ref_groups: str,
+    cpg_index_path: str,
+    marker_regions: str,
+    marker_format: str,
+    output_path: str,
+    threads: int,
+    verbose: bool,
+) -> None:
+    """Prebuild a matrix reference panel on fixed marker regions.
+
+    This avoids rebuilding from .beta files at the beginning of every
+    ``finaleme-too run``. Use the generated matrix with
+    ``finaleme-too run --reference-panel <matrix.tsv[.gz]>``.
+    """
+    _setup_logging(verbose)
+    t0 = perf_counter()
+    n_threads = max(1, int(threads))
+
+    log.info(
+        "Reference prebuild: loading marker regions from %s (format=%s)",
+        marker_regions,
+        marker_format,
+    )
+    markers = MarkerRegionsLoader.load(marker_regions, marker_format=marker_format)
+    log.info("Reference prebuild: loaded %d marker regions", markers.n_markers)
+
+    log.info(
+        "Reference prebuild: building reference from beta list (%s) + groups (%s) using %d thread(s)",
+        ref_betas,
+        ref_groups,
+        n_threads,
+    )
+    reference = ReferencePanelLoader.load_beta_list(
+        ref_betas_arg=ref_betas,
+        groups_file=ref_groups,
+        cpg_index_path=cpg_index_path,
+        marker_regions=markers,
+        threads=n_threads,
+    )
+    ReferencePanelLoader.write_matrix(reference, output_path)
+    log.info(
+        "Reference prebuild: wrote matrix (%d markers x %d cell types) to %s in %.2fs",
+        reference.n_markers,
+        reference.n_cell_types,
+        output_path,
+        perf_counter() - t0,
+    )
+    click.echo(
+        f"Wrote prebuilt reference panel to {output_path}. "
+        "Use it with: finaleme-too run --reference-panel <this file>."
     )
 
 

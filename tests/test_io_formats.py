@@ -12,7 +12,11 @@ import pytest
 from finaleme_too.config import MeasurementMode
 from finaleme_too.io.marker_regions import MarkerRegions, MarkerRegionsLoader
 from finaleme_too.io.methylation_loader import MethylationLoader
-from finaleme_too.io.reference_panel import ReferencePanelLoader, load_cpg_index
+from finaleme_too.io.reference_panel import (
+    ReferencePanel,
+    ReferencePanelLoader,
+    load_cpg_index,
+)
 from finaleme_too.io.sample_sheet import SampleSheet
 
 
@@ -110,6 +114,27 @@ def test_reference_panel_matrix_loader(tmp_path: Path):
     assert ref.cell_types == ["CellA", "CellB"]
     assert ref.methylation.shape == (2, 2)
     np.testing.assert_allclose(ref.methylation[0], [0.1, 0.9], atol=1e-6)
+
+
+def test_reference_panel_matrix_writer_roundtrip(tmp_path: Path):
+    ref = ReferencePanel(
+        chrom=np.array(["chr1", "chr2"], dtype=object),
+        start=np.array([100, 200], dtype=np.int64),
+        end=np.array([150, 260], dtype=np.int64),
+        cell_types=["CellA", "CellB"],
+        methylation=np.array([[0.1, 0.9], [0.8, 0.2]], dtype=np.float32),
+        coverage=np.array([[10, 20], [30, 40]], dtype=np.int32),
+    )
+    out = tmp_path / "ref_prebuilt.tsv.gz"
+    ReferencePanelLoader.write_matrix(ref, out)
+
+    loaded = ReferencePanelLoader.load_matrix(out)
+    assert loaded.cell_types == ["CellA", "CellB"]
+    assert loaded.n_markers == 2
+    np.testing.assert_array_equal(loaded.chrom, ref.chrom)
+    np.testing.assert_array_equal(loaded.start, ref.start)
+    np.testing.assert_array_equal(loaded.end, ref.end)
+    np.testing.assert_allclose(loaded.methylation, ref.methylation, atol=1e-6)
 
 
 def test_load_cpg_index(tmp_path: Path):

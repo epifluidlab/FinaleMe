@@ -1737,6 +1737,21 @@ def test_cli_train_binarization_has_help():
     assert "--output" in result.output
 
 
+def test_cli_build_reference_panel_has_help():
+    """The prebuild command should be discoverable for reuse in run."""
+    from click.testing import CliRunner
+    from finaleme_too.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["build-reference-panel", "--help"])
+    assert result.exit_code == 0
+    assert "--ref-betas" in result.output
+    assert "--ref-groups" in result.output
+    assert "--cpg-index" in result.output
+    assert "--marker-regions" in result.output
+    assert "--output" in result.output
+
+
 def test_cli_run_has_binarization_flag():
     """The ``run`` command exposes the ``--binarization`` flag (Phase E
     removed the legacy ``--calibration`` flag entirely)."""

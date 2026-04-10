@@ -201,6 +201,30 @@ class ReferencePanelLoader:
             )
 
     @staticmethod
+    def write_matrix(reference: ReferencePanel, filepath: str | Path) -> None:
+        """Write a reference panel matrix TSV (optionally gzipped).
+
+        Output schema matches ``load_matrix``:
+        ``chrom  start  end  <cell_type_1> ... <cell_type_K>``.
+        """
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data: dict[str, object] = {
+            "chrom": np.asarray(reference.chrom, dtype=object),
+            "start": np.asarray(reference.start, dtype=np.int64),
+            "end": np.asarray(reference.end, dtype=np.int64),
+        }
+        methy = np.asarray(reference.methylation, dtype=np.float32)
+        for i, ct in enumerate(reference.cell_types):
+            data[str(ct)] = methy[:, i].astype(np.float64)
+        df = pd.DataFrame(data)
+
+        opener = gzip.open if path.name.endswith(".gz") else open
+        with opener(path, "wt") as fh:
+            df.to_csv(fh, sep="\t", index=False, float_format="%.6g")
+
+    @staticmethod
     def load_beta_list(
         ref_betas_arg: str,
         groups_file: str | Path,
