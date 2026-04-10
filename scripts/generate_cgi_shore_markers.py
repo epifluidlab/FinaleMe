@@ -55,7 +55,6 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -518,6 +517,90 @@ def _select_legacy_coordinate_columns(df):
     return chr_col, 'start', 'end'
 
 
+def _select_legacy_cpg_columns(df):
+    """Detect startCpG/endCpG columns in an atlas dataframe."""
+    start_cpg_col = None
+    end_cpg_col = None
+    for col in df.columns:
+        key = str(col).strip().lower().replace('_', '')
+        if key == 'startcpg':
+            start_cpg_col = col
+        elif key == 'endcpg':
+            end_cpg_col = col
+    if start_cpg_col is None or end_cpg_col is None:
+        raise RuntimeError(
+            f'Cannot find startCpG/endCpG columns in legacy atlas: {list(df.columns)}'
+        )
+    return start_cpg_col, end_cpg_col
+
+
+def _load_groups_for_stage4(groups_path):
+    """Load groups CSV into a sample->group map (matching Java stripping rules)."""
+    groups_df = pd.read_csv(groups_path, comment='#')
+    cols_lower = {str(c).lower(): c for c in groups_df.columns}
+    if 'name' in cols_lower and 'group' in cols_lower:
+        name_col = cols_lower['name']
+        group_col = cols_lower['group']
+    elif groups_df.shape[1] >= 2:
+        name_col = groups_df.columns[0]
+        group_col = groups_df.columns[1]
+    else:
+        raise RuntimeError(f'Groups file must contain at least 2 columns: {groups_path}')
+
+    names = (
+        groups_df[name_col].astype(str)
+        .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
+        .tolist()
+    )
+    groups = groups_df[group_col].astype(str).tolist()
+    sample_to_group = dict(zip(names, groups))
+    return sample_to_group
+
+
+def _beta_basename_to_sample_name_local(beta_path):
+    """Mirror Java beta filename stripping (.beta/.lbeta)."""
+    name = Path(beta_path).name
+    if name.endswith('.beta'):
+        return name[:-5]
+    if name.endswith('.lbeta'):
+        return name[:-6]
+    return name
+
+
+def _load_beta_file_to_markers_by_cpg_index(beta_path, start_cpg, end_cpg):
+    """Aggregate per-marker (methy,total) using Java marker-mode CpG index logic.
+
+    Java equivalent:
+        startIdx = startCpG - 1
+        endIdx = endCpG - 1   // exclusive
+        for i in [startIdx, endIdx): sum beta[i]
+    """
+    with open(beta_path, 'rb') as fh:
+        data = np.frombuffer(fh.read(), dtype=np.uint8)
+    if data.size % 2 != 0:
+        raise RuntimeError(f'Beta file size not divisible by 2: {beta_path}')
+    per_cpg = data.reshape((-1, 2)).astype(np.int64)
+    num_sites = per_cpg.shape[0]
+
+    n_markers = len(start_cpg)
+    out = np.zeros((n_markers, 2), dtype=np.int64)
+    for mi in range(n_markers):
+        s = int(start_cpg[mi])
+        e = int(end_cpg[mi])
+        # Keep behavior aligned with Java assumptions (1-based positive indices).
+        if s <= 0 or e <= 0:
+            continue
+        lo = s - 1
+        hi = e - 1  # exclusive
+        if hi <= lo or lo >= num_sites:
+            continue
+        hi = min(hi, num_sites)
+        block = per_cpg[lo:hi]
+        out[mi, 0] = int(block[:, 0].sum())
+        out[mi, 1] = int(block[:, 1].sum())
+    return out
+
+
 def _build_count_output_frames(legacy_atlas_df, cell_types, agg_methy, agg_total):
     """Build Stage-4 outputs while preserving legacy atlas row identity/order.
 
@@ -839,66 +922,21 @@ def stage4_build_reference_panel(args, markers_path):
     n_markers = len(legacy_atlas_df)
     eprint(f'  Legacy atlas markers: {n_markers}')
 
-    # Build a MarkerRegions-like struct for the .beta reader
-    # (we import lazily to avoid a hard dependency on the finaleme_too
-    # package in the standalone script)
-    try:
-        from finaleme_too.io.marker_regions import MarkerRegions
-        from finaleme_too.io.reference_panel import (
-            _beta_basename_to_sample_name,
-            _load_beta_file_to_markers,
-            _load_groups_file,
-            load_cpg_index,
-        )
-        marker_regions = MarkerRegions(
-            chrom=marker_chroms,
-            start=marker_starts,
-            end=marker_ends,
-            marker_name=None,
-        )
-        has_finaleme_too = True
-    except ImportError:
-        has_finaleme_too = False
-
-    if not has_finaleme_too:
-        eprint('  WARNING: finaleme_too not installed — using fallback .beta parser.')
-        eprint('  Install finaleme_too for faster, validated .beta parsing.')
-        return _stage4_fallback_slow(
-            args,
-            legacy_atlas_df,
-            legacy_chr_col,
-            legacy_start_col,
-            legacy_end_col,
-            panel_path,
-            atlas_path,
-        )
-
-    # Load CpG index
-    cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
-                             'CpG.bed.gz')
-    if not op.isfile(cpg_index_path):
-        # Try alternate location
-        cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
-                                 'CpG.bed')
-    if not op.isfile(cpg_index_path):
-        raise RuntimeError(f'CpG index not found at {cpg_index_path}. '
-                           f'Run wgbstools init to create it.')
-    eprint(f'  CpG index: {cpg_index_path}')
-    cpg_index = load_cpg_index(cpg_index_path)
+    # Use startCpG/endCpG ranges from legacy atlas so Stage 4 k/n exactly matches
+    # Java BetaValueDeconvolution -markerRegions reference extraction behavior.
+    start_cpg_col, end_cpg_col = _select_legacy_cpg_columns(legacy_atlas_df)
+    start_cpg = pd.to_numeric(legacy_atlas_df[start_cpg_col], errors='coerce').astype(np.int64).to_numpy()
+    end_cpg = pd.to_numeric(legacy_atlas_df[end_cpg_col], errors='coerce').astype(np.int64).to_numpy()
+    eprint('  Stage 4 k/n extraction mode: Java-compatible startCpG/endCpG index slicing')
 
     # Load groups
-    groups_df = _load_groups_file(args.groups)
-    groups_df['name_stripped'] = (
-        groups_df['name'].astype(str)
-        .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
-    )
-    sample_to_group = dict(zip(groups_df['name_stripped'], groups_df['group']))
+    sample_to_group = _load_groups_for_stage4(args.groups)
     # Preserve legacy atlas cell-type column order when available.
     atlas_cell_types = [str(c) for c in legacy_atlas_df.columns[8:]]
     if atlas_cell_types:
         cell_types = atlas_cell_types
     else:
-        cell_types = sorted(set(groups_df['group']))
+        cell_types = sorted(set(sample_to_group.values()))
     ct_to_index = {c: i for i, c in enumerate(cell_types)}
     n_ct = len(cell_types)
     eprint(f'  Cell types: {n_ct} — {cell_types}')
@@ -911,7 +949,7 @@ def stage4_build_reference_panel(args, markers_path):
 
     for beta_path_str in args.betas:
         beta_path = Path(beta_path_str)
-        sample_name = _beta_basename_to_sample_name(beta_path)
+        sample_name = _beta_basename_to_sample_name_local(beta_path)
         group = sample_to_group.get(sample_name)
         if group is None:
             continue
@@ -919,7 +957,7 @@ def stage4_build_reference_panel(args, markers_path):
             skipped_group_mismatch += 1
             continue
         ci = ct_to_index[group]
-        counts = _load_beta_file_to_markers(beta_path, marker_regions, cpg_index)
+        counts = _load_beta_file_to_markers_by_cpg_index(beta_path, start_cpg, end_cpg)
         agg_methy[:, ci] += counts[:, 0]
         agg_total[:, ci] += counts[:, 1]
         n_matched += 1
@@ -971,27 +1009,12 @@ def _stage4_fallback_slow(args, legacy_atlas_df, chr_col, start_col, end_col, pa
     if not op.isfile(cpg_index_path):
         raise RuntimeError(f'CpG index not found at {cpg_index_path}')
 
-    # Load CpG positions per chromosome
-    chr_positions = defaultdict(list)
-    opener = gzip.open if cpg_index_path.endswith('.gz') else open
-    with opener(cpg_index_path, 'rt') as fh:
-        for line in fh:
-            if not line.strip() or line.startswith('#'):
-                continue
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                try:
-                    chr_positions[parts[0]].append(int(parts[1]))
-                except ValueError:
-                    continue
-    chr_arrays = {c: np.array(sorted(set(v)), dtype=np.int64)
-                  for c, v in chr_positions.items()}
-    chr_offsets = {}
-    total = 0
-    for c in sorted(chr_arrays.keys()):
-        chr_offsets[c] = total
-        total += len(chr_arrays[c])
-    eprint(f'  [fallback] CpG sites: {total:,}')
+    # In fallback mode we still use Java-compatible CpG index slicing from
+    # startCpG/endCpG in the legacy atlas; no coordinate overlap logic.
+    start_cpg_col, end_cpg_col = _select_legacy_cpg_columns(legacy_atlas_df)
+    start_cpg = pd.to_numeric(legacy_atlas_df[start_cpg_col], errors='coerce').astype(np.int64).to_numpy()
+    end_cpg = pd.to_numeric(legacy_atlas_df[end_cpg_col], errors='coerce').astype(np.int64).to_numpy()
+    eprint('  [fallback] Stage 4 k/n extraction mode: Java-compatible startCpG/endCpG index slicing')
 
     # Load groups
     groups_df = pd.read_csv(args.groups)
@@ -1008,9 +1031,6 @@ def _stage4_fallback_slow(args, legacy_atlas_df, chr_col, start_col, end_col, pa
         cell_types = sorted(set(groups_df['group']))
     ct_to_index = {c: i for i, c in enumerate(cell_types)}
 
-    marker_chroms = legacy_atlas_df[chr_col].astype(str).to_numpy()
-    marker_starts = pd.to_numeric(legacy_atlas_df[start_col], errors='coerce').astype(np.int64).to_numpy()
-    marker_ends = pd.to_numeric(legacy_atlas_df[end_col], errors='coerce').astype(np.int64).to_numpy()
     n_markers = len(legacy_atlas_df)
     n_ct = len(cell_types)
     agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
@@ -1033,29 +1053,9 @@ def _stage4_fallback_slow(args, legacy_atlas_df, chr_col, start_col, end_col, pa
             continue
         ci = ct_to_index[group]
 
-        with open(beta_path, 'rb') as fh:
-            data = np.frombuffer(fh.read(), dtype=np.uint8)
-        per_cpg = data.reshape((-1, 2)).astype(np.int64)
-
-        for mi in range(n_markers):
-            chrom = str(marker_chroms[mi])
-            start = int(marker_starts[mi])
-            end = int(marker_ends[mi])
-            positions = chr_arrays.get(chrom)
-            offset = chr_offsets.get(chrom)
-            if positions is None or offset is None:
-                continue
-            lo = int(np.searchsorted(positions, start, side='left'))
-            hi = int(np.searchsorted(positions, end, side='left'))
-            if hi <= lo:
-                continue
-            global_lo = offset + lo
-            global_hi = min(offset + hi, total, per_cpg.shape[0])
-            if global_lo >= global_hi:
-                continue
-            block = per_cpg[global_lo:global_hi]
-            agg_methy[mi, ci] += int(block[:, 0].sum())
-            agg_total[mi, ci] += int(block[:, 1].sum())
+        counts = _load_beta_file_to_markers_by_cpg_index(beta_path, start_cpg, end_cpg)
+        agg_methy[:, ci] += counts[:, 0]
+        agg_total[:, ci] += counts[:, 1]
         n_matched += 1
 
     eprint(f'  [fallback] Matched beta files: {n_matched}/{len(args.betas)}')
