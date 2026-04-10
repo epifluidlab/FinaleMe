@@ -91,6 +91,7 @@ class MarkerRegionsLoader:
         end_cpgs: list[int] = []
         has_any_cpg_index = False
         names: list[str] = []
+        seen_keys: set[tuple[str, int, int]] = set()
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
             for line in fh:
@@ -105,7 +106,13 @@ class MarkerRegionsLoader:
                     end = int(parts[2])
                 except ValueError:
                     continue
-                chroms.append(parts[0])
+                chrom = parts[0]
+                key = (chrom, start, end)
+                if key in seen_keys:
+                    # Java parity: deduplicate by coordinates, keep first.
+                    continue
+                seen_keys.add(key)
+                chroms.append(chrom)
                 starts.append(start)
                 ends.append(end)
                 # Optional BED extension: col4/5 are startCpG/endCpG.
@@ -155,6 +162,7 @@ class MarkerRegionsLoader:
         start_cpgs: list[int] = []
         end_cpgs: list[int] = []
         names: list[str] = []
+        seen_keys: set[tuple[str, int, int]] = set()
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
             for line in fh:
@@ -172,7 +180,13 @@ class MarkerRegionsLoader:
                     end = int(parts[2])
                 except ValueError:
                     continue
-                chroms.append(parts[0])
+                chrom = parts[0]
+                key = (chrom, start, end)
+                if key in seen_keys:
+                    # Java parity: deduplicate by coordinates, keep first.
+                    continue
+                seen_keys.add(key)
+                chroms.append(chrom)
                 starts.append(start)
                 ends.append(end)
                 try:

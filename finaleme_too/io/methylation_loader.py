@@ -208,16 +208,14 @@ class MethylationLoader:
             )
         if df.empty:
             raise InvalidInputFormatError(f"Empty FinaleMe prediction file: {path}")
-        return _aggregate_per_cpg_to_markers(
+        return _aggregate_per_cpg_to_markers_first_match(
             sample_id=sample_id,
             cpg_chrom=df["chrom"].to_numpy(),
             cpg_start=df["start"].to_numpy(),
             cpg_methy=df["methy_count_pred"].to_numpy(),
             cpg_total=df["total_count_pred"].to_numpy(),
-            cpg_pct=df["methy_pct_pred"].to_numpy() / 100.0,
             marker_regions=marker_regions,
             mode=mode,
-            keep_pct=True,
         )
 
     # ------------------------------------------------------------------
@@ -418,21 +416,65 @@ def _parse_finaleme_bed_with_tabix(
             if query_chrom is None:
                 continue
 
-            marker_ids = np.asarray(marker_ids_list, dtype=np.int64)
-            starts = np.asarray(marker_regions.start[marker_ids], dtype=np.int64)
-            ends = np.asarray(marker_regions.end[marker_ids], dtype=np.int64)
-            if starts.size == 0:
+            # Preserve original marker order for Java parity in overlap mode.
+            marker_ids_orig = np.asarray(marker_ids_list, dtype=np.int64)
+            starts_orig = np.asarray(marker_regions.start[marker_ids_orig], dtype=np.int64)
+            ends_orig = np.asarray(marker_regions.end[marker_ids_orig], dtype=np.int64)
+            if starts_orig.size == 0:
                 continue
-            valid_marker = ends > starts
+            valid_marker = ends_orig > starts_orig
             if not np.any(valid_marker):
                 continue
-            marker_ids = marker_ids[valid_marker]
-            starts = starts[valid_marker]
-            ends = ends[valid_marker]
-            order = np.argsort(starts, kind="mergesort")
-            marker_ids = marker_ids[order]
-            starts = starts[order]
-            ends = ends[order]
+            marker_ids_orig = marker_ids_orig[valid_marker]
+            starts_orig = starts_orig[valid_marker]
+            ends_orig = ends_orig[valid_marker]
+
+            # Coordinate-sorted copies for fetch-window construction.
+            order = np.argsort(starts_orig, kind="mergesort")
+            marker_ids = marker_ids_orig[order]
+            starts = starts_orig[order]
+            ends = ends_orig[order]
+            if starts.size <= 1:
+                has_overlap = False
+            else:
+                prev_max_end = np.maximum.accumulate(ends[:-1])
+                has_overlap = bool(np.any(starts[1:] < prev_max_end))
+
+            # Java parity for overlapping markers:
+            # assign each CpG to the first matching marker in original order.
+            if has_overlap:
+                fetch_windows = _build_tabix_fetch_windows(starts, ends)
+                for _, _, fetch_start, fetch_end in fetch_windows:
+                    if fetch_end <= fetch_start:
+                        continue
+                    cand_mask = (ends_orig > fetch_start) & (starts_orig < fetch_end)
+                    if not np.any(cand_mask):
+                        continue
+                    cand_ids = marker_ids_orig[cand_mask]
+                    cand_starts = starts_orig[cand_mask]
+                    cand_ends = ends_orig[cand_mask]
+                    try:
+                        for line in tbx.fetch(query_chrom, int(fetch_start), int(fetch_end)):
+                            parts = line.split("\t")
+                            if len(parts) < 6:
+                                continue
+                            try:
+                                cpg_start = int(parts[1])
+                                meth = int(float(parts[4]))
+                                total = int(float(parts[5]))
+                            except ValueError:
+                                continue
+                            for idx in range(cand_ids.size):
+                                if cand_starts[idx] <= cpg_start < cand_ends[idx]:
+                                    mid = int(cand_ids[idx])
+                                    k_arr[mid] += meth
+                                    n_arr[mid] += total
+                                    break
+                    except ValueError:
+                        pass
+                continue
+
+            # Non-overlapping markers: fast unique-assignment path.
 
             fetch_windows = _build_tabix_fetch_windows(starts, ends)
             for win_lo, win_hi, fetch_start, fetch_end in fetch_windows:
@@ -442,77 +484,30 @@ def _parse_finaleme_bed_with_tabix(
                 if starts_w.size == 0 or fetch_end <= fetch_start:
                     continue
 
-                # Fast path when marker intervals in this fetch window do not
-                # overlap: each CpG record belongs to at most one marker.
-                non_overlap = (
-                    bool(np.all(ends_w[:-1] <= starts_w[1:]))
-                    if starts_w.size > 1
-                    else True
-                )
-
-                if non_overlap:
-                    ptr = 0
-                    n_local = starts_w.size
-                    try:
-                        for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
-                            parts = line.split("\t")
-                            if len(parts) < 6:
-                                continue
-                            try:
-                                cpg_start = int(parts[1])
-                                meth = float(parts[4])
-                                total = float(parts[5])
-                            except ValueError:
-                                continue
-                            # prediction.bed.gz is BED-like (0-based, half-open)
-                            while ptr < n_local and ends_w[ptr] <= cpg_start:
-                                ptr += 1
-                            if ptr >= n_local:
-                                break
-                            if starts_w[ptr] <= cpg_start < ends_w[ptr]:
-                                mid = int(marker_ids_w[ptr])
-                                k_arr[mid] += int(meth)
-                                n_arr[mid] += int(total)
-                    except ValueError:
-                        pass
-                else:
-                    # Fallback path for overlapping markers: maintain active set.
-                    import heapq
-
-                    active: list[tuple[int, int]] = []  # (end, local_idx)
-                    add_ptr = 0
-                    n_local = starts_w.size
-                    try:
-                        for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
-                            parts = line.split("\t")
-                            if len(parts) < 6:
-                                continue
-                            try:
-                                cpg_start = int(parts[1])
-                                meth = float(parts[4])
-                                total = float(parts[5])
-                            except ValueError:
-                                continue
-
-                            while add_ptr < n_local and starts_w[add_ptr] <= cpg_start:
-                                heapq.heappush(
-                                    active, (int(ends_w[add_ptr]), int(add_ptr))
-                                )
-                                add_ptr += 1
-                            while active and active[0][0] <= cpg_start:
-                                heapq.heappop(active)
-
-                            if not active:
-                                continue
-                            meth_i = int(meth)
-                            total_i = int(total)
-                            for _, local_idx in active:
-                                if starts_w[local_idx] <= cpg_start < ends_w[local_idx]:
-                                    mid = int(marker_ids_w[local_idx])
-                                    k_arr[mid] += meth_i
-                                    n_arr[mid] += total_i
-                    except ValueError:
-                        pass
+                ptr = 0
+                n_local = starts_w.size
+                try:
+                    for line in tbx.fetch(query_chrom, fetch_start, fetch_end):
+                        parts = line.split("\t")
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            cpg_start = int(parts[1])
+                            meth = float(parts[4])
+                            total = float(parts[5])
+                        except ValueError:
+                            continue
+                        # prediction.bed.gz is BED-like (0-based, half-open)
+                        while ptr < n_local and ends_w[ptr] <= cpg_start:
+                            ptr += 1
+                        if ptr >= n_local:
+                            break
+                        if starts_w[ptr] <= cpg_start < ends_w[ptr]:
+                            mid = int(marker_ids_w[ptr])
+                            k_arr[mid] += int(meth)
+                            n_arr[mid] += int(total)
+                except ValueError:
+                    pass
     finally:
         tbx.close()
 
@@ -778,6 +773,65 @@ def _aggregate_per_cpg_to_markers(
             ).astype(np.float32)
     else:
         predicted_beta = None
+
+    return MarkerObservations(
+        sample_id=sample_id,
+        chrom=marker_regions.chrom,
+        start=marker_regions.start,
+        end=marker_regions.end,
+        k=k_arr.astype(np.int32),
+        n=n_arr.astype(np.int32),
+        predicted_beta=predicted_beta,
+        mode=mode,
+    )
+
+
+def _aggregate_per_cpg_to_markers_first_match(
+    sample_id: str,
+    cpg_chrom: np.ndarray,
+    cpg_start: np.ndarray,
+    cpg_methy: np.ndarray,
+    cpg_total: np.ndarray,
+    marker_regions: MarkerRegions,
+    mode: MeasurementMode,
+) -> MarkerObservations:
+    """Java-compatible aggregation for overlapping markers (first-hit assignment).
+
+    For each CpG, assign counts to the first matching marker interval in the
+    original marker order for that chromosome, then stop.
+    """
+    n_markers = marker_regions.n_markers
+    k_arr = np.zeros(n_markers, dtype=np.int64)
+    n_arr = np.zeros(n_markers, dtype=np.int64)
+
+    cpg_chrom_arr = np.asarray(cpg_chrom, dtype=object)
+    cpg_start_arr = np.asarray(cpg_start, dtype=np.int64)
+    cpg_methy_arr = np.asarray(cpg_methy, dtype=np.float64)
+    cpg_total_arr = np.asarray(cpg_total, dtype=np.float64)
+
+    chrom_to_marker_idx: dict[str, list[int]] = {}
+    for mi in range(n_markers):
+        chrom = str(marker_regions.chrom[mi])
+        chrom_to_marker_idx.setdefault(chrom, []).append(mi)
+
+    for i in range(cpg_start_arr.size):
+        chrom = str(cpg_chrom_arr[i])
+        marker_ids = chrom_to_marker_idx.get(chrom)
+        if not marker_ids:
+            continue
+        pos = int(cpg_start_arr[i])
+        for mi in marker_ids:
+            start = int(marker_regions.start[mi])
+            end = int(marker_regions.end[mi])
+            if start <= pos < end:
+                k_arr[mi] += int(cpg_methy_arr[i])
+                n_arr[mi] += int(cpg_total_arr[i])
+                break
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        predicted_beta = np.where(
+            n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+        ).astype(np.float32)
 
     return MarkerObservations(
         sample_id=sample_id,

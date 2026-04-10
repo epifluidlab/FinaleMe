@@ -154,6 +154,10 @@ class ReferencePanelLoader:
         for col, target in zip(df.columns[:3], ["chrom", "start", "end"]):
             rename[col] = target
         df = df.rename(columns=rename)
+        # Java BetaValueDeconvolution parity: deduplicate marker coordinates
+        # by (chrom, start, end), keeping the first occurrence.
+        if {"chrom", "start", "end"}.issubset(df.columns):
+            df = df.drop_duplicates(subset=["chrom", "start", "end"], keep="first")
         cell_types = [str(c) for c in df.columns[3:]]
 
         # Auto-detect format: check the first non-NaN value in the first
