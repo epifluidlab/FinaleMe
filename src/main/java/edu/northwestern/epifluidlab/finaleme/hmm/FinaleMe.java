@@ -1824,8 +1824,8 @@ public class FinaleMe {
 		ArrayList<DecodeSummaryRow> rows = toSortedDecodeRowsForPrediction(methySummary, chromOrder);
 		File bgzfOutput = new File(outputFile);
 		log.info("Writing decode prediction output as BGZF: " + bgzfOutput.getPath());
-		try (BlockCompressedOutputStream output = new BlockCompressedOutputStream(bgzfOutput);
-				OutputStreamWriter writer = new OutputStreamWriter(output, StandardCharsets.UTF_8)) {
+		try (BlockCompressedOutputStream output = new BlockCompressedOutputStream(bgzfOutput)) {
+			OutputStreamWriter writer = new OutputStreamWriter(output, StandardCharsets.UTF_8);
 			writer.write("#chr\tstart\tend\tmethy_perc_predict\tmethy_count_predict\ttotal_count_predict\tmethy_perc_obs\tmethy_count_obs\ttotal_count_obs\n");
 			for (DecodeSummaryRow row : rows) {
 				writer.write(row.chr);
@@ -1847,6 +1847,10 @@ public class FinaleMe {
 				writer.write(Integer.toString(row.totalObs));
 				writer.write('\n');
 			}
+			// Flush writer bytes into BGZF stream. We intentionally do not close
+			// writer here because closing it would close `output`, which is already
+			// managed by the outer try-with-resources.
+			writer.flush();
 		}
 
 		if (!rows.isEmpty()) {
