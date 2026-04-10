@@ -113,6 +113,7 @@ class TOOPipeline:
         cpg_index: dict | None = None,
         binarization=None,  # BinarizationParams | None — v3 FinaleMe path
         binarize_threshold: float | None = None,  # universal hard threshold mode
+        binarize_threshold_from_params: bool = False,  # per-bin tau_high mode
     ):
         from finaleme_too.config import SolverMethod
         from finaleme_too.core.observation_model_binarization import BinarizationModel
@@ -128,6 +129,7 @@ class TOOPipeline:
             self.binarize_threshold = thr
         else:
             self.binarize_threshold = None
+        self.binarize_threshold_from_params = bool(binarize_threshold_from_params)
         self.region_annotations = region_annotations
         self._region_annotation_lookup: pd.DataFrame | None = None
         self.group_comparison_spec = group_comparison_spec
@@ -145,6 +147,7 @@ class TOOPipeline:
             hard_threshold=self.binarize_threshold,
             binarization_model=config.model.binarization_model,
             call_weight_override=config.model.hierarchical_call_weight,
+            learned_threshold_from_params=self.binarize_threshold_from_params,
         )
 
         # Decouple uncertainty source from the point-estimate solver.
@@ -768,6 +771,7 @@ class TOOPipeline:
                 else self.region_annotations
             ),
             hard_threshold=self.binarize_threshold,
+            learned_threshold_from_params=self.binarize_threshold_from_params,
         )
 
     # Backwards-compat aliases so any stale caller finding the old method
@@ -827,7 +831,7 @@ class TOOPipeline:
             # binarization inference-QC calibration diagnostics are not
             # meaningful; treat the binarization stage as bypassed for QC
             # flagging so users do not get BINARIZATION_FAIL from this mode.
-            if self.binarize_threshold is not None:
+            if self.binarize_threshold is not None or self.binarize_threshold_from_params:
                 qc = {
                     "flag": "HARD_THRESHOLD",
                     "fraction_called": float("nan"),

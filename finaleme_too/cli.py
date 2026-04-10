@@ -80,6 +80,16 @@ def main() -> None:
                    "rate for p_goodness (0..0.49). Example: 0.10 means "
                    "p_goodness expects ~90% concordance, not 100%.")
 @click.option(
+    "--binarizeThresholdFromParams",
+    "--binarize-threshold-from-params",
+    "binarize_threshold_from_params",
+    is_flag=True,
+    default=False,
+    help="Use per-bin learned M-thresholds from --binarization JSON "
+    "(tau_high by region/bin) in a binary mode: predicted_beta < tau_high => U, "
+    ">= tau_high => M. Disables Ambiguous calls.",
+)
+@click.option(
     "--binarization-model",
     "binarization_model",
     default=None,
@@ -156,6 +166,7 @@ def run_cmd(
     binarization_path: str | None,
     binarize_threshold: float | None,
     binarize_mismatch_tolerance: float,
+    binarize_threshold_from_params: bool,
     binarization_model: str | None,
     hierarchical_call_weight: float | None,
     hierarchical_quadrature_points: int | None,
@@ -368,6 +379,11 @@ def run_cmd(
                 log.warning(
                     "Ignoring --binarization because --binarizeThreshold was provided."
                 )
+            if binarize_threshold_from_params:
+                log.warning(
+                    "Ignoring --binarizeThresholdFromParams because "
+                    "--binarizeThreshold was provided."
+                )
             from finaleme_too.preprocessing.binarization import (
                 build_identity_placeholder_params,
             )
@@ -396,6 +412,12 @@ def run_cmd(
                 config, binarization_path,
                 use_default=config.binarization.use_default,
             )
+            if binarize_threshold_from_params and binarization_params is None:
+                log.warning(
+                    "--binarizeThresholdFromParams requested but no binarization "
+                    "params JSON is available; this run will proceed without "
+                    "FinaleMe binarization."
+                )
         region_annotations = load_optional_region_annotations(config, region_annotation)
     _mark_stage("finaleme_aux_inputs", t0, skipped=not has_finaleme)
 
@@ -408,6 +430,7 @@ def run_cmd(
         config=config,
         binarization=binarization_params,
         binarize_threshold=binarize_threshold,
+        binarize_threshold_from_params=binarize_threshold_from_params,
         region_annotations=region_annotations,
         group_comparison_spec=effective_group_comparison,
         cpg_index=cpg_idx,

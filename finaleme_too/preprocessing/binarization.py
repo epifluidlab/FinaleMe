@@ -428,6 +428,7 @@ def apply_binarization(
     params: BinarizationParams,
     region_annotations: pd.DataFrame | None = None,
     hard_threshold: float | None = None,
+    learned_threshold_from_params: bool = False,
 ) -> MarkerObservations:
     """Apply a trained binarization model to one sample's observations.
 
@@ -449,6 +450,13 @@ def apply_binarization(
         --binarizeThreshold``. When set, marker calls are:
         ``predicted_beta < hard_threshold -> U`` and
         ``predicted_beta >= hard_threshold -> M`` for usable bins.
+        Ambiguous calls are disabled in this mode.
+    learned_threshold_from_params
+        Optional per-bin threshold mode (JSON-driven). When True (and
+        ``hard_threshold`` is None), each marker uses its learned
+        ``tau_high`` from ``params`` as a binary cutoff:
+        ``predicted_beta < tau_high -> U`` and
+        ``predicted_beta >= tau_high -> M`` for usable bins.
         Ambiguous calls are disabled in this mode.
 
     Returns
@@ -524,6 +532,13 @@ def apply_binarization(
         u_mask = usable_per & finite & (pred < thr)
         called_state[u_mask] = STATE_U
         m_mask = usable_per & finite & (pred >= thr)
+        called_state[m_mask] = STATE_M
+    elif learned_threshold_from_params:
+        # Per-bin learned-threshold mode: no Ambiguous state. Uses each
+        # marker's context-bin learned tau_high as the M cutoff.
+        u_mask = usable_per & finite & (pred < tau_high_per)
+        called_state[u_mask] = STATE_U
+        m_mask = usable_per & finite & (pred >= tau_high_per)
         called_state[m_mask] = STATE_M
     else:
         # U call

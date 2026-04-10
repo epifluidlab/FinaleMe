@@ -240,12 +240,14 @@ class BinarizationModel:
         hard_threshold: float | None = None,
         binarization_model: str = "legacy",
         call_weight_override: float | None = None,
+        learned_threshold_from_params: bool = False,
     ):
         # Optional universal hard threshold used by
         # ``finaleme-too run --binarizeThreshold``.
         self.hard_threshold = hard_threshold
         self.binarization_model = str(binarization_model or "legacy").lower()
         self.call_weight_override = call_weight_override
+        self.learned_threshold_from_params = bool(learned_threshold_from_params)
 
     def build(
         self,
@@ -306,10 +308,27 @@ class BinarizationModel:
 
         # Binarize the reference panel (full shape M_original × K) and
         # append the 0.5 unknown column.
-        ref_binary_full = _binarize_reference_panel(
-            reference.methylation,
-            hard_threshold=self.hard_threshold,
-        )
+        if self.hard_threshold is not None:
+            ref_binary_full = _binarize_reference_panel(
+                reference.methylation,
+                hard_threshold=self.hard_threshold,
+            )
+        elif self.learned_threshold_from_params:
+            # Per-marker binary reference thresholding using learned tau_high
+            # from the marker's context bin. This keeps reference binarization
+            # consistent with learned-threshold sample calling.
+            thr_full = np.asarray(binarization.tau_high, dtype=np.float64)[context_bin]
+            ref_arr = np.asarray(reference.methylation, dtype=np.float64)
+            ref_binary_full = np.where(
+                np.isfinite(ref_arr) & (ref_arr >= thr_full[:, None]),
+                1.0,
+                0.0,
+            ).astype(np.float64)
+        else:
+            ref_binary_full = _binarize_reference_panel(
+                reference.methylation,
+                hard_threshold=None,
+            )
         K = ref_binary_full.shape[1]
         unknown_col = np.full((ref_binary_full.shape[0], 1), 0.5, dtype=np.float64)
         ref_full = np.hstack([ref_binary_full, unknown_col])  # (M_original, K+1)

@@ -252,6 +252,40 @@ def test_apply_binarization_hard_threshold_has_no_ambiguous():
     assert int(np.sum(binarized.called_state == STATE_AMBIGUOUS)) == 0
 
 
+def test_apply_binarization_learned_threshold_from_params_is_per_bin_binary():
+    """Per-bin learned-threshold mode must use tau_high by marker bin and
+    disable Ambiguous calls."""
+    params = build_identity_placeholder_params()
+    # Distinct learned M cutoffs by class-bin:
+    # CGI bin 0 -> 0.20, shore bin 2 -> 0.80
+    params.tau_high[0] = 0.20
+    params.tau_high[2] = 0.80
+
+    # Same predicted beta on two markers, but different bins via region class.
+    pred = np.array([0.50, 0.50], dtype=np.float32)
+    obs = _mk_obs("s1", pred)
+    ann = pd.DataFrame(
+        {
+            "chrom": ["chr1", "chr1"],
+            "start": [1000, 2000],
+            "end": [1100, 2100],
+            "cpg_density": [0.15, 0.05],  # CGI (bin 0), shore (bin 2)
+            "region_class": ["CGI", "shore"],
+        }
+    )
+    out = apply_binarization(
+        obs,
+        params,
+        region_annotations=ann,
+        learned_threshold_from_params=True,
+    )
+
+    assert out.context_bin.tolist() == [0, 2]
+    assert out.called_state[0] == STATE_M  # 0.50 >= 0.20
+    assert out.called_state[1] == STATE_U  # 0.50 < 0.80
+    assert int(np.sum(out.called_state == STATE_AMBIGUOUS)) == 0
+
+
 def test_apply_binarization_respects_usable_flag():
     """Markers in bins with usable=False must be Excluded even when
     predicted_beta is in the U/M range."""
@@ -796,6 +830,49 @@ def test_binarization_model_filters_ambiguous_and_excluded():
 
     model = BinarizationModel().build(binarized, params, reference)
     assert model.n_markers == 2  # only the 2 called markers pass
+
+
+def test_binarization_model_learned_threshold_reference_binarization_per_bin():
+    """When learned-threshold mode is enabled, reference binarization must
+    use per-marker tau_high from the marker's context bin."""
+    params = build_identity_placeholder_params()
+    params.tau_high[0] = 0.20  # CGI
+    params.tau_high[2] = 0.80  # shore
+
+    # Same reference methylation value at both markers; different context
+    # bins must produce different binary reference rows.
+    reference = ReferencePanel(
+        chrom=np.array(["chr1", "chr1"], dtype=object),
+        start=np.array([1000, 2000], dtype=np.int64),
+        end=np.array([1100, 2100], dtype=np.int64),
+        cell_types=["CT0"],
+        methylation=np.array([[0.30], [0.30]], dtype=np.float32),
+        coverage=None,
+    )
+    obs = _mk_obs("s1", np.array([0.90, 0.10], dtype=np.float32))
+    ann = pd.DataFrame(
+        {
+            "chrom": ["chr1", "chr1"],
+            "start": [1000, 2000],
+            "end": [1100, 2100],
+            "cpg_density": [0.15, 0.05],  # CGI (bin 0), shore (bin 2)
+            "region_class": ["CGI", "shore"],
+        }
+    )
+    binarized = apply_binarization(
+        obs,
+        params,
+        region_annotations=ann,
+        learned_threshold_from_params=True,
+    )
+    model = BinarizationModel(learned_threshold_from_params=True).build(
+        binarized, params, reference
+    )
+
+    # CT0 column in reference_binary should be thresholded per-row:
+    # row0 threshold=0.20 => 0.30 -> 1
+    # row1 threshold=0.80 => 0.30 -> 0
+    np.testing.assert_array_equal(model.reference_binary[:, 0], np.array([1.0, 0.0]))
 
 
 def test_binarization_model_raises_when_no_binarization_applied():
