@@ -141,11 +141,9 @@ def run_group_comparisons(
             )
         elif method == TestMethod.BAYESIAN_POSTERIOR:
             if not posterior_samples_by_sample:
-                pairwise = compositional_regression_test(
-                    proportions, sample_ids, group_labels, cell_type_names, contrasts,
-                    covariates=covariates,
-                    fdr_alpha=1.0,
-                )
+                # Keep bayesian rows explicit in the output even when
+                # posterior draws are unavailable.
+                pairwise = _nan_bayesian_results(cell_type_names, contrasts)
             else:
                 sample_groups_map = {
                     sid: lab for sid, lab in zip(sample_ids, group_labels)
@@ -169,6 +167,30 @@ def run_group_comparisons(
     # omnibus rows are not stuck with NaN adjusted_p_value (architecture §10.3).
     apply_fdr(results, alpha=fdr_alpha, method=fdr_method)
     return results
+
+
+def _nan_bayesian_results(
+    cell_type_names: list[str],
+    contrasts: list[tuple[str, str]],
+) -> list[TestResult]:
+    """Return explicit NA bayesian rows when posterior samples are unavailable."""
+    out: list[TestResult] = []
+    for ct in cell_type_names:
+        for group_a, group_b in contrasts:
+            out.append(
+                TestResult(
+                    cell_type=ct,
+                    contrast=f"{group_a}_vs_{group_b}",
+                    test_type="bayesian",
+                    mean_a=float("nan"),
+                    mean_b=float("nan"),
+                    effect_size=float("nan"),
+                    se=float("nan"),
+                    statistic=float("nan"),
+                    p_value=float("nan"),
+                )
+            )
+    return out
 
 
 __all__ = [

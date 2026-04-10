@@ -646,10 +646,7 @@ class TOOPipeline:
 
         # Bayesian comparison needs per-sample posterior draws (Phase E only)
         posterior_by_sample: dict[str, np.ndarray] | None = None
-        if (
-            self.config.testing.method.value == "bayesian_posterior"
-            and any(r.posterior_samples is not None for r in results)
-        ):
+        if any(r.posterior_samples is not None for r in results):
             posterior_by_sample = {
                 r.sample_id: r.posterior_samples
                 for r in results
@@ -664,19 +661,53 @@ class TOOPipeline:
         # sample with NaN covariates on a per-fit basis, so partially-
         # populated covariates don't kill the whole analysis.
         covariate_df = self._build_covariate_dataframe(sample_sheet, sample_ids)
+        spec_full = self.group_comparison_spec
+        spec_pairwise = spec_full
+        if isinstance(spec_full, str) and spec_full.strip().lower().startswith("omnibus"):
+            # Run omnibus once (ILR call below), and keep Bayesian/Wilcoxon
+            # on pairwise contrasts only to avoid triplicate omnibus rows.
+            spec_pairwise = "all"
 
-        return run_group_comparisons(
+        # 1) ILR (includes omnibus rows when requested)
+        results_ilr = run_group_comparisons(
             proportions=prop,
             sample_ids=sample_ids,
             group_labels=labels,
             cell_type_names=results[0].cell_types,
-            spec=self.group_comparison_spec,
-            method=self.config.testing.method,
+            spec=spec_full,
+            method=TestMethod.ILR_REGRESSION,
+            fdr_alpha=self.config.testing.fdr_alpha,
+            fdr_method=self.config.testing.fdr_method,
+            posterior_samples_by_sample=None,
+            covariates=covariate_df,
+        )
+        # 2) Bayesian posterior comparison (pairwise)
+        results_bayes = run_group_comparisons(
+            proportions=prop,
+            sample_ids=sample_ids,
+            group_labels=labels,
+            cell_type_names=results[0].cell_types,
+            spec=spec_pairwise,
+            method=TestMethod.BAYESIAN_POSTERIOR,
             fdr_alpha=self.config.testing.fdr_alpha,
             fdr_method=self.config.testing.fdr_method,
             posterior_samples_by_sample=posterior_by_sample,
+            covariates=None,
+        )
+        # 3) Wilcoxon (pairwise)
+        results_wilcoxon = run_group_comparisons(
+            proportions=prop,
+            sample_ids=sample_ids,
+            group_labels=labels,
+            cell_type_names=results[0].cell_types,
+            spec=spec_pairwise,
+            method=TestMethod.WILCOXON,
+            fdr_alpha=self.config.testing.fdr_alpha,
+            fdr_method=self.config.testing.fdr_method,
+            posterior_samples_by_sample=None,
             covariates=covariate_df,
         )
+        return results_ilr + results_bayes + results_wilcoxon
 
     def _build_covariate_dataframe(
         self,
