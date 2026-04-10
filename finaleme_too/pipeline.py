@@ -24,6 +24,7 @@ import pandas as pd
 from finaleme_too.config import (
     CoverageTier,
     MeasurementMode,
+    TestMethod,
     TOOConfig,
 )
 from finaleme_too.core.deconvolution import (
