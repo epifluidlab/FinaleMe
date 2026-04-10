@@ -1010,6 +1010,9 @@ public class BetaValueDeconvolution {
         if (queryFile.endsWith(".beta") || queryFile.endsWith(".lbeta")) {
             return loadQueryFromBeta(queryFile, windows, cpgIndex);
         } else if (queryFile.endsWith(".bed.gz") || queryFile.endsWith(".bed")) {
+            if (isPredictionBedPath(queryFile)) {
+                return loadQueryFromPredictionOverlap(queryFile, windows);
+            }
             return loadQueryFromBed(queryFile, windows, cpgIndex);
         } else {
             throw new IllegalArgumentException(
@@ -1025,6 +1028,76 @@ public class BetaValueDeconvolution {
         for (int w = 0; w < windows.size(); w++) {
             if (counts[w][1] >= minCoverage) {
                 result[w] = (double) counts[w][0] / counts[w][1];
+            } else {
+                result[w] = Double.NaN;
+            }
+        }
+        return result;
+    }
+
+    private boolean isPredictionBedPath(String path) {
+        String lower = path.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".prediction.bed") || lower.endsWith(".prediction.bed.gz");
+    }
+
+    /**
+     * FinaleMe prediction.bed(.gz) path.
+     * Uses legacy genomic interval overlap (start/end) by design.
+     */
+    private double[] loadQueryFromPredictionOverlap(String predFile, List<Window> windows)
+            throws IOException {
+        int numWindows = windows.size();
+        long[] methyCounts = new long[numWindows];
+        long[] totalCounts = new long[numWindows];
+
+        // Build interval lookup: chr -> sorted list of (start, end, windowIndex)
+        Map<String, List<int[]>> chrWindowMap = new HashMap<>();
+        for (int w = 0; w < numWindows; w++) {
+            Window win = windows.get(w);
+            chrWindowMap.computeIfAbsent(win.chr, k -> new ArrayList<>())
+                    .add(new int[]{win.start, win.end, w});
+        }
+
+        InputStream input = predFile.endsWith(".gz")
+                ? new GZIPInputStream(new FileInputStream(predFile))
+                : new FileInputStream(predFile);
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith("#") || line.isEmpty()) continue;
+                String[] parts = line.split("\t");
+                if (parts.length < 6) continue;
+
+                String chr = parts[0];
+                int pos;
+                double methyCount, totalCount;
+                try {
+                    pos = Integer.parseInt(parts[1]);
+                    methyCount = Double.parseDouble(parts[4]); // methy_count_predict
+                    totalCount = Double.parseDouble(parts[5]); // total_count_predict
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+
+                List<int[]> chrWindows = chrWindowMap.get(chr);
+                if (chrWindows == null) continue;
+
+                // Find which window this CpG falls in (linear scan; windows are sorted)
+                for (int[] wInfo : chrWindows) {
+                    if (pos >= wInfo[0] && pos < wInfo[1]) {
+                        int wIdx = wInfo[2];
+                        methyCounts[wIdx] += (long) methyCount;
+                        totalCounts[wIdx] += (long) totalCount;
+                        break;
+                    }
+                }
+            }
+        }
+
+        double[] result = new double[numWindows];
+        for (int w = 0; w < numWindows; w++) {
+            if (totalCounts[w] >= minCoverage) {
+                result[w] = (double) methyCounts[w] / totalCounts[w];
             } else {
                 result[w] = Double.NaN;
             }
