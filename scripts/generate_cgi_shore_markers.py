@@ -13,10 +13,12 @@ Pipeline stages:
   Stage 1: Generate CGI+shore BED regions
   Stage 2: Generate candidate blocks within CGI+shore
   Stage 3: Find tissue-specific markers with adaptive thresholds
-  Stage 4: Build reference panel (per-marker methylated_count/total_count per cell type)
+  Stage 4: Build count-based panel outputs:
+           - reference panel TSV (chrom/start/end + per-cell-type k/n)
+           - UXM-atlas-compatible TSV (same marker rows as Stage 3 + per-cell-type k/n)
   Stage 5: Generate validation report
 
-The Stage 4 output is a TSV with format:
+The Stage 4 reference-panel output is a TSV with format:
 
     chrom  start  end  CellType1     CellType2     ...
     chr1   1000   1500 125/250       30/250        ...
@@ -25,6 +27,11 @@ Each cell value is ``methylated_count/total_count`` aggregated across all
 reference samples in that cell type's group. The downstream loader detects
 this format and produces both a methylation matrix (k/n ratios) and a
 coverage matrix (n values) for reference uncertainty weighting.
+
+Stage 4 also writes an atlas-style file with the original marker metadata
+columns (chr/start/end/startCpG/endCpG/target/name/direction) plus the same
+per-cell-type ``k/n`` values, preserving marker row identity/order from
+Stage 3.
 
 Usage:
   python generate_cgi_shore_markers.py --genome hg19 --num-markers 250 \\
@@ -476,6 +483,84 @@ def merge_marker_files(markers_dir, out_path):
     return merged
 
 
+def _run_legacy_atlas_build(args, markers_path, atlas_path):
+    """Run the original UXM atlas builder to preserve legacy row behavior."""
+    build_py = op.join(args.uxm_path, 'src', 'build.py')
+    if not op.isfile(build_py):
+        raise RuntimeError(f'UXM_deconv build.py not found at {build_py}')
+
+    pat_str = ' '.join(args.pats)
+    cmd = (f'python3 {build_py} '
+           f'--markers {markers_path} '
+           f'--groups {args.groups} '
+           f'--pats {pat_str} '
+           f'--output {atlas_path} '
+           f'-l {args.rlen} '
+           f'--use_um')
+    if args.threads:
+        cmd += f' -@ {args.threads}'
+    if args.verbose:
+        cmd += ' -v'
+
+    eprint('  Building legacy atlas row template (UXM build.py)...')
+    run_cmd(cmd, verbose=args.verbose)
+    if not op.isfile(atlas_path):
+        raise RuntimeError(f'Legacy atlas was not created: {atlas_path}')
+
+
+def _select_legacy_coordinate_columns(df):
+    """Detect chromosome/start/end columns in an atlas dataframe."""
+    chr_col = 'chr' if 'chr' in df.columns else '#chr' if '#chr' in df.columns else 'chrom' if 'chrom' in df.columns else None
+    if chr_col is None:
+        raise RuntimeError(f'Cannot find chromosome column in atlas: {list(df.columns)}')
+    if 'start' not in df.columns or 'end' not in df.columns:
+        raise RuntimeError(f'Cannot find start/end columns in atlas: {list(df.columns)}')
+    return chr_col, 'start', 'end'
+
+
+def _build_count_output_frames(legacy_atlas_df, cell_types, agg_methy, agg_total):
+    """Build Stage-4 outputs while preserving legacy atlas row identity/order.
+
+    Returns:
+        panel_df: chrom/start/end + per-cell-type k/n values
+        atlas_df: legacy first 8 columns + per-cell-type k/n values
+    """
+    if legacy_atlas_df.shape[1] < 8:
+        raise RuntimeError(
+            f'Legacy atlas must have at least 8 metadata columns, got {legacy_atlas_df.shape[1]}'
+        )
+
+    chr_col, start_col, end_col = _select_legacy_coordinate_columns(legacy_atlas_df)
+    start_vals = pd.to_numeric(legacy_atlas_df[start_col], errors='coerce')
+    end_vals = pd.to_numeric(legacy_atlas_df[end_col], errors='coerce')
+    if start_vals.isna().any() or end_vals.isna().any():
+        raise RuntimeError('Legacy atlas has non-numeric start/end values.')
+
+    marker_chroms = legacy_atlas_df[chr_col].astype(str).to_numpy()
+    marker_starts = start_vals.astype(np.int64).to_numpy()
+    marker_ends = end_vals.astype(np.int64).to_numpy()
+    n_markers = len(legacy_atlas_df)
+
+    def _kn_col(ci):
+        return [f'{agg_methy[mi, ci]}/{agg_total[mi, ci]}' for mi in range(n_markers)]
+
+    # Reference panel for -refPanel mode.
+    panel_df = pd.DataFrame({
+        'chrom': marker_chroms,
+        'start': marker_starts,
+        'end': marker_ends,
+    })
+    for ci, ct in enumerate(cell_types):
+        panel_df[ct] = _kn_col(ci)
+
+    # Atlas output: preserve first 8 metadata columns exactly as legacy.
+    atlas_df = legacy_atlas_df.iloc[:, :8].copy()
+    for ci, ct in enumerate(cell_types):
+        atlas_df[ct] = _kn_col(ci)
+
+    return panel_df, atlas_df
+
+
 def stage3_find_markers(args, blocks_path):
     """Find tissue-specific markers with adaptive thresholds."""
     eprint('\n=== Stage 3: Find Tissue-Specific Markers ===')
@@ -714,47 +799,45 @@ def stage3_find_markers(args, blocks_path):
 ###############################################################################
 
 def stage4_build_reference_panel(args, markers_path):
-    """Build a reference panel TSV from markers and reference .beta files.
+    """Build count-based outputs with legacy atlas row behavior.
 
-    The output is a TSV directly consumable by ``finaleme-too run
-    --reference-panel`` and ``BetaValueDeconvolution -refPanel``:
-
-        chrom  start  end  CellType1       CellType2       ...
-        chr1   1000   1500 125/250         30/250          ...
-        chr1   5000   5800 5/180           160/180         ...
-
-    Each cell value is ``methylated_count/total_count`` aggregated across
-    all reference samples in that cell type's group. This pre-computed
-    format eliminates the need to reload all .beta files at runtime,
-    which is the dominant startup cost for large reference panels.
-
-    The downstream loader (``ReferencePanelLoader.load_matrix``) detects
-    the ``k/n`` format and produces both a ``methylation`` matrix
-    (``k/n`` ratios) and a ``coverage`` matrix (``n`` values) that the
-    observation model uses for reference uncertainty weighting (math doc
-    §2.4).
+    Row identity/order is produced by the original UXM ``build.py`` pipeline
+    (legacy behavior), then per-cell-type value columns are replaced by
+    ``methylated_count/total_count`` derived from reference .beta files.
     """
     eprint('\n=== Stage 4: Build Reference Panel ===')
 
-    panel_path = op.join(args.out_dir,
-                         f'ReferencePanel.CGI_shore.U{args.num_markers}.{args.genome}.tsv')
+    panel_path = op.join(
+        args.out_dir, f'ReferencePanel.CGI_shore.U{args.num_markers}.{args.genome}.tsv'
+    )
+    atlas_path = op.join(
+        args.out_dir, f'Atlas.CGI_shore.U{args.num_markers}.l{args.rlen}.{args.genome}.tsv'
+    )
 
-    if op.isfile(panel_path) and not args.force:
-        eprint(f'  Output exists: {panel_path}')
-        return panel_path
+    if op.isfile(panel_path) and op.isfile(atlas_path) and not args.force:
+        eprint(f'  Outputs exist: {panel_path} and {atlas_path}')
+        return panel_path, atlas_path
 
-    # Load marker regions
-    markers_df = pd.read_csv(markers_path, sep='\t')
-    chr_col = '#chr' if '#chr' in markers_df.columns else 'chr'
-    if chr_col not in markers_df.columns:
-        raise RuntimeError(f'Markers file missing chromosome column; '
-                           f'columns: {list(markers_df.columns)}')
+    # Build or reuse legacy atlas row template.
+    if op.isfile(atlas_path) and not args.force:
+        eprint(f'  Reusing existing legacy atlas template: {atlas_path}')
+    else:
+        _run_legacy_atlas_build(args, markers_path, atlas_path)
 
-    marker_chroms = markers_df[chr_col].to_numpy(dtype=str)
-    marker_starts = markers_df['start'].to_numpy(dtype=np.int64)
-    marker_ends = markers_df['end'].to_numpy(dtype=np.int64)
-    n_markers = len(markers_df)
-    eprint(f'  Marker regions: {n_markers}')
+    legacy_atlas_df = pd.read_csv(atlas_path, sep='\t')
+    if legacy_atlas_df.empty:
+        raise RuntimeError(f'Legacy atlas has no rows: {atlas_path}')
+    if legacy_atlas_df.shape[1] < 8:
+        raise RuntimeError(
+            f'Legacy atlas must have >=8 columns, got {legacy_atlas_df.shape[1]} in {atlas_path}'
+        )
+
+    legacy_chr_col, legacy_start_col, legacy_end_col = _select_legacy_coordinate_columns(legacy_atlas_df)
+    marker_chroms = legacy_atlas_df[legacy_chr_col].astype(str).to_numpy()
+    marker_starts = pd.to_numeric(legacy_atlas_df[legacy_start_col], errors='coerce').astype(np.int64).to_numpy()
+    marker_ends = pd.to_numeric(legacy_atlas_df[legacy_end_col], errors='coerce').astype(np.int64).to_numpy()
+    n_markers = len(legacy_atlas_df)
+    eprint(f'  Legacy atlas markers: {n_markers}')
 
     # Build a MarkerRegions-like struct for the .beta reader
     # (we import lazily to avoid a hard dependency on the finaleme_too
@@ -780,7 +863,15 @@ def stage4_build_reference_panel(args, markers_path):
     if not has_finaleme_too:
         eprint('  WARNING: finaleme_too not installed — using fallback .beta parser.')
         eprint('  Install finaleme_too for faster, validated .beta parsing.')
-        return _stage4_fallback_slow(args, markers_df, chr_col, panel_path)
+        return _stage4_fallback_slow(
+            args,
+            legacy_atlas_df,
+            legacy_chr_col,
+            legacy_start_col,
+            legacy_end_col,
+            panel_path,
+            atlas_path,
+        )
 
     # Load CpG index
     cpg_index_path = op.join(args.wgbstools_path, 'references', args.genome,
@@ -802,7 +893,12 @@ def stage4_build_reference_panel(args, markers_path):
         .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
     )
     sample_to_group = dict(zip(groups_df['name_stripped'], groups_df['group']))
-    cell_types = sorted(set(groups_df['group']))
+    # Preserve legacy atlas cell-type column order when available.
+    atlas_cell_types = [str(c) for c in legacy_atlas_df.columns[8:]]
+    if atlas_cell_types:
+        cell_types = atlas_cell_types
+    else:
+        cell_types = sorted(set(groups_df['group']))
     ct_to_index = {c: i for i, c in enumerate(cell_types)}
     n_ct = len(cell_types)
     eprint(f'  Cell types: {n_ct} — {cell_types}')
@@ -811,12 +907,16 @@ def stage4_build_reference_panel(args, markers_path):
     agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
     agg_total = np.zeros((n_markers, n_ct), dtype=np.int64)
     n_matched = 0
+    skipped_group_mismatch = 0
 
     for beta_path_str in args.betas:
         beta_path = Path(beta_path_str)
         sample_name = _beta_basename_to_sample_name(beta_path)
         group = sample_to_group.get(sample_name)
         if group is None:
+            continue
+        if group not in ct_to_index:
+            skipped_group_mismatch += 1
             continue
         ci = ct_to_index[group]
         counts = _load_beta_file_to_markers(beta_path, marker_regions, cpg_index)
@@ -825,37 +925,35 @@ def stage4_build_reference_panel(args, markers_path):
         n_matched += 1
 
     eprint(f'  Matched beta files: {n_matched}/{len(args.betas)}')
+    if skipped_group_mismatch > 0:
+        eprint(f'  WARNING: skipped {skipped_group_mismatch} matched betas due to group not present in legacy atlas columns.')
 
     if n_matched == 0:
         eprint('  ERROR: No beta files matched the groups file!')
         raise RuntimeError('No beta files matched — check groups file sample names.')
 
-    # Build the output DataFrame
-    out_df = pd.DataFrame({
-        'chrom': marker_chroms,
-        'start': marker_starts,
-        'end': marker_ends,
-    })
-    for ci, ct in enumerate(cell_types):
-        # Format as "methylated_count/total_count"
-        col_values = []
-        for mi in range(n_markers):
-            col_values.append(f'{agg_methy[mi, ci]}/{agg_total[mi, ci]}')
-        out_df[ct] = col_values
-
-    out_df.to_csv(panel_path, sep='\t', index=False)
+    panel_df, atlas_df = _build_count_output_frames(
+        legacy_atlas_df=legacy_atlas_df,
+        cell_types=cell_types,
+        agg_methy=agg_methy,
+        agg_total=agg_total,
+    )
+    panel_df.to_csv(panel_path, sep='\t', index=False)
+    atlas_df.to_csv(atlas_path, sep='\t', index=False)
 
     eprint(f'  Reference panel written: {panel_path}')
+    eprint(f'  Atlas-style k/n file written: {atlas_path} (legacy row structure preserved)')
     eprint(f'  Shape: {n_markers} markers x {n_ct} cell types')
     eprint(f'  Format: methylated_count/total_count per cell')
     eprint(f'  Usage:')
     eprint(f'    finaleme-too run --reference-panel {panel_path} ...')
     eprint(f'    BetaValueDeconvolution -refPanel {panel_path} ...')
+    eprint(f'    BetaValueDeconvolution -markerRegions {atlas_path} ...')
 
-    return panel_path
+    return panel_path, atlas_path
 
 
-def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
+def _stage4_fallback_slow(args, legacy_atlas_df, chr_col, start_col, end_col, panel_path, atlas_path):
     """Fallback .beta parser when finaleme_too is not installed.
 
     Reads each .beta file as raw binary (uint8 pairs), looks up CpG
@@ -903,17 +1001,22 @@ def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
         .str.replace(r'\.(pat\.gz|beta|pat)$', '', regex=True)
     )
     sample_to_group = dict(zip(groups_df['name_stripped'], groups_df['group']))
-    cell_types = sorted(set(groups_df['group']))
+    atlas_cell_types = [str(c) for c in legacy_atlas_df.columns[8:]]
+    if atlas_cell_types:
+        cell_types = atlas_cell_types
+    else:
+        cell_types = sorted(set(groups_df['group']))
     ct_to_index = {c: i for i, c in enumerate(cell_types)}
 
-    marker_chroms = markers_df[chr_col].to_numpy(dtype=str)
-    marker_starts = markers_df['start'].to_numpy(dtype=np.int64)
-    marker_ends = markers_df['end'].to_numpy(dtype=np.int64)
-    n_markers = len(markers_df)
+    marker_chroms = legacy_atlas_df[chr_col].astype(str).to_numpy()
+    marker_starts = pd.to_numeric(legacy_atlas_df[start_col], errors='coerce').astype(np.int64).to_numpy()
+    marker_ends = pd.to_numeric(legacy_atlas_df[end_col], errors='coerce').astype(np.int64).to_numpy()
+    n_markers = len(legacy_atlas_df)
     n_ct = len(cell_types)
     agg_methy = np.zeros((n_markers, n_ct), dtype=np.int64)
     agg_total = np.zeros((n_markers, n_ct), dtype=np.int64)
     n_matched = 0
+    skipped_group_mismatch = 0
 
     for beta_path_str in args.betas:
         beta_path = Path(beta_path_str)
@@ -924,6 +1027,9 @@ def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
                 break
         group = sample_to_group.get(name)
         if group is None:
+            continue
+        if group not in ct_to_index:
+            skipped_group_mismatch += 1
             continue
         ci = ct_to_index[group]
 
@@ -953,20 +1059,23 @@ def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
         n_matched += 1
 
     eprint(f'  [fallback] Matched beta files: {n_matched}/{len(args.betas)}')
+    if skipped_group_mismatch > 0:
+        eprint(f'  [fallback] WARNING: skipped {skipped_group_mismatch} matched betas due to group not present in legacy atlas columns.')
 
-    out_df = pd.DataFrame({
-        'chrom': marker_chroms,
-        'start': marker_starts,
-        'end': marker_ends,
-    })
-    for ci, ct in enumerate(cell_types):
-        col_values = [f'{agg_methy[mi, ci]}/{agg_total[mi, ci]}'
-                      for mi in range(n_markers)]
-        out_df[ct] = col_values
+    if n_matched == 0:
+        raise RuntimeError('No beta files matched — check groups file names and atlas cell-type columns.')
 
-    out_df.to_csv(panel_path, sep='\t', index=False)
+    panel_df, atlas_df = _build_count_output_frames(
+        legacy_atlas_df=legacy_atlas_df,
+        cell_types=cell_types,
+        agg_methy=agg_methy,
+        agg_total=agg_total,
+    )
+    panel_df.to_csv(panel_path, sep='\t', index=False)
+    atlas_df.to_csv(atlas_path, sep='\t', index=False)
     eprint(f'  [fallback] Reference panel written: {panel_path}')
-    return panel_path
+    eprint(f'  [fallback] Atlas-style k/n file written: {atlas_path}')
+    return panel_path, atlas_path
 
 
 ###############################################################################
@@ -976,7 +1085,7 @@ def _stage4_fallback_slow(args, markers_df, chr_col, panel_path):
 ###############################################################################
 
 def stage5_validation_report(args, cgi_shore_bed, blocks_path, markers_path,
-                             panel_path):
+                             panel_path, atlas_path):
     """Generate validation report."""
     eprint('\n=== Stage 5: Validation Report ===')
 
@@ -1066,6 +1175,19 @@ def stage5_validation_report(args, cgi_shore_bed, blocks_path, markers_path,
         lines.append(f'Markers: {len(full_panel)}')
     else:
         lines.append('  Reference panel file not found!')
+    lines.append('')
+
+    # Atlas-style k/n file info
+    lines.append('--- Atlas-Style k/n Output ---')
+    if op.isfile(atlas_path):
+        atlas_df = pd.read_csv(atlas_path, sep='\t', nrows=5)
+        lines.append(f'Atlas-style file: {atlas_path}')
+        lines.append('Format: UXM-atlas columns + methylated_count/total_count per cell type')
+        lines.append(f'Columns: {list(atlas_df.columns[:8])} + {max(0, atlas_df.shape[1] - 8)} cell-type columns')
+        full_atlas = pd.read_csv(atlas_path, sep='\t', usecols=[0])
+        lines.append(f'Rows: {len(full_atlas)}')
+    else:
+        lines.append('  Atlas-style file not found!')
     lines.append('')
 
     lines.append('=' * 70)
@@ -1206,16 +1328,17 @@ def main():
     markers_path = stage3_find_markers(args, blocks_path)
 
     # Stage 4: Build reference panel
-    panel_path = stage4_build_reference_panel(args, markers_path)
+    panel_path, atlas_path = stage4_build_reference_panel(args, markers_path)
 
     # Stage 5: Validation report
     stage5_validation_report(args, cgi_shore_bed, blocks_path,
-                            markers_path, panel_path)
+                            markers_path, panel_path, atlas_path)
 
     eprint('\n' + '=' * 70)
     eprint('Pipeline complete!')
     eprint(f'  Markers: {markers_path}')
     eprint(f'  Reference panel: {panel_path}')
+    eprint(f'  Atlas-style k/n file: {atlas_path}')
     eprint(f'  Use with:')
     eprint(f'    finaleme-too run --reference-panel {panel_path} \\')
     eprint(f'      --marker-regions {markers_path} ...')

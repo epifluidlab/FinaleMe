@@ -426,6 +426,7 @@ public class BetaValueDeconvolution {
         Set<String> seen = new HashSet<>();
         int skippedNonAutosome = 0;
         int skippedDuplicate = 0;
+        int skippedNoCpg = 0;
         int parsedRows = 0;
 
         try {
@@ -481,7 +482,8 @@ public class BetaValueDeconvolution {
                         ? (endCpgLast + 1)
                         : 0;
                 if (endCpgExclusive == 0) {
-                    startCpgIdx = 0;
+                    skippedNoCpg++;
+                    continue;
                 }
                 windows.add(new Window(chr, start, end, startCpgIdx, endCpgExclusive));
 
@@ -536,8 +538,8 @@ public class BetaValueDeconvolution {
 
         log.info(
                 "Reference panel parsing: {} data rows -> {} kept "
-                        + "(skipped {} non-autosome, {} duplicate)",
-                parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate
+                        + "(skipped {} non-autosome, {} duplicate, {} no-CpG)",
+                parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate, skippedNoCpg
         );
 
         return new Object[]{windows, refMatrix, cellTypes};
