@@ -849,7 +849,12 @@ class TOOPipeline:
             and obs.called_state is not None
             and obs.context_bin is not None
         )
+        # Coverage tier and reported mean_coverage should both be based on
+        # the full marker panel for this sample (before per-marker filtering
+        # for likelihood/deconvolution), so qc_summary reflects cohort-wide
+        # sample depth rather than depth over only n_markers_used.
         tier = self.tier_assigner.assign(obs)
+        mean_coverage_all_markers = effective_coverage_in_markers(obs)
 
         binarization_flag: str | None = None
         binarization_debug: dict | None = None
@@ -1227,11 +1232,11 @@ class TOOPipeline:
                 top_n=50,
             )
         # Mean coverage = effective depth of coverage in marker regions
-        # (Σ reads * fragment_length / Σ marker_widths). Same scale as the
-        # tier classification thresholds, so qc_summary.tsv's coverage_tier
-        # and mean_coverage columns are always self-consistent. Both paths
-        # compute this from obs_filtered which always has k/n.
-        mean_coverage = effective_coverage_in_markers(obs_filtered)
+        # (Σ reads * fragment_length / Σ marker_widths), computed over ALL
+        # marker regions in the sample (pre-filter), not just n_markers_used.
+        # This keeps qc_summary.tsv coverage_tier and mean_coverage aligned to
+        # the same sample-level definition.
+        mean_coverage = mean_coverage_all_markers
 
         # pct_imputed: fraction of markers where the pre-imputation n was below
         # the per-marker tier threshold but the post-imputation n is at or

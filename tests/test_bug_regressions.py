@@ -1601,6 +1601,65 @@ def test_pipeline_writes_consistent_qc_summary_for_high_coverage_sample(tmp_path
             f"mean_coverage {mc} not close to expected {expected_cov}"
 
 
+def test_pipeline_mean_coverage_uses_all_markers_not_only_used_markers(tmp_path):
+    """Regression: mean_coverage/coverage_tier must be based on all markers.
+
+    We create samples where half the markers have deep coverage (n=120) and
+    half have zero coverage (n=0). Deconvolution uses only covered markers,
+    so a buggy implementation that computes mean_coverage from n_markers_used
+    reports ~40x instead of the correct all-marker value ~20x.
+    """
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+    from finaleme_too.preprocessing.coverage import FRAGMENT_LENGTH_BP
+
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=2)
+
+    for s in sheet.samples:
+        bed = s.methylation_file
+        lines = bed.read_text().splitlines()
+        new_lines = []
+        for i, line in enumerate(lines):
+            parts = line.split("\t")
+            # bissnp_6plus2: chrom start end name score strand methPct totalCount
+            if i < len(lines) // 2:
+                parts[7] = "120"
+            else:
+                parts[7] = "0"
+            new_lines.append("\t".join(parts))
+        bed.write_text("\n".join(new_lines) + "\n")
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 5
+    cfg.uncertainty.seed = 7
+    cfg.markers.n_per_type = 0  # skip marker selection
+    # Force the all-marker coverage (~20x) into LOW while the used-marker-only
+    # coverage (~40x) would be HIGH. This catches the scope bug.
+    cfg.coverage.tier_high = 30.0
+    cfg.coverage.tier_low = 0.5
+
+    out_dir = tmp_path / "out_qc_all_markers"
+    out_dir.mkdir(exist_ok=True)
+    TOOPipeline(cfg).run(sheet, reference, marker_regions, out_dir)
+
+    qc = pd.read_csv(out_dir / "qc_summary.tsv", sep="\t")
+    expected_all_markers_cov = (20 * 120 * FRAGMENT_LENGTH_BP) / (40 * 500)
+    expected_used_markers_cov = (20 * 120 * FRAGMENT_LENGTH_BP) / (20 * 500)
+
+    tiers = qc.loc[qc["metric"] == "coverage_tier"].iloc[0, 1:].tolist()
+    assert all(str(v) == "LOW" for v in tiers), f"Expected LOW tiers, got {tiers}"
+
+    mean_cov_values = [
+        float(v) for v in qc.loc[qc["metric"] == "mean_coverage"].iloc[0, 1:].tolist()
+    ]
+    for mc in mean_cov_values:
+        assert abs(mc - expected_all_markers_cov) < 2.0, \
+            f"mean_coverage {mc} not close to all-marker expected {expected_all_markers_cov}"
+        assert abs(mc - expected_used_markers_cov) > 5.0, \
+            f"mean_coverage {mc} looks like used-marker coverage {expected_used_markers_cov}"
+
+
 # ---------------------------------------------------------------------------
 # April 2026 — .too.tsv header comment documenting reliability semantics
 # ---------------------------------------------------------------------------
