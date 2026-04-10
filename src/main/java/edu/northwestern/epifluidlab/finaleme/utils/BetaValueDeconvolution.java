@@ -212,7 +212,7 @@ public class BetaValueDeconvolution {
         if (useRefPanel) {
             // ===== Reference panel mode: load pre-aggregated panel directly =====
             log.info("Loading pre-aggregated reference panel: {}", refPanelFile);
-            Object[] panelData = loadReferencePanel(refPanelFile);
+            Object[] panelData = loadReferencePanel(refPanelFile, cpgIndex);
             selectedWindows = (List<Window>) panelData[0];
             double[][] refMatrix = (double[][]) panelData[1];
             cellTypes = (List<String>) panelData[2];
@@ -411,7 +411,7 @@ public class BetaValueDeconvolution {
      *   [1] refMatrix — (nMarkers x nCellTypes) methylation matrix
      *   [2] cellTypes — ordered list of cell type names from the header
      */
-    private Object[] loadReferencePanel(String path) throws IOException {
+    private Object[] loadReferencePanel(String path, CpgIndex cpgIndex) throws IOException {
         BufferedReader br;
         if (path.endsWith(".gz")) {
             br = new BufferedReader(new InputStreamReader(
@@ -423,6 +423,10 @@ public class BetaValueDeconvolution {
         List<Window> windows = new ArrayList<>();
         List<double[]> rows = new ArrayList<>();
         List<String> cellTypes = null;
+        Set<String> seen = new HashSet<>();
+        int skippedNonAutosome = 0;
+        int skippedDuplicate = 0;
+        int parsedRows = 0;
 
         try {
             String line;
@@ -455,7 +459,31 @@ public class BetaValueDeconvolution {
                 String chr = parts[0];
                 int start = Integer.parseInt(parts[1]);
                 int end = Integer.parseInt(parts[2]);
-                windows.add(new Window(chr, start, end, 0, 0));
+                parsedRows++;
+
+                // Keep refPanel behavior consistent with -markerRegions mode:
+                // skip non-autosome chromosomes and deduplicate by coordinates.
+                if (chr.contains("_") || chr.equals("chrX") || chr.equals("chrY") || chr.equals("chrM")) {
+                    skippedNonAutosome++;
+                    continue;
+                }
+                String key = chr + ":" + start + "-" + end;
+                if (!seen.add(key)) {
+                    skippedDuplicate++;
+                    continue;
+                }
+
+                // Populate start/end CpG indices so query .beta inputs behave
+                // consistently with marker-regions mode.
+                int startCpgIdx = cpgIndex.getFirstCpgIndexAtOrAfter(chr, start);
+                int endCpgLast = cpgIndex.getLastCpgIndexBefore(chr, end);
+                int endCpgExclusive = (startCpgIdx > 0 && endCpgLast >= startCpgIdx)
+                        ? (endCpgLast + 1)
+                        : 0;
+                if (endCpgExclusive == 0) {
+                    startCpgIdx = 0;
+                }
+                windows.add(new Window(chr, start, end, startCpgIdx, endCpgExclusive));
 
                 int nCt = parts.length - 3;
                 double[] vals = new double[nCt];
@@ -467,7 +495,9 @@ public class BetaValueDeconvolution {
                         try {
                             long k = Long.parseLong(kn[0]);
                             long n = Long.parseLong(kn[1]);
-                            vals[i] = (n > 0) ? (double) k / n : Double.NaN;
+                            // Keep refPanel mode consistent with
+                            // loadReferenceMethylation(): enforce minCoverage.
+                            vals[i] = (n >= minCoverage) ? (double) k / n : Double.NaN;
                         } catch (NumberFormatException e) {
                             vals[i] = Double.NaN;
                         }
@@ -503,6 +533,12 @@ public class BetaValueDeconvolution {
                 refMatrix[i][j] = row[j];
             }
         }
+
+        log.info(
+                "Reference panel parsing: {} data rows -> {} kept "
+                        + "(skipped {} non-autosome, {} duplicate)",
+                parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate
+        );
 
         return new Object[]{windows, refMatrix, cellTypes};
     }
