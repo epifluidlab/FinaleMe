@@ -8,6 +8,7 @@ Two supported input modes (architecture §3.3):
 from __future__ import annotations
 
 import gzip
+import io
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -120,7 +121,20 @@ class ReferencePanelLoader:
 
     @staticmethod
     def load_matrix(filepath: str | Path) -> ReferencePanel:
-        """Load a TSV reference panel: chrom start end CellType1 CellType2 ...
+        """Load a TSV reference panel.
+
+        Supported schemas:
+
+        1) Compact reference panel (Stage-4 ``ReferencePanel.*.tsv``):
+               chrom  start  end  CellType1  CellType2 ...
+
+        2) Atlas-style panel (Stage-4 ``Atlas.*.tsv``):
+               #chr/chr  start  end  startCpG  endCpG  target  name/region
+               direction  CellType1  CellType2 ...
+
+        In atlas-style input, metadata columns (startCpG/endCpG/target/
+        name/region/direction) are ignored and only the per-cell-type value
+        columns are loaded.
 
         Two value formats are supported per cell-type column:
 
@@ -139,32 +153,92 @@ class ReferencePanelLoader:
         value is checked for a ``/`` character. If present, the count-
         ratio format is assumed for ALL cell-type columns.
         """
+        def _norm(col: object) -> str:
+            return str(col).strip().lower().lstrip("#").replace("_", "")
+
         path = Path(filepath)
         if not path.exists():
             raise InvalidReferencePanelError(f"Reference panel not found: {path}")
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt") as fh:
-            df = pd.read_csv(fh, sep="\t", comment="#")
+            # Keep "#chr" header lines while still skipping legacy UXM comment
+            # prolog lines ("#>" / "#<"), if present.
+            kept_lines = []
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("#>") or s.startswith("#<"):
+                    continue
+                if s.startswith("#") and not s.lower().startswith("#chr\t") and not s.lower().startswith("#chrom\t"):
+                    # Generic comment line (but preserve #chr/#chrom headers).
+                    continue
+                kept_lines.append(line)
+        if not kept_lines:
+            raise InvalidReferencePanelError(f"Reference panel is empty: {path}")
+        df = pd.read_csv(io.StringIO("".join(kept_lines)), sep="\t")
         if df.shape[1] < 4:
             raise InvalidReferencePanelError(
                 f"Reference panel must have >=4 columns; got {df.shape[1]}"
             )
-        # Rename leading columns case-insensitively
-        rename = {}
-        for col, target in zip(df.columns[:3], ["chrom", "start", "end"]):
-            rename[col] = target
+        cols = list(df.columns)
+        norm_cols = [_norm(c) for c in cols]
+        idx_by_norm = {k: i for i, k in enumerate(norm_cols)}
+
+        chr_idx = idx_by_norm.get("chrom", idx_by_norm.get("chr", 0))
+        start_idx = idx_by_norm.get("start", 1 if len(cols) > 1 else 0)
+        end_idx = idx_by_norm.get("end", 2 if len(cols) > 2 else 0)
+
+        rename: dict[object, str] = {}
+        rename[cols[chr_idx]] = "chrom"
+        rename[cols[start_idx]] = "start"
+        rename[cols[end_idx]] = "end"
         df = df.rename(columns=rename)
+        cols = list(df.columns)
+        norm_cols = [_norm(c) for c in cols]
+
+        # Determine where cell-type value columns start.
+        # Atlas-style files usually have "... direction <CellType...>".
+        direction_idx = next((i for i, c in enumerate(norm_cols) if c == "direction"), -1)
+        if direction_idx >= 0 and direction_idx + 1 < len(cols):
+            first_value_idx = direction_idx + 1
+        else:
+            meta_cols = {"startcpg", "endcpg", "target", "name", "region", "direction"}
+            pivot = max(start_idx, end_idx) + 1
+            meta_idx = [i for i in range(pivot, len(cols)) if norm_cols[i] in meta_cols]
+            first_value_idx = (max(meta_idx) + 1) if meta_idx else pivot
+
+        if first_value_idx >= len(cols):
+            raise InvalidReferencePanelError(
+                "Could not identify cell-type value columns in reference panel: "
+                f"{path}"
+            )
+
         # Java BetaValueDeconvolution parity: deduplicate marker coordinates
         # by (chrom, start, end), keeping the first occurrence.
         if {"chrom", "start", "end"}.issubset(df.columns):
             df = df.drop_duplicates(subset=["chrom", "start", "end"], keep="first")
-        cell_types = [str(c) for c in df.columns[3:]]
+        cell_types = [str(c) for c in df.columns[first_value_idx:]]
+        if not cell_types:
+            raise InvalidReferencePanelError(
+                "No cell-type value columns found in reference panel: "
+                f"{path}"
+            )
 
-        # Auto-detect format: check the first non-NaN value in the first
-        # cell-type column for a "/" character.
-        first_ct_col = cell_types[0]
-        first_val = str(df[first_ct_col].iloc[0])
-        is_count_ratio = "/" in first_val
+        # Auto-detect format: look for a count-ratio token in any first
+        # non-empty cell-type value.
+        is_count_ratio = False
+        for ct in cell_types:
+            series = df[ct]
+            first_token = None
+            for v in series:
+                s = str(v).strip()
+                if s and s.lower() not in {"nan", "na", "none"}:
+                    first_token = s
+                    break
+            if first_token is not None and "/" in first_token:
+                is_count_ratio = True
+                break
 
         if is_count_ratio:
             # Parse "k/n" strings into separate methylation and coverage
