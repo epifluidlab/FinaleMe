@@ -37,7 +37,10 @@ def load_fragments_from_pat(
     pat_path: str | Path,
     marker_regions: MarkerRegions,
     cpg_index: dict,
+    reference_methylation: np.ndarray | None = None,
     max_fragments: int | None = None,
+    min_cpgs: int = 3,
+    informativeness_threshold: float = 0.2,
 ) -> list[Fragment]:
     """Parse a .pat.gz file into fragments aligned to marker regions.
 
@@ -51,8 +54,21 @@ def load_fragments_from_pat(
     cpg_index : dict
         Output of :func:`finaleme_too.io.reference_panel.load_cpg_index`.
         Maps chrom → sorted CpG positions + per-chrom 1-based offsets.
+    reference_methylation : ndarray or None
+        Reference methylation matrix (n_markers × K). When provided,
+        fragment filters from design §3.5.3 are applied:
+        - Minimum CpG count (``min_cpgs``)
+        - All CpGs in the fragment must have non-NA reference values
+        - Informativeness filter (``informativeness_threshold``)
     max_fragments : int or None
         If set, stop parsing after this many fragments (useful for tests).
+    min_cpgs : int
+        Minimum number of CpGs (present in reference panel) a fragment
+        must cover to be retained. Default: 3 (design §3.5.3).
+    informativeness_threshold : float
+        Minimum informativeness score I(f) to retain a fragment. I(f) is
+        the maximum pairwise mean absolute difference across cell types
+        at the fragment's CpG positions. Default: 0.2 (design §3.5.3).
 
     Returns
     -------
@@ -140,11 +156,43 @@ def load_fragments_from_pat(
                 meth_calls.append(1 if ch == "C" else 0)
             if not marker_idx_list:
                 continue
+
+            # --- Design §3.5.3 fragment filters ---
+            cpg_arr = np.asarray(marker_idx_list, dtype=np.int64)
+
+            # Filter 1: minimum CpG count
+            if len(cpg_arr) < min_cpgs:
+                continue
+
+            if reference_methylation is not None:
+                ref = np.asarray(reference_methylation, dtype=np.float64)
+
+                # Filter 2: all CpGs must have non-NA reference values
+                valid_idx = cpg_arr[(cpg_arr >= 0) & (cpg_arr < ref.shape[0])]
+                if len(valid_idx) < min_cpgs:
+                    continue
+                ref_slice = ref[valid_idx]  # (L, K)
+                if np.isnan(ref_slice).any():
+                    continue
+
+                # Filter 3: informativeness — at least 2 cell types must
+                # differ meaningfully. I(f) = max_{t1,t2} mean(|β_t1 - β_t2|)
+                if ref_slice.shape[1] >= 2:
+                    best_diff = 0.0
+                    n_ct = ref_slice.shape[1]
+                    for t1 in range(n_ct):
+                        for t2 in range(t1 + 1, n_ct):
+                            diff = np.abs(ref_slice[:, t1] - ref_slice[:, t2]).mean()
+                            if diff > best_diff:
+                                best_diff = diff
+                    if best_diff < informativeness_threshold:
+                        continue
+
             # Emit one Fragment per unique (marker, count) repetition. We
             # expand ``count`` by appending the same Fragment ``count`` times
             # because the EM algorithm sums responsibilities per-fragment.
             frag = Fragment(
-                cpg_indices=np.asarray(marker_idx_list, dtype=np.int64),
+                cpg_indices=cpg_arr,
                 methylated=np.asarray(meth_calls, dtype=np.uint8),
             )
             for _ in range(count):
