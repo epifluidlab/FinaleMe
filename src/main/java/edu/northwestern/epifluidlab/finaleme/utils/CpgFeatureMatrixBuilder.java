@@ -147,9 +147,21 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	@Option(name="-inferMethyFromValueWig",usage="for tabix fragment input, infer methy_stat from first -valueWigs track at each CpG (>=50 => m; <50 => u) if -fragMethyColumn is unset. default: true")
 	public boolean inferMethyFromValueWig = true;
 
+	@Option(name="-useEndMotif",usage="add 5' end 4-mer motif score as a feature column in the output. Default: false")
+	public boolean useEndMotif = false;
+
+	@Option(name="-noCoverage",usage="write NaN for the Norm_Frag_cov column (coverage-free mode). Default: false")
+	public boolean noCoverage = false;
+
+	@Option(name="-saveMotifLookup",usage="save 5' end motif score lookup table (256 4-mer -> methylation rate) to TSV file during training. Default: null")
+	public String saveMotifLookup = null;
+
+	@Option(name="-loadMotifLookup",usage="load 5' end motif score lookup table from TSV file for decode mode. Default: null")
+	public String loadMotifLookup = null;
+
 	@Option(name="-t",usage="number of threads for parallel 5Mb bin processing. Use >0 to set explicitly; default uses all available cores.")
 	public int threads = -1;
-	
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -163,6 +175,10 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 	private static long startTime = -1;
 	private static long points = 0;
+
+	// 5' end motif scoring: 256 4-mer -> methylation rate mapping
+	private java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLongArray> motifCounts = null;
+	private HashMap<String, Double> motifScoreMap = null;
 
 
 	/**
@@ -195,6 +211,26 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						parser.printUsage(System.err);
 						System.err.println();
 						return;
+					}
+
+					// Validate motif lookup options
+					if (saveMotifLookup != null && !useEndMotif) {
+						throw new CmdLineException(parser, "-saveMotifLookup requires -useEndMotif", new Throwable());
+					}
+					if (loadMotifLookup != null && !useEndMotif) {
+						throw new CmdLineException(parser, "-loadMotifLookup requires -useEndMotif", new Throwable());
+					}
+					if (saveMotifLookup != null && loadMotifLookup != null) {
+						throw new CmdLineException(parser, "-saveMotifLookup and -loadMotifLookup are mutually exclusive", new Throwable());
+					}
+
+					// Initialize motif data structures
+					if (saveMotifLookup != null) {
+						motifCounts = new java.util.concurrent.ConcurrentHashMap<>();
+					}
+					if (loadMotifLookup != null) {
+						motifScoreMap = loadMotifLookupFile(loadMotifLookup);
+						log.info("Loaded motif lookup with " + motifScoreMap.size() + " entries from " + loadMotifLookup);
 					}
 
 					//read input bed file, for each row,
@@ -546,6 +582,9 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					FileOutputStream output = new FileOutputStream(detailFile);
 					OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
 					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
+					if (useEndMotif) {
+						writer.write("\tmotif_score");
+					}
 					if(includeCpgDist){
 						writer.write("\tdist_nearest_CpG");
 					}
@@ -975,8 +1014,26 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												}
 											}
 
-											binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",normalizedFragCov)
+											// 5' end motif extraction and scoring (BAM path)
+											String bamMotif = null;
+											double bamMotifScore = Double.NaN;
+											if (useEndMotif) {
+												// BAM coords are 1-based; subtract 1 for 0-based TwoBitParser
+												bamMotif = extractFivePrimeMotif(binRefParser, fragStart - 1, fragEnd - 1, negStrand);
+												if (saveMotifLookup != null) {
+													accumulateMotifCount(bamMotif, methyStat);
+												}
+												if (motifScoreMap != null) {
+													bamMotifScore = getMotifScore(bamMotif);
+												}
+											}
+
+											double covValue = noCoverage ? Double.NaN : normalizedFragCov;
+											binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",covValue)
 													 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
+											if (useEndMotif) {
+												binWriter.write("\t" + (Double.isNaN(bamMotifScore) ? "NaN" : String.format("%.6f", bamMotifScore)));
+											}
 											if(includeCpgDist) binWriter.write("\t" + nearestCpg);
 											if(overlapStatCollections.size()>0){
 												for(String key : finalOverlapLocString) binWriter.write("\t" + overlapStatCollections.get(key));
@@ -1263,8 +1320,26 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 													}
 												}
 
-												binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",normalizedFragCov)
+												// 5' end motif extraction and scoring (Tabix path)
+												String tabixMotif = null;
+												double tabixMotifScore = Double.NaN;
+												if (useEndMotif) {
+													// Tabix/BED coords are 0-based; use directly
+													tabixMotif = extractFivePrimeMotif(binRefParser, fragment.start, fragment.end, negStrand);
+													if (saveMotifLookup != null) {
+														accumulateMotifCount(tabixMotif, methyStat);
+													}
+													if (motifScoreMap != null) {
+														tabixMotifScore = getMotifScore(tabixMotif);
+													}
+												}
+
+												double tabixCovValue = noCoverage ? Double.NaN : normalizedFragCov;
+												binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",tabixCovValue)
 														 + "\t" + baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
+												if (useEndMotif) {
+													binWriter.write("\t" + (Double.isNaN(tabixMotifScore) ? "NaN" : String.format("%.6f", tabixMotifScore)));
+												}
 												if(includeCpgDist) binWriter.write("\t" + nearestCpg);
 												if(overlapStatCollections.size()>0){
 													for(String key : finalOverlapLocString) binWriter.write("\t" + overlapStatCollections.get(key));
@@ -1348,6 +1423,11 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 					writer.close();
 					output.close();
+
+					// Save motif lookup table if in training mode
+					if (saveMotifLookup != null && motifCounts != null) {
+						saveMotifLookupFile(saveMotifLookup);
+					}
 
 					if(wgsReader != null){
 						wgsReader.close();
@@ -1604,10 +1684,107 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 		totalTime /= 1000;
 		double totalTimeMins = totalTime/60;
 		double totalTimeHours = totalTime/3600;
-		
+
 		log.info("Counted " + points + " data points in total");
 		log.info("CpgFeatureMatrixBuilder's running time is: " + String.format("%.2f",totalTime) + " secs, " + String.format("%.2f",totalTimeMins) +  " mins, " + String.format("%.2f",totalTimeHours) +  " hours");
 	}
-	
+
+	/**
+	 * Extract the 4-mer at the 5' end of a fragment from the .2bit reference genome.
+	 *
+	 * For + strand fragments: 5' end is at fragStart, extract [fragStart, fragStart+4).
+	 * For - strand fragments: 5' end is at fragEnd, extract reverse complement of [fragEnd-4, fragEnd).
+	 *
+	 * All coordinates must be 0-based. For BAM input, subtract 1 from the 1-based SAMRecord
+	 * coordinates at the call site.
+	 *
+	 * @param binRefParser TwoBitParser set to the current chromosome
+	 * @param fragStart    0-based fragment start (genomic)
+	 * @param fragEnd      0-based exclusive fragment end (genomic)
+	 * @param negStrand    whether fragment is on negative strand
+	 * @return uppercase 4-mer string, or null if lookup fails or contains N
+	 */
+	private String extractFivePrimeMotif(TwoBitParser binRefParser, int fragStart, int fragEnd, boolean negStrand) {
+		try {
+			String seq;
+			if (!negStrand) {
+				// + strand: 5' is at fragStart
+				if (fragStart < 0) return null;
+				seq = binRefParser.loadFragment(fragStart, 4);
+			} else {
+				// - strand: 5' is at fragEnd, take reverse complement
+				int motifStart = fragEnd - 4;
+				if (motifStart < 0) return null;
+				seq = binRefParser.loadFragment(motifStart, 4);
+				byte[] seqBytes = seq.getBytes();
+				SequenceUtil.reverseComplement(seqBytes);
+				seq = new String(seqBytes);
+			}
+			seq = seq.toUpperCase();
+			if (seq.length() != 4 || seq.contains("N")) return null;
+			return seq;
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	/**
+	 * Look up motif score from the loaded motif score map.
+	 * Returns 0.5 (neutral) for null/absent motifs.
+	 */
+	private double getMotifScore(String motif) {
+		if (motif == null || motifScoreMap == null) return 0.5;
+		return motifScoreMap.getOrDefault(motif, 0.5);
+	}
+
+	/**
+	 * Accumulate motif counts for training mode (thread-safe).
+	 */
+	private void accumulateMotifCount(String motif, char methyStat) {
+		if (motif == null || motifCounts == null) return;
+		java.util.concurrent.atomic.AtomicLongArray counts = motifCounts.computeIfAbsent(motif,
+				k -> new java.util.concurrent.atomic.AtomicLongArray(2));
+		counts.incrementAndGet(1); // total
+		if (methyStat == 'm') {
+			counts.incrementAndGet(0); // methylated
+		}
+	}
+
+	/**
+	 * Load motif score lookup table from TSV file.
+	 * Format: header line, then rows of "motif\tscore".
+	 */
+	private HashMap<String, Double> loadMotifLookupFile(String path) throws IOException {
+		HashMap<String, Double> map = new HashMap<>();
+		BufferedReader br = new BufferedReader(new FileReader(path));
+		String line;
+		boolean header = true;
+		while ((line = br.readLine()) != null) {
+			if (header) { header = false; continue; }
+			String[] parts = line.split("\t");
+			if (parts.length >= 2) {
+				map.put(parts[0].trim(), Double.parseDouble(parts[1].trim()));
+			}
+		}
+		br.close();
+		return map;
+	}
+
+	/**
+	 * Save motif score lookup table to TSV file.
+	 * Uses Laplace smoothing: score = (methylated + 1) / (total + 2).
+	 */
+	private void saveMotifLookupFile(String path) throws IOException {
+		OutputStreamWriter mw = new OutputStreamWriter(new FileOutputStream(path), "UTF-8");
+		mw.write("motif\tscore\n");
+		for (java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLongArray> entry : motifCounts.entrySet()) {
+			long methylated = entry.getValue().get(0);
+			long total = entry.getValue().get(1);
+			double score = (double)(methylated + 1) / (total + 2);  // Laplace smoothing
+			mw.write(entry.getKey() + "\t" + String.format("%.6f", score) + "\n");
+		}
+		mw.close();
+		log.info("Motif lookup saved to " + path + " with " + motifCounts.size() + " motifs");
+	}
 
 }

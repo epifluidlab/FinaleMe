@@ -187,6 +187,21 @@ public class FinaleMe {
 	public boolean bwConvertChrMToMT = false;
 
 	
+	@Option(name="-useEndMotif",usage="include 5' end motif score as a third feature in lowCoverage mode (3D: fragLen, distToCenter, motifScore). Default: false")
+	public boolean useEndMotif = false;
+
+	@Option(name="-adaptEmissionOnly",usage="constrained Baum-Welch: freeze transitions/initiation, adapt emissions only. Requires -decodeModeOnly. Default: false")
+	public boolean adaptEmissionOnly = false;
+
+	@Option(name="-adaptLambda",usage="shrinkage regularization toward reference model (0=no regularization, 1=no adaptation). Default: 0.5")
+	public double adaptLambda = 0.5;
+
+	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 5")
+	public int adaptMaxIter = 5;
+
+	@Option(name="-adaptMinFragments",usage="minimum fragments with >= miniDataPoints CpGs to attempt adaptation; below this, use reference model directly. Default: 1000")
+	public int adaptMinFragments = 1000;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -293,7 +308,8 @@ public class FinaleMe {
 								HashMap<String, IntervalTree<Integer>> excludeLoc) {
 		if (line.startsWith("#")) return null;
 		String[] splitLines = line.split("\t");
-		if (splitLines.length < (features + 4) || splitLines[1].equalsIgnoreCase("start")
+		int minCols = features + 4 + (useEndMotif ? 1 : 0);
+		if (splitLines.length < minCols || splitLines[1].equalsIgnoreCase("start")
 				|| Integer.parseInt(splitLines[4]) >= maxFragLen
 				|| Integer.parseInt(splitLines[4]) <= minFragLen
 				|| Double.parseDouble(splitLines[8]) <= 5) {
@@ -324,7 +340,15 @@ public class FinaleMe {
 		int offset = Integer.parseInt(splitLines[9]);
 		if (offset < 0) return null;
 
-		double methyPrior = Double.parseDouble(splitLines[11]);
+		// When -useEndMotif is set, motif_score is at col [11] and methyPrior shifts to [12]
+		double motifScore = Double.NaN;
+		int methyPriorCol = 11;
+		if (useEndMotif) {
+			motifScore = Double.parseDouble(splitLines[11]);
+			methyPriorCol = 12;
+		}
+
+		double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
 		if (Double.isNaN(methyPrior)) return null;
 
 		double fragLen = Double.parseDouble(splitLines[4]);
@@ -341,7 +365,7 @@ public class FinaleMe {
 
 		String loc = chr + ":" + start + ":" + end;
 		String readName = splitLines[3];
-		return new ParsedRow(readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, distToCenter);
+		return new ParsedRow(readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, distToCenter, motifScore);
 	}
 
 	private AssembledFragment assembleFragment(
@@ -399,8 +423,9 @@ public class FinaleMe {
 	private SummaryStatistics[] collectStats(String matrixFile,
 											 HashMap<String, IntervalTree<Integer>> overlapLoc,
 											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
-		SummaryStatistics[] stats = new SummaryStatistics[3];
-		for (int i = 0; i < 3; i++) {
+		int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
+		SummaryStatistics[] stats = new SummaryStatistics[numStats];
+		for (int i = 0; i < numStats; i++) {
 			stats[i] = new SummaryStatistics();
 		}
 
@@ -420,6 +445,9 @@ public class FinaleMe {
 			stats[0].addValue(row.fragLen);
 			stats[1].addValue(row.coverage);
 			stats[2].addValue(row.distToCenter);
+			if (lowCoverage && useEndMotif && !Double.isNaN(row.motifScore)) {
+				stats[3].addValue(row.motifScore);
+			}
 		}
 
 		if (matrixFile.endsWith(".gz")) {
@@ -431,7 +459,7 @@ public class FinaleMe {
 	}
 
 	private void logFeatureStats(SummaryStatistics[] stats) {
-		final String[] featureNames = new String[]{"FragLen", "Norm_Frag_cov", "DistToCenter"};
+		final String[] featureNames = new String[]{"FragLen", "Norm_Frag_cov", "DistToCenter", "MotifScore"};
 		for (int i = 0; i < stats.length; i++) {
 			String featureName = i < featureNames.length ? featureNames[i] : ("Feature" + i);
 			logFeatureStat(i, featureName, stats[i]);
@@ -491,7 +519,18 @@ public class FinaleMe {
 						log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
 					initiate();
 
-					if (decodeModeOnly && !aucMode) {
+					if (adaptEmissionOnly && decodeModeOnly) {
+						// Adaptation + decode path
+						CpgIndex cpgIndex = null;
+						if (patOutput) {
+							cpgIndex = loadCpgIndex(cpgIndexFile);
+						}
+						LinkedHashMap<String, Integer> chromOrder = null;
+						if (bwOutput) {
+							chromOrder = loadChromOrder(chromSizeFile);
+						}
+						adaptAndDecodeStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
+					} else if (decodeModeOnly && !aucMode) {
 						// Streaming decode path: bounded memory
 						CpgIndex cpgIndex = null;
 						if (patOutput) {
@@ -642,20 +681,22 @@ public class FinaleMe {
 		}
 
 			String line;
-			SummaryStatistics[] stats = new SummaryStatistics[3];
-			for(int i = 0; i < 3; i++){
+			int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
+			SummaryStatistics[] stats = new SummaryStatistics[numStats];
+			for(int i = 0; i < numStats; i++){
 				stats[i] = new SummaryStatistics();
 			}
 
 			// Store raw parsed row data for second-phase processing
-			// Each entry: [readName, methyStat, loc, offset, methyPrior, fragLen, coverage, distToCenter]
+			// Each entry: [readName, methyStat, loc, offset, methyPrior, fragLen, coverage, distToCenter, motifScore]
 			ArrayList<Object[]> rawRows = new ArrayList<Object[]>();
 
 			while( (line = br.readLine()) != null){
 				if(line.startsWith("#"))
 					continue;
 				String[] splitLines = line.split("\t");
-				if(splitLines.length< (features + 4) || splitLines[1].equalsIgnoreCase("start") || Integer.parseInt(splitLines[4]) >= maxFragLen || Integer.parseInt(splitLines[4])  <= minFragLen || Double.parseDouble(splitLines[8]) <= 5){
+				int minCols = features + 4 + (useEndMotif ? 1 : 0);
+				if(splitLines.length< minCols || splitLines[1].equalsIgnoreCase("start") || Integer.parseInt(splitLines[4]) >= maxFragLen || Integer.parseInt(splitLines[4])  <= minFragLen || Double.parseDouble(splitLines[8]) <= 5){
 					continue;
 				}
 				String chr = splitLines[0];
@@ -684,7 +725,14 @@ public class FinaleMe {
 				if(offset < 0){
 					continue;
 				}
-				Double methyPrior = Double.parseDouble(splitLines[11]);
+				// When -useEndMotif, motif_score is at col [11] and methyPrior shifts to [12]
+				double motifScore = Double.NaN;
+				int methyPriorCol = 11;
+				if (useEndMotif) {
+					motifScore = Double.parseDouble(splitLines[11]);
+					methyPriorCol = 12;
+				}
+				Double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
 				if(Double.isNaN(methyPrior)){
 					continue;
 				}
@@ -694,6 +742,9 @@ public class FinaleMe {
 				stats[0].addValue(fragLen);
 				stats[1].addValue(coverage);
 				stats[2].addValue(DistToCenter);
+				if (lowCoverage && useEndMotif && !Double.isNaN(motifScore)) {
+					stats[3].addValue(motifScore);
+				}
 
 				// Adjust methyPrior for boundary values
 				if(Double.compare(methyPrior, 100.0)==0){
@@ -708,7 +759,7 @@ public class FinaleMe {
 
 				String loc = chr + ":" + start + ":" + end;
 				String readName = splitLines[3];
-				rawRows.add(new Object[]{readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, DistToCenter});
+				rawRows.add(new Object[]{readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, DistToCenter, motifScore});
 			}
 			if(matrixFile.endsWith(".gz")){
 				gzipInputStream.close();
@@ -727,6 +778,7 @@ public class FinaleMe {
 			double fragLen = (Double) row[5];
 			double coverage = (Double) row[6];
 			double DistToCenter = (Double) row[7];
+			double rowMotifScore = (Double) row[8];
 
 			if(covOutlier > 0 && ((coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
 					(fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
@@ -735,7 +787,13 @@ public class FinaleMe {
 			}
 			double[] value;
 
-			if(lowCoverage){
+			if(lowCoverage && useEndMotif){
+				value = new double[]{
+						(fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
+						(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
+						(rowMotifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
+				};
+			}else if(lowCoverage){
 				value = new double[]{
 						(fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
 						(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
@@ -1292,7 +1350,13 @@ public class FinaleMe {
 
 			// Z-score normalize
 			double[] value;
-			if (lowCoverage) {
+			if (lowCoverage && useEndMotif) {
+				value = new double[]{
+					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
+					(row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation(),
+				};
+			} else if (lowCoverage) {
 				value = new double[]{
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
 					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
@@ -2571,9 +2635,11 @@ public class FinaleMe {
 		final double fragLen;
 		final double coverage;
 		final double distToCenter;
+		final double motifScore;
 
 		ParsedRow(String readName, String methyStat, String loc, int offset,
-				  double methyPrior, double fragLen, double coverage, double distToCenter) {
+				  double methyPrior, double fragLen, double coverage, double distToCenter,
+				  double motifScore) {
 			this.readName = readName;
 			this.methyStat = methyStat;
 			this.loc = loc;
@@ -2582,6 +2648,7 @@ public class FinaleMe {
 			this.fragLen = fragLen;
 			this.coverage = coverage;
 			this.distToCenter = distToCenter;
+			this.motifScore = motifScore;
 		}
 	}
 
@@ -2600,6 +2667,226 @@ public class FinaleMe {
 			this.locRow = locRow;
 			this.observedRow = observedRow;
 		}
+	}
+
+	// ======================== Emission Adaptation Methods ========================
+
+	/**
+	 * Regularize MLE emission parameters toward reference model parameters.
+	 * new = (1 - lambda) * mle + lambda * ref, applied to mu, sigma, proportions.
+	 */
+	@SuppressWarnings("unchecked")
+	private OpdfMultiMixtureGaussian regularizeGmm(OpdfMultiMixtureGaussian mle,
+												   OpdfMultiMixtureGaussian ref,
+												   double lambda) {
+		MultiMixtureGaussianDistribution mleDist = mle.getDistribution();
+		MultiMixtureGaussianDistribution refDist = ref.getDistribution();
+
+		int dim = mleDist.getDimension();
+		ArrayList<Integer> mixNumbers = mleDist.getMixNumberInFeature();
+
+		// Interpolate per-component parameters
+		ArrayList<ArrayList<Double>> newMeans = new ArrayList<>();
+		ArrayList<ArrayList<Double>> newVars = new ArrayList<>();
+		ArrayList<ArrayList<Double>> newProps = new ArrayList<>();
+
+		for (int d = 0; d < dim; d++) {
+			ArrayList<Double> mleMeansD = mleDist.getMeanInEachGaussian().get(d);
+			ArrayList<Double> refMeansD = refDist.getMeanInEachGaussian().get(d);
+			ArrayList<Double> mleVarsD = mleDist.getVarianceInEachGaussian().get(d);
+			ArrayList<Double> refVarsD = refDist.getVarianceInEachGaussian().get(d);
+			ArrayList<Double> mlePropsD = mleDist.getPropInEachGaussian().get(d);
+			ArrayList<Double> refPropsD = refDist.getPropInEachGaussian().get(d);
+
+			int nComponents = mixNumbers.get(d);
+			ArrayList<Double> interpMeans = new ArrayList<>();
+			ArrayList<Double> interpVars = new ArrayList<>();
+			ArrayList<Double> interpProps = new ArrayList<>();
+
+			for (int k = 0; k < nComponents; k++) {
+				interpMeans.add((1 - lambda) * mleMeansD.get(k) + lambda * refMeansD.get(k));
+				interpVars.add((1 - lambda) * mleVarsD.get(k) + lambda * refVarsD.get(k));
+				interpProps.add((1 - lambda) * mlePropsD.get(k) + lambda * refPropsD.get(k));
+			}
+			newMeans.add(interpMeans);
+			newVars.add(interpVars);
+			newProps.add(interpProps);
+		}
+
+		// Interpolate top-level mean and covariance
+		double[] mleMean = mle.mean();
+		double[] refMean = ref.mean();
+		double[][] mleCov = mle.covariance();
+		double[][] refCov = ref.covariance();
+
+		double[] newMean = new double[dim];
+		double[][] newCov = new double[dim][dim];
+		for (int i = 0; i < dim; i++) {
+			newMean[i] = (1 - lambda) * mleMean[i] + lambda * refMean[i];
+			for (int j = 0; j < dim; j++) {
+				newCov[i][j] = (1 - lambda) * mleCov[i][j] + lambda * refCov[i][j];
+			}
+		}
+
+		return new OpdfMultiMixtureGaussian(newMean, newCov, mixNumbers, newMeans, newVars, newProps);
+	}
+
+	/**
+	 * Perform one constrained Baum-Welch iteration:
+	 * 1. Run standard BW iterate (updates everything)
+	 * 2. Restore frozen transitions and pi from reference
+	 * 3. Regularize emissions toward reference
+	 */
+	private BayesianNhmmV5<ObservationVector> adaptIteration(
+			BayesianNhmmV5<ObservationVector> currentHmm,
+			BayesianNhmmV5<ObservationVector> refHmm,
+			List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> sequences,
+			double lambda) {
+
+		int nThreads = resolveThreadCount();
+		BaumWelchBayesianNhmmV5ScaledLearner bwl = new BaumWelchBayesianNhmmV5ScaledLearner(nThreads);
+
+		// Full BW iteration (updates everything: transitions, pi, emissions)
+		BayesianNhmmV5<ObservationVector> updatedHmm = bwl.iterate(currentHmm, sequences);
+
+		// Restore frozen transitions and pi from reference model
+		for (int r = 0; r <= refHmm.nbCpgDistState(); r++) {
+			for (int i = 0; i < refHmm.nbStates(); i++) {
+				updatedHmm.setPri(r, i, refHmm.getPri(r, i));
+				for (int j = 0; j < refHmm.nbStates(); j++) {
+					updatedHmm.setArij(r, i, j, refHmm.getArij(r, i, j));
+				}
+			}
+		}
+
+		// Regularize emissions toward reference
+		for (int s = 0; s < updatedHmm.nbStates(); s++) {
+			OpdfMultiMixtureGaussian mleOpdf = (OpdfMultiMixtureGaussian) updatedHmm.getOpdf(s);
+			OpdfMultiMixtureGaussian refOpdf = (OpdfMultiMixtureGaussian) refHmm.getOpdf(s);
+			OpdfMultiMixtureGaussian regularized = regularizeGmm(mleOpdf, refOpdf, lambda);
+			updatedHmm.setOpdf(s, regularized);
+		}
+
+		return updatedHmm;
+	}
+
+	/**
+	 * Adaptation + decode streaming mode:
+	 * 1. Load reference model
+	 * 2. Collect stats, load data
+	 * 3. Constrained BW adaptation (emissions only)
+	 * 4. Viterbi decode all fragments using adapted model
+	 *
+	 * Note: We do not re-center reference GMM means to target z-score space.
+	 * Since both reference and target are independently z-score normalized,
+	 * adaptation iterations correct any distribution shift. This can be
+	 * revisited if adaptation proves insufficient for large distribution shifts.
+	 */
+	private void adaptAndDecodeStreaming(String inputFile, String modelFile, String outputFile,
+										 CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception {
+		System.out.println("\nAdaptation + decode mode ...\n");
+
+		// Load reference model
+		BayesianNhmmV5<ObservationVector> refHmm = loadHmmModel(modelFile);
+		refHmm.setBayesianFactor(bayesianFactor);
+		refHmm.setMethyState(this.methylatedState);
+		refHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
+		refHmm.setMinCpgNum(1);
+
+		// Load region/exclude intervals
+		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
+		HashMap<String, IntervalTree<Integer>> excludeLoc = loadIntervalFile(exclude);
+
+		// Phase 1: Collect stats
+		log.info("Phase 1: Collecting feature statistics ...");
+		SummaryStatistics[] stats = collectStats(inputFile, overlapLoc, excludeLoc);
+		logFeatureStats(stats);
+
+		long totalFragments = stats[0].getN();
+		log.info("Total data points: " + totalFragments);
+
+		if (totalFragments < adaptMinFragments) {
+			log.warn("Only " + totalFragments + " fragments (< " + adaptMinFragments +
+					 "); skipping adaptation, decoding with reference model directly.");
+			// Decode with reference model using streaming decode
+			decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
+			return;
+		}
+
+		// Phase 2: Load data into memory for adaptation
+		log.info("Phase 2: Loading data for adaptation ...");
+		MatrixObj matrixObj = processMatrixFile(inputFile);
+		matrixObj.cpgDistFreq = null;
+
+		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix =
+			new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
+		for (org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> row : matrixObj.matrix) {
+			matrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(row.getLeft(), row.getMiddle()));
+		}
+
+		log.info("Loaded " + matrix.size() + " fragments for adaptation");
+
+		// Phase 3: Constrained Baum-Welch adaptation
+		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
+				 ", maxIter=" + adaptMaxIter + ") ...");
+
+		BayesianNhmmV5<ObservationVector> adaptedHmm;
+		try {
+			adaptedHmm = refHmm.clone();
+		} catch (CloneNotSupportedException e) {
+			throw new RuntimeException("Failed to clone reference HMM", e);
+		}
+
+		KullbackLeiblerDistanceBayesianNhmmV5Calculator klc =
+			new KullbackLeiblerDistanceBayesianNhmmV5Calculator(matrix, resolveThreadCount());
+
+		double distance = Double.MAX_VALUE;
+		for (int iter = 0; iter < adaptMaxIter; iter++) {
+			BayesianNhmmV5<ObservationVector> prevHmm;
+			try {
+				prevHmm = adaptedHmm.clone();
+			} catch (CloneNotSupportedException e) {
+				throw new RuntimeException("Failed to clone HMM at iteration " + iter, e);
+			}
+
+			adaptedHmm = adaptIteration(adaptedHmm, refHmm, matrix, adaptLambda);
+
+			distance = klc.distance(prevHmm, adaptedHmm, true);
+			log.info("Adaptation iteration " + (iter + 1) + ": KL distance = " + distance);
+
+			if (Double.isNaN(distance)) {
+				log.warn("KL distance is NaN at iteration " + (iter + 1) +
+						 "; falling back to reference model.");
+				adaptedHmm = refHmm;
+				break;
+			}
+			if (Math.abs(distance) < tol) {
+				log.info("Adaptation converged at iteration " + (iter + 1));
+				break;
+			}
+		}
+
+		this.methylatedState = adaptedHmm.getMethyState(lowCoverage);
+		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
+		adaptedHmm.setMinCpgNum(1);
+		System.out.println("Adapted HMM:\n" + adaptedHmm);
+
+		// Save adapted model BEFORE decoding (decodeHmm reloads from file)
+		log.info("Saving adapted model to " + modelFile + " ...");
+		ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(modelFile));
+		oos.writeObject(adaptedHmm);
+		oos.close();
+
+		// Free adaptation data
+		matrix = null;
+		matrixObj.matrixU = null;
+		matrixObj.matrixM = null;
+		matrixObj.pi = null;
+		matrixObj.a = null;
+
+		// Phase 4: Viterbi decode all fragments with adapted model
+		log.info("Phase 4: Decoding with adapted model ...");
+		decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
 	}
 
 }
