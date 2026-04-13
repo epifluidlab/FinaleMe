@@ -496,7 +496,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						readsNumTotal = estimateTotalFragmentsFromTabixInput(wgsBamFile);
 						log.info("Counted " + (long)readsNumTotal + " fragments from tabix fragment input");
 					}else{
-						// Use BAM index statistics for fast approximate read count
+						// Strategy 1: BAM index metadata (instant, but some indices lack this data)
 						log.info("Get total reads number used for scaling from bam index... ");
 						boolean usedIndex = false;
 						if(wgsReader.indexing() != null && wgsReader.indexing().hasBrowseableIndex()){
@@ -513,14 +513,28 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 									usedIndex = true;
 									log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index (fast path)");
 								} else {
-									log.info("BAM index returned 0 aligned reads; falling back to full scan...");
+									log.info("BAM index returned 0 aligned reads (metadata bin may be missing)");
 								}
 							} catch(Exception e){
-								log.info("Failed to get counts from BAM index, falling back to full scan...");
-								usedIndex = false;
+								log.info("Failed to get counts from BAM index: " + e.getMessage());
 								readsNumTotal = 0;
 							}
 						}
+						// Strategy 2: Estimate from BAM file size (fast heuristic).
+						// Average compressed BAM record is ~100-200 bytes; 150 is a good
+						// default for paired-end WGS. This is only used for coverage
+						// normalization, so an approximate count is acceptable.
+						if(!usedIndex){
+							long bamFileSize = new File(wgsBamFile).length();
+							if (bamFileSize > 0) {
+								readsNumTotal = bamFileSize / 150;
+								log.info("Estimated " + (long)readsNumTotal +
+										 " reads from BAM file size (" + (bamFileSize / (1024*1024)) +
+										 " MB / ~150 bytes per record)");
+								usedIndex = true;
+							}
+						}
+						// Strategy 3: Full scan (last resort, slow)
 						if(!usedIndex){
 							log.info("Get total reads number used for scaling from bam file (full scan)... ");
 							SAMRecordIterator wgsIt = wgsReader.iterator();
