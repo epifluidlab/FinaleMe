@@ -483,7 +483,12 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 					
 					double readsNumTotal = 0;
-					if(totalReadsInBam > 0){
+					if (noCoverage) {
+						// Coverage column is NaN in -noCoverage mode; skip the expensive
+						// total-reads count entirely (saves minutes on large BAMs).
+						log.info("Skipping total reads count (-noCoverage mode; coverage column will be NaN)");
+						readsNumTotal = 1;  // avoid division by zero downstream
+					} else if(totalReadsInBam > 0){
 						log.info("Get total reads number used for scaling from input option -totalReadsInBam ... ");
 						readsNumTotal = totalReadsInBam;
 					}else if(useTabixFragmentInput){
@@ -496,7 +501,6 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						boolean usedIndex = false;
 						if(wgsReader.indexing() != null && wgsReader.indexing().hasBrowseableIndex()){
 							try {
-								htsjdk.samtools.BAMIndexMetaData[] indexStats = null;
 								htsjdk.samtools.BAMIndex bamIndex = wgsReader.indexing().getIndex();
 								int nRefs = wgsReader.getFileHeader().getSequenceDictionary().getSequences().size();
 								for(int refIdx = 0; refIdx < nRefs; refIdx++){
@@ -505,8 +509,12 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 										readsNumTotal += meta.getAlignedRecordCount();
 									}
 								}
-								usedIndex = true;
-								log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index (fast path)");
+								if (readsNumTotal > 0) {
+									usedIndex = true;
+									log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index (fast path)");
+								} else {
+									log.info("BAM index returned 0 aligned reads; falling back to full scan...");
+								}
 							} catch(Exception e){
 								log.info("Failed to get counts from BAM index, falling back to full scan...");
 								usedIndex = false;
@@ -530,7 +538,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 							wgsIt.close();
 						}
 					}
-					
+
 					log.info((long)readsNumTotal + " reads in total ...");
 					readsNumTotal = readsNumTotal/1000000;
 					log.info("Output value for each CpG in each DNA fragment ... ");
