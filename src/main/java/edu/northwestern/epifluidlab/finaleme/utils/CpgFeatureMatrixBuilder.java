@@ -1079,7 +1079,14 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",covValue)
 													 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
 											if (useEndMotif) {
-												binWriter.write("\t" + (Double.isNaN(bamMotifScore) ? "NaN" : String.format("%.6f", bamMotifScore)));
+												if (saveMotifLookup != null && loadMotifLookup == null) {
+													// Training mode: write 4-mer string as placeholder.
+													// The concatenation phase replaces it with the real score
+													// after all bins have contributed to motifCounts.
+													binWriter.write("\t" + (bamMotif != null ? bamMotif : "NNNN"));
+												} else {
+													binWriter.write("\t" + (Double.isNaN(bamMotifScore) ? "NaN" : String.format("%.6f", bamMotifScore)));
+												}
 											}
 											if(includeCpgDist) binWriter.write("\t" + nearestCpg);
 											if(overlapStatCollections.size()>0){
@@ -1396,7 +1403,12 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",tabixCovValue)
 														 + "\t" + baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
 												if (useEndMotif) {
-													binWriter.write("\t" + (Double.isNaN(tabixMotifScore) ? "NaN" : String.format("%.6f", tabixMotifScore)));
+													if (saveMotifLookup != null && loadMotifLookup == null) {
+														// Training mode: write 4-mer string as placeholder
+														binWriter.write("\t" + (tabixMotif != null ? tabixMotif : "NNNN"));
+													} else {
+														binWriter.write("\t" + (Double.isNaN(tabixMotifScore) ? "NaN" : String.format("%.6f", tabixMotifScore)));
+													}
 												}
 												if(includeCpgDist) binWriter.write("\t" + nearestCpg);
 												if(overlapStatCollections.size()>0){
@@ -1467,22 +1479,84 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						executor.shutdown();
 						logCpgProgress(globalCpgCount.get(), finalTotalCpgTargets);
 
-					// Concatenate temp files into the output
-					byte[] buffer = new byte[8192];
-					for(File tempFile : tempFiles){
-						FileInputStream fis = new FileInputStream(tempFile);
-						int bytesRead;
-						while((bytesRead = fis.read(buffer)) != -1){
-							writer.write(new String(buffer, 0, bytesRead, "UTF-8"));
+					// If training mode (-saveMotifLookup without -loadMotifLookup),
+					// compute motifScoreMap from accumulated counts BEFORE concatenation
+					// so that the output contains real motif scores, not placeholders.
+					if (saveMotifLookup != null && motifCounts != null && motifScoreMap == null) {
+						log.info("Computing motif scores from " + motifCounts.size() + " accumulated 4-mers ...");
+						motifScoreMap = new HashMap<>();
+						for (java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLongArray> entry : motifCounts.entrySet()) {
+							long methylated = entry.getValue().get(0);
+							long total = entry.getValue().get(1);
+							motifScoreMap.put(entry.getKey(), (double)(methylated + 1) / (total + 2));
 						}
-						fis.close();
+						log.info("Motif scores computed. Replacing placeholder values in output ...");
+					}
+
+					// Concatenate temp files into the output.
+					// When motifScoreMap was just computed (training mode), replace the
+					// NaN motif_score column (col 11) with actual values looked up from
+					// each line's fragment coordinates in the .2bit reference.
+					boolean needMotifRewrite = (useEndMotif && saveMotifLookup != null && loadMotifLookup == null);
+					// motif_score is column index 11 (0-based) when -useEndMotif is set
+					final int MOTIF_COL = 11;
+
+					for(File tempFile : tempFiles){
+						if (!needMotifRewrite) {
+							// Fast path: raw byte copy when no rewriting needed
+							byte[] buffer = new byte[8192];
+							FileInputStream fis = new FileInputStream(tempFile);
+							int bytesRead;
+							while((bytesRead = fis.read(buffer)) != -1){
+								writer.write(new String(buffer, 0, bytesRead, "UTF-8"));
+							}
+							fis.close();
+						} else {
+							// Line-by-line rewrite: replace motif_score NaN with real value.
+							// Each line has readName at col[3], FragLen at col[4], strand at col[5],
+							// fragStart can be derived from col[1](cpg_start) and col[9](offset).
+							// But it's simpler to look up the motif from the readName using the
+							// per-read motif cache that was populated during processing... except
+							// caches are per-bin and gone. Instead, extract the motif score from
+							// the methy_stat (col[6]) and the motif lookup computed above.
+							// Since we don't have the 4-mer stored in the output, we need to
+							// recompute it. But that requires .2bit access again.
+							//
+							// Simpler approach: store the 4-mer in a hidden column during
+							// processing, or accept that we must re-derive it.
+							//
+							// SIMPLEST: during parallel processing, when saveMotifLookup mode,
+							// write the 4-mer string in the motif_score column (not NaN or 0.5).
+							// Then here, replace the 4-mer with its score.
+							BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(tempFile), "UTF-8"));
+							String line;
+							while ((line = br.readLine()) != null) {
+								String[] cols = line.split("\t", MOTIF_COL + 2);
+								if (cols.length > MOTIF_COL) {
+									String motifKey = cols[MOTIF_COL].trim();
+									double score = motifScoreMap != null ? motifScoreMap.getOrDefault(motifKey, 0.5) : 0.5;
+									cols[MOTIF_COL] = String.format("%.6f", score);
+									// Rejoin — but we split with limit, so cols[MOTIF_COL+1] has the rest
+									StringBuilder sb = new StringBuilder();
+									for (int ci = 0; ci < cols.length; ci++) {
+										if (ci > 0) sb.append('\t');
+										sb.append(cols[ci]);
+									}
+									writer.write(sb.toString());
+								} else {
+									writer.write(line);
+								}
+								writer.write("\n");
+							}
+							br.close();
+						}
 						tempFile.delete();
 					}
 
 					writer.close();
 					output.close();
 
-					// Save motif lookup table if in training mode
+					// Save motif lookup table
 					if (saveMotifLookup != null && motifCounts != null) {
 						saveMotifLookupFile(saveMotifLookup);
 					}
