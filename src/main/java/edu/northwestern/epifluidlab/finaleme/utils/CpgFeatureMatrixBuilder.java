@@ -554,38 +554,60 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 							}
 						}
 
-						// Step B: Sample ~1M reads to measure filter pass rate.
-						// Use a separate SamReader to avoid disturbing the main reader's state.
+						// Step B: Sample ~1M reads from random genomic regions to measure
+						// the filter pass rate. Sampling from the first 1M sequential reads
+						// is biased (chr1 start is enriched for centromeric/telomeric low-quality
+						// reads). Instead, query ~50K reads from the midpoint of each major
+						// chromosome via the BAM index — this gives representative coverage
+						// across the genome in ~2 seconds.
 						if(rawIndexTotal > 0){
-							final int SAMPLE_SIZE = 1_000_000;
+							final int TARGET_PER_CHROM = 50_000;
+							final int REGION_SIZE = 1_000_000; // 1Mb window around each midpoint
 							long sampled = 0;
 							long passed = 0;
 							SamReader sampleReader = SamReaderFactory.makeDefault()
 								.validationStringency(ValidationStringency.SILENT)
 								.open(new File(wgsBamFile));
-							SAMRecordIterator sampleIt = sampleReader.iterator();
-							while(sampleIt.hasNext() && sampled < SAMPLE_SIZE){
-								SAMRecord r = sampleIt.next();
-								sampled++;
-								if(failFlagFilter(r)){
-									continue;
+							List<htsjdk.samtools.SAMSequenceRecord> sequences =
+								sampleReader.getFileHeader().getSequenceDictionary().getSequences();
+							for(htsjdk.samtools.SAMSequenceRecord seq : sequences){
+								int seqLen = seq.getSequenceLength();
+								if(seqLen < REGION_SIZE) continue; // skip tiny contigs
+								String seqName = seq.getSequenceName();
+								int midpoint = seqLen / 2;
+								int queryStart = Math.max(1, midpoint - REGION_SIZE / 2);
+								int queryEnd = Math.min(seqLen, midpoint + REGION_SIZE / 2);
+								int chromSampled = 0;
+								try {
+									SAMRecordIterator regionIt = sampleReader.queryOverlapping(
+										seqName, queryStart, queryEnd);
+									while(regionIt.hasNext() && chromSampled < TARGET_PER_CHROM){
+										SAMRecord r = regionIt.next();
+										sampled++;
+										chromSampled++;
+										if(failFlagFilter(r)){
+											continue;
+										}
+										if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+											continue;
+										}
+										passed++;
+									}
+									regionIt.close();
+								} catch(Exception regionEx){
+									// Some references may not be queryable; skip
 								}
-								if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
-									continue;
-								}
-								passed++;
 							}
-							sampleIt.close();
 							sampleReader.close();
 							if(sampled > 0 && passed > 0){
 								double passRate = (double) passed / sampled;
 								readsNumTotal = (long)(rawIndexTotal * passRate);
 								usedIndex = true;
-								log.info("Sampled " + sampled + " reads: " + passed + " passed filters (" +
+								log.info("Sampled " + sampled + " reads across " + sequences.size() +
+										 " chromosomes: " + passed + " passed filters (" +
 										 String.format("%.1f%%", passRate * 100) + "); estimated " +
 										 (long)readsNumTotal + " filtered reads");
 							} else if(sampled > 0){
-								// All sampled reads were filtered — very unusual. Use raw total as upper bound.
 								log.warn("All " + sampled + " sampled reads were filtered out; using raw index total");
 								readsNumTotal = rawIndexTotal;
 								usedIndex = true;
