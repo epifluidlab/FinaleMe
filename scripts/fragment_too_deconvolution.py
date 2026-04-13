@@ -99,12 +99,19 @@ def run_fragment_deconvolution(
 
     if n_fragments_used == 0:
         log.warning("No informative fragments found. Writing empty results.")
-        K_total = K + 1
+        K_total = (K + 1) if estimate_unknown else K
         empty_w = np.zeros(K_total)
-        empty_w[-1] = 1.0
+        if estimate_unknown:
+            empty_w[-1] = 1.0
+        empty_gamma = np.zeros((0, K_total), dtype=np.float64)
         write_fragment_proportions(
-            cell_types, empty_w, None, None, None, None, fdr_threshold,
+            cell_types if estimate_unknown else cell_types,
+            empty_w, None, None, None, None, fdr_threshold,
             f"{output_prefix}_proportions.tsv",
+        )
+        write_fragment_responsibilities(
+            empty_gamma, cell_types,
+            f"{output_prefix}_fragment_responsibilities.tsv.gz",
         )
         write_fragment_diagnostics(
             {"n_fragments_total": 0, "n_fragments_used": 0, "em_converged": False},
@@ -113,14 +120,18 @@ def run_fragment_deconvolution(
         return {"n_fragments_used": 0}
 
     # 5. Run EM (full solve)
-    log.info("Running fragment-level EM ...")
+    log.info("Running fragment-level EM (unknown_component=%s) ...", estimate_unknown)
     deconvolver = FragmentLevelDeconvolver(
         max_iter=200,
         tol=1e-6,
-        unknown_profile=0.5 if estimate_unknown else -1.0,
+        unknown_profile=0.5,
+        include_unknown=estimate_unknown,
     )
-    w, gamma, ll, log_p = deconvolver.solve_full(fragments, reference.methylation)
-    log.info("EM converged. Log-likelihood: %.2f, pi_unknown: %.4f", ll, w[-1])
+    w, gamma, ll, log_p, em_converged = deconvolver.solve_full(fragments, reference.methylation)
+    if em_converged:
+        log.info("EM converged. Log-likelihood: %.2f", ll)
+    else:
+        log.warning("EM did not converge within max_iter. Log-likelihood: %.2f", ll)
 
     # 6. Bootstrap CI
     ci_lower = None
@@ -171,7 +182,7 @@ def run_fragment_deconvolution(
     diagnostics = {
         "n_fragments_used": n_fragments_used,
         "em_log_likelihood": float(ll),
-        "em_converged": True,
+        "em_converged": em_converged,
         "pi_unknown": float(w[-1]),
         "bootstrap_replicates": bootstrap_replicates,
         "test_method": test_method,
@@ -196,8 +207,8 @@ def main() -> None:
     parser.add_argument("--min-cpgs", type=int, default=3, help="Minimum CpGs per fragment (default: 3)")
     parser.add_argument("--informativeness-threshold", type=float, default=0.2,
                         help="Min informativeness score I(f) (default: 0.2)")
-    parser.add_argument("--estimate-unknown", action="store_true", default=True,
-                        help="Include unknown cell type component (default: True)")
+    parser.add_argument("--estimate-unknown", action=argparse.BooleanOptionalAction, default=True,
+                        help="Include unknown cell type component (default: True; use --no-estimate-unknown to disable)")
     parser.add_argument("--bootstrap-replicates", type=int, default=1000,
                         help="Number of bootstrap replicates for CI (default: 1000; 0 to skip)")
     parser.add_argument("--test-method", choices=["lrt", "permutation", "none"], default="lrt",

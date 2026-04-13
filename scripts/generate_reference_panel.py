@@ -52,9 +52,19 @@ def load_manifest(path: str | Path) -> pd.DataFrame:
 
     3-column manifests (name, group, file_path) are used for pat/beta/bissnp.
     4-column manifests (name, group, methy_bw, cov_bw) are used for bigwig.
+
+    The design doc uses ``# name  group  file_path`` as the header (the
+    leading ``#`` is a comment marker in the spec, not part of the column
+    name). We strip the ``#`` prefix from the header so that the column
+    names parse correctly regardless of whether the ``#`` is present.
     """
-    df = pd.read_csv(path, sep="\t", comment="#")
-    df.columns = [c.strip() for c in df.columns]
+    df = pd.read_csv(path, sep="\t", comment=None)
+    # Strip leading '#' and whitespace from column names
+    df.columns = [c.lstrip("# ").strip() for c in df.columns]
+    # Drop any rows that are pure comment lines (first cell starts with #)
+    first_col = df.columns[0]
+    comment_mask = df[first_col].astype(str).str.startswith("#")
+    df = df[~comment_mask].reset_index(drop=True)
     return df
 
 
@@ -63,13 +73,19 @@ def detect_input_format(manifest_df: pd.DataFrame, user_format: str) -> str:
     if user_format != "auto":
         return user_format
 
+    if manifest_df.empty:
+        raise ValueError("Manifest is empty (no data rows after header)")
+
     # 4-column with methy_bw => bigwig
     if "methy_bw" in manifest_df.columns and "cov_bw" in manifest_df.columns:
         return "bigwig"
 
     # 3-column: detect from file extension of first entry
     if "file_path" not in manifest_df.columns:
-        raise ValueError("Manifest must have 'file_path' column (or 'methy_bw'+'cov_bw' for bigwig)")
+        raise ValueError(
+            f"Manifest must have 'file_path' column (or 'methy_bw'+'cov_bw' for bigwig). "
+            f"Found columns: {list(manifest_df.columns)}"
+        )
 
     first_file = str(manifest_df["file_path"].iloc[0]).lower()
     if first_file.endswith(".pat.gz") or first_file.endswith(".pat"):
@@ -250,6 +266,7 @@ def aggregate_to_cpg_matrix(
     cpg_index: dict,
     input_format: str,
     min_coverage: int = 5,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """Aggregate all input files into a CpG x cell_type matrix.
 
@@ -431,9 +448,11 @@ def main() -> None:
     marker_regions = MarkerRegionsLoader.load(args.marker_regions)
     log.info("Marker regions: %d", marker_regions.n_markers)
 
-    log.info("Aggregating per-CpG methylation from %d files ...", len(manifest_df))
+    log.info("Aggregating per-CpG methylation from %d files (%d threads) ...",
+             len(manifest_df), args.threads)
     methylation, coverage, cell_types, chrom_arr, position_arr = aggregate_to_cpg_matrix(
-        manifest_df, cpg_index, input_format, min_coverage=args.min_coverage
+        manifest_df, cpg_index, input_format, min_coverage=args.min_coverage,
+        n_jobs=args.threads,
     )
     log.info("CpGs after min-coverage filter: %d", methylation.shape[0])
 

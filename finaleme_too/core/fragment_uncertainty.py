@@ -89,7 +89,7 @@ class FragmentBootstrapCI:
 
         def _run_one(indices: np.ndarray) -> np.ndarray:
             resampled = log_p_matrix[indices]
-            w, _gamma, _ll = _em_from_log_p(resampled, max_iter, tol)
+            w, _gamma, _ll, _conv = _em_from_log_p(resampled, max_iter, tol)
             return w
 
         samples = parallel_map(
@@ -149,7 +149,7 @@ def fragment_lrt_pvalues(
         cols = list(range(K_total))
         cols.pop(t)
         log_p_reduced = log_p_matrix[:, cols]
-        _w, _gamma, ll_reduced = _em_from_log_p(log_p_reduced, max_iter, tol)
+        _w, _gamma, ll_reduced, _conv = _em_from_log_p(log_p_reduced, max_iter, tol)
         lr_stat = 2.0 * max(0.0, ll_full - ll_reduced)
         return float(chi2.sf(lr_stat, df=1))
 
@@ -203,7 +203,7 @@ def fragment_permutation_pvalues(
         def _perm_one(indices: np.ndarray) -> float:
             log_p_perm = log_p_matrix.copy()
             log_p_perm[:, t] = log_p_perm[indices, t]
-            w, _gamma, _ll = _em_from_log_p(log_p_perm, max_iter, tol)
+            w, _gamma, _ll, _conv = _em_from_log_p(log_p_perm, max_iter, tol)
             return w[t]
 
         null_pi_t = parallel_map(
