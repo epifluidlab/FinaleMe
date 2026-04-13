@@ -555,11 +555,11 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						}
 
 						// Step B: If raw total < 5M, go straight to full scan (fast enough).
-						// Otherwise, sample ~1M reads proportionally across chromosomes
-						// (weighted by chromosome length) to measure the filter pass rate.
+						// Otherwise, sample ~50K reads from the midpoint of each major
+						// chromosome via the BAM index to measure the filter pass rate.
 						final long FULL_SCAN_THRESHOLD = 5_000_000L;
-						final int TOTAL_SAMPLE_TARGET = 1_000_000;
-						final int REGION_SIZE = 1_000_000; // 1Mb query window per chromosome
+						final int TARGET_PER_CHROM = 50_000;
+						final int REGION_SIZE = 1_000_000; // 1Mb window around each midpoint
 
 						if(rawIndexTotal > 0 && rawIndexTotal < FULL_SCAN_THRESHOLD){
 							log.info("Raw total " + rawIndexTotal + " < 5M; using full scan for exact count");
@@ -572,51 +572,11 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 								.open(new File(wgsBamFile));
 							List<htsjdk.samtools.SAMSequenceRecord> sequences =
 								sampleReader.getFileHeader().getSequenceDictionary().getSequences();
-
-							// Compute total genome length for proportional allocation
-							long genomeLength = 0;
-							for(htsjdk.samtools.SAMSequenceRecord seq : sequences){
-								if(seq.getSequenceLength() >= REGION_SIZE){
-									genomeLength += seq.getSequenceLength();
-								}
-							}
-
-							// First pass: allocate proportionally, sample each chromosome
-							int remainingBudget = TOTAL_SAMPLE_TARGET;
-							// Track chromosomes that had fewer reads than allocated for redistribution
-							int chromsProcessed = 0;
 							int chromsWithReads = 0;
-
-							// Sort by length descending so large chromosomes are sampled first;
-							// any leftover budget from small/empty chromosomes accumulates for later.
-							List<htsjdk.samtools.SAMSequenceRecord> sortedSeqs = new ArrayList<>(sequences);
-							sortedSeqs.sort((a, b) -> Integer.compare(b.getSequenceLength(), a.getSequenceLength()));
-
-							for(htsjdk.samtools.SAMSequenceRecord seq : sortedSeqs){
+							for(htsjdk.samtools.SAMSequenceRecord seq : sequences){
 								int seqLen = seq.getSequenceLength();
 								if(seqLen < REGION_SIZE) continue;
 								String seqName = seq.getSequenceName();
-								chromsProcessed++;
-
-								// Proportional allocation from remaining budget
-								int chromsLeft = 0;
-								long genomeLenLeft = 0;
-								for(int si = chromsProcessed; si < sortedSeqs.size(); si++){
-									if(sortedSeqs.get(si).getSequenceLength() >= REGION_SIZE){
-										chromsLeft++;
-										genomeLenLeft += sortedSeqs.get(si).getSequenceLength();
-									}
-								}
-								long thisGenomeLen = seqLen;
-								long totalLenLeft = thisGenomeLen + genomeLenLeft;
-								int chromTarget;
-								if(totalLenLeft > 0){
-									chromTarget = (int)(remainingBudget * ((double) thisGenomeLen / totalLenLeft));
-									chromTarget = Math.max(chromTarget, 100); // at least 100 reads per chromosome
-								} else {
-									chromTarget = remainingBudget;
-								}
-
 								int midpoint = seqLen / 2;
 								int queryStart = Math.max(1, midpoint - REGION_SIZE / 2);
 								int queryEnd = Math.min(seqLen, midpoint + REGION_SIZE / 2);
@@ -624,7 +584,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 								try {
 									SAMRecordIterator regionIt = sampleReader.queryOverlapping(
 										seqName, queryStart, queryEnd);
-									while(regionIt.hasNext() && chromSampled < chromTarget){
+									while(regionIt.hasNext() && chromSampled < TARGET_PER_CHROM){
 										SAMRecord r = regionIt.next();
 										sampled++;
 										chromSampled++;
@@ -641,9 +601,6 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 									// Some references may not be queryable; skip
 								}
 								if(chromSampled > 0) chromsWithReads++;
-								// Reads not used from this chromosome go back into the budget
-								remainingBudget -= chromSampled;
-								if(remainingBudget <= 0) break;
 							}
 							sampleReader.close();
 
