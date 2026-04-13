@@ -496,80 +496,105 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						readsNumTotal = estimateTotalFragmentsFromTabixInput(wgsBamFile);
 						log.info("Counted " + (long)readsNumTotal + " fragments from tabix fragment input");
 					}else{
-						// Strategy 1: BAM index metadata (instant).
-						// Iterates by integer refIdx — not affected by chr prefix mismatch.
-						// Uses per-reference try-catch so one bad contig doesn't kill the count.
-						log.info("Get total reads number used for scaling from bam index... ");
+						// Strategy 1 (fast, ~2 seconds): Get raw total from BAM index or
+						// samtools idxstats, then sample ~1M reads to measure the pass
+						// rate under failFlagFilter + stringentPaired, and scale.
+						// This gives an accurate filtered count without a full scan.
+						log.info("Estimating filtered read count (index + sampling) ...");
 						boolean usedIndex = false;
+
+						// Step A: Get raw (unfiltered) total from index
+						long rawIndexTotal = 0;
 						if(wgsReader.indexing() != null && wgsReader.indexing().hasBrowseableIndex()){
 							try {
 								htsjdk.samtools.BAMIndex bamIndex = wgsReader.indexing().getIndex();
 								int nRefs = wgsReader.getFileHeader().getSequenceDictionary().getSequences().size();
-								int failedRefs = 0;
 								for(int refIdx = 0; refIdx < nRefs; refIdx++){
 									try {
 										htsjdk.samtools.BAMIndexMetaData meta = bamIndex.getMetaData(refIdx);
 										if(meta != null){
-											readsNumTotal += meta.getAlignedRecordCount();
+											rawIndexTotal += meta.getAlignedRecordCount();
 										}
 									} catch(Exception refEx){
-										failedRefs++;
+										// skip bad references
 									}
 								}
-								if (failedRefs > 0) {
-									log.info("BAM index: skipped " + failedRefs + "/" + nRefs +
-											 " references due to metadata errors");
-								}
-								if (readsNumTotal > 0) {
-									usedIndex = true;
-									log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index metadata");
-								} else {
-									log.info("BAM index metadata returned 0 (metadata bin may be absent)");
+								if (rawIndexTotal > 0) {
+									log.info("BAM index: " + rawIndexTotal + " raw aligned reads");
 								}
 							} catch(Exception e){
-								log.info("Failed to open BAM index: " + e.getMessage());
-								readsNumTotal = 0;
+								log.info("BAM index metadata failed: " + e.getMessage());
 							}
 						}
-						// Strategy 2: samtools idxstats (instant, works even when
-						// the BAI metadata bin is absent — reads index bin/chunk
-						// offsets directly). This is the equivalent of `samtools idxstats`.
-						if(!usedIndex){
+						// If BAM index metadata returned 0 (absent metadata bin), try samtools idxstats
+						if(rawIndexTotal == 0){
 							try {
-								log.info("Trying samtools idxstats ...");
 								ProcessBuilder pb = new ProcessBuilder("samtools", "idxstats", wgsBamFile);
 								pb.redirectErrorStream(true);
 								Process proc = pb.start();
 								BufferedReader idxReader = new BufferedReader(
 									new InputStreamReader(proc.getInputStream()));
 								String idxLine;
-								long idxTotal = 0;
 								while((idxLine = idxReader.readLine()) != null){
 									String[] parts = idxLine.split("\t");
 									if(parts.length >= 3){
 										try {
-											idxTotal += Long.parseLong(parts[2]);
+											rawIndexTotal += Long.parseLong(parts[2]);
 										} catch(NumberFormatException nfe){
-											// skip header or malformed lines
+											// skip malformed lines
 										}
 									}
 								}
-								int exitCode = proc.waitFor();
-								if(exitCode == 0 && idxTotal > 0){
-									readsNumTotal = idxTotal;
-									usedIndex = true;
-									log.info("Estimated " + (long)readsNumTotal +
-											 " aligned reads from samtools idxstats");
-								} else {
-									log.info("samtools idxstats returned 0 or failed (exit=" + exitCode + ")");
+								proc.waitFor();
+								if (rawIndexTotal > 0) {
+									log.info("samtools idxstats: " + rawIndexTotal + " raw aligned reads");
 								}
 							} catch(Exception e){
 								log.info("samtools idxstats not available: " + e.getMessage());
 							}
 						}
-						// Strategy 3: Full scan (last resort, slow)
+
+						// Step B: Sample ~1M reads to measure filter pass rate.
+						// Use a separate SamReader to avoid disturbing the main reader's state.
+						if(rawIndexTotal > 0){
+							final int SAMPLE_SIZE = 1_000_000;
+							long sampled = 0;
+							long passed = 0;
+							SamReader sampleReader = SamReaderFactory.makeDefault()
+								.validationStringency(ValidationStringency.SILENT)
+								.open(new File(wgsBamFile));
+							SAMRecordIterator sampleIt = sampleReader.iterator();
+							while(sampleIt.hasNext() && sampled < SAMPLE_SIZE){
+								SAMRecord r = sampleIt.next();
+								sampled++;
+								if(failFlagFilter(r)){
+									continue;
+								}
+								if(stringentPaired && !CcInferenceUtils.passReadPairOrientation(r)){
+									continue;
+								}
+								passed++;
+							}
+							sampleIt.close();
+							sampleReader.close();
+							if(sampled > 0 && passed > 0){
+								double passRate = (double) passed / sampled;
+								readsNumTotal = (long)(rawIndexTotal * passRate);
+								usedIndex = true;
+								log.info("Sampled " + sampled + " reads: " + passed + " passed filters (" +
+										 String.format("%.1f%%", passRate * 100) + "); estimated " +
+										 (long)readsNumTotal + " filtered reads");
+							} else if(sampled > 0){
+								// All sampled reads were filtered — very unusual. Use raw total as upper bound.
+								log.warn("All " + sampled + " sampled reads were filtered out; using raw index total");
+								readsNumTotal = rawIndexTotal;
+								usedIndex = true;
+							}
+						}
+
+						// Strategy 2: Full scan (last resort, when no index available)
 						if(!usedIndex){
-							log.info("Get total reads number used for scaling from bam file (full scan)... ");
+							log.info("No BAM index available. Full scan for read count ...");
 							SAMRecordIterator wgsIt = wgsReader.iterator();
 							while(wgsIt.hasNext()){
 								SAMRecord r = wgsIt.next();
