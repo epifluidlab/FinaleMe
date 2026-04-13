@@ -1052,6 +1052,7 @@ class TOOPipeline:
                         pat_path,
                         marker_regions=frag_marker_regions,
                         cpg_index=self.cpg_index,
+                        reference_methylation=reference.methylation,
                     )
                     if fragments:
                         w_hat_fragment = self.fragment_deconvolver.solve(
@@ -1185,8 +1186,9 @@ class TOOPipeline:
         )
         likelihood_score[K] = lik_u
         p_likelihood[K] = plik_u
-        # Multiple-testing correction across known cell types only.
-        q_likelihood[:K] = _benjamini_hochberg(p_likelihood[:K])
+        # Multiple-testing correction across all T+1 components including
+        # the Unknown component (design §3.5.8).
+        q_likelihood[:K + 1] = _benjamini_hochberg(p_likelihood[:K + 1])
 
         reliability = np.empty(K + 1, dtype=object)
         for j in range(K):

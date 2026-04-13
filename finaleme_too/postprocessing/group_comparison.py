@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 from finaleme_too.config import TestMethod
 from finaleme_too.postprocessing.statistical_testing import (
@@ -141,9 +144,16 @@ def run_group_comparisons(
             )
         elif method == TestMethod.BAYESIAN_POSTERIOR:
             if not posterior_samples_by_sample:
-                # Keep bayesian rows explicit in the output even when
-                # posterior draws are unavailable.
-                pairwise = _nan_bayesian_results(cell_type_names, contrasts)
+                # Fall back to ILR compositional regression when posterior
+                # samples are unavailable instead of emitting NaN rows.
+                log.warning(
+                    "Bayesian posterior samples unavailable; "
+                    "falling back to ILR compositional regression."
+                )
+                pairwise = compositional_regression_test(
+                    proportions, sample_ids, group_labels, cell_type_names,
+                    contrasts, covariates=covariates, fdr_alpha=1.0,
+                )
             else:
                 sample_groups_map = {
                     sid: lab for sid, lab in zip(sample_ids, group_labels)

@@ -65,7 +65,10 @@ class FragmentLevelDeconvolver:
             uniform[-1] = 1.0
             return uniform
 
-        # Pre-compute log P(f | j) for all fragments and cell types
+        # Pre-compute log P(f | j) for all fragments and cell types.
+        # Guard against NaN in the reference matrix: if any reference CpG
+        # row contains NaN, that CpG is excluded from the likelihood for
+        # the affected cell types (treated as uninformative).
         log_p = np.zeros((F, K_total), dtype=np.float64)
         for f, frag in enumerate(fragments):
             idx = np.asarray(frag.cpg_indices, dtype=np.int64)
@@ -74,8 +77,17 @@ class FragmentLevelDeconvolver:
                 continue
             idx = idx[mask]
             m = np.asarray(frag.methylated, dtype=np.float64)[mask]
-            r = np.clip(R_aug[idx], 1e-9, 1.0 - 1e-9)  # (L, K_total)
+            r = R_aug[idx]  # (L, K_total)
+            # Replace NaN values with 0.5 so they contribute zero log-likelihood
+            nan_mask = np.isnan(r)
+            if nan_mask.any():
+                r = r.copy()
+                r[nan_mask] = 0.5
+            r = np.clip(r, 1e-9, 1.0 - 1e-9)
             ll = m[:, None] * np.log(r) + (1.0 - m[:, None]) * np.log(1.0 - r)
+            # Zero out contributions from NaN reference positions
+            if nan_mask.any():
+                ll[nan_mask] = 0.0
             log_p[f] = ll.sum(axis=0)
 
         # Initialize w uniform

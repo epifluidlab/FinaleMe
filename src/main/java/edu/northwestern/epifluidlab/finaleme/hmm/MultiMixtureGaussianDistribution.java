@@ -403,8 +403,28 @@ implements MultiRandomDistribution
 	*/
 	
 	
+	// --- Getters for per-component GMM parameters (used by emission adaptation) ---
+
+	public ArrayList<ArrayList<Double>> getMeanInEachGaussian() {
+		return meanInEachGaussian;
+	}
+
+	public ArrayList<ArrayList<Double>> getVarianceInEachGaussian() {
+		return varianceInEachGaussian;
+	}
+
+	public ArrayList<ArrayList<Double>> getPropInEachGaussian() {
+		return propInEachGaussian;
+	}
+
+	public int getDimension() {
+		return dimension;
+	}
+
+	public ArrayList<Integer> getMixNumberInFeature() {
+		return mixNumberInFeature;
+	}
+
 	private static final long serialVersionUID = -2438571303843585271L;
-
-
 
 }

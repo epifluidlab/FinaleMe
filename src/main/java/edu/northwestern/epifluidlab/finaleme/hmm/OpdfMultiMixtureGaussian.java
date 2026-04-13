@@ -411,5 +411,13 @@ implements Opdf<ObservationVector>
 	}
 
 
+	/**
+	 * Returns the underlying MultiMixtureGaussianDistribution for direct
+	 * access to per-component GMM parameters (used by emission adaptation).
+	 */
+	public MultiMixtureGaussianDistribution getDistribution() {
+		return distribution;
+	}
+
 	private static final long serialVersionUID = 1L;
 }
