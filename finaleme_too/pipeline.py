@@ -1038,6 +1038,8 @@ class TOOPipeline:
             fragment_mode == "always"
             or (fragment_mode == "auto" and tier == CoverageTier.ULTRALOW)
         )
+        fragment_log_p: np.ndarray | None = None
+        fragment_ll: float | None = None
         if should_try_fragment and self.cpg_index is not None:
             pat_path = sample.resolved_pat_file() if hasattr(sample, "resolved_pat_file") else None
             if pat_path is not None and Path(pat_path).exists():
@@ -1055,9 +1057,11 @@ class TOOPipeline:
                         reference_methylation=reference.methylation,
                     )
                     if fragments:
-                        w_hat_fragment = self.fragment_deconvolver.solve(
-                            fragments, reference.methylation
-                        )
+                        # Use solve_full() to get log_p for bootstrap/LRT
+                        w_hat_fragment, _gamma, fragment_ll, fragment_log_p = \
+                            self.fragment_deconvolver.solve_full(
+                                fragments, reference.methylation
+                            )
                         log.info(
                             "Sample %s: used fragment-level EM on %d fragments (tier=%s)",
                             sample.sample_id, len(fragments), tier.value,

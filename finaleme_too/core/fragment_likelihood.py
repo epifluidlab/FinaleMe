@@ -33,6 +33,66 @@ class Fragment:
     methylated: np.ndarray  # uint8 (0/1) calls aligned to cpg_indices
 
 
+def _em_from_log_p(
+    log_p: np.ndarray,
+    max_iter: int = 200,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Run EM on a precomputed log-likelihood matrix.
+
+    This is the shared building block used by ``solve_full()``, the fragment
+    bootstrap, and the LRT/permutation tests.
+
+    Parameters
+    ----------
+    log_p : ndarray, shape (F, K_total)
+        Pre-computed log P(f | j) for all fragments and cell types.
+    max_iter : int
+        Maximum EM iterations.
+    tol : float
+        Convergence threshold on max absolute change in proportions.
+
+    Returns
+    -------
+    w : ndarray, shape (K_total,)
+        Estimated mixture proportions.
+    gamma : ndarray, shape (F, K_total)
+        Per-fragment responsibilities from the final E-step.
+    ll : float
+        Final log-likelihood Σ_f log Σ_j w_j P(f|j).
+    """
+    K_total = log_p.shape[1]
+    w = np.full(K_total, 1.0 / K_total, dtype=np.float64)
+
+    gamma = np.empty_like(log_p)
+    ll = -np.inf
+
+    for _it in range(max_iter):
+        # E-step: numerically stable softmax of log_p + log_w
+        with np.errstate(divide="ignore"):
+            log_unnorm = log_p + np.log(np.maximum(w, 1e-12))[None, :]
+        row_max = np.max(log_unnorm, axis=1, keepdims=True)
+        log_unnorm_shifted = log_unnorm - row_max
+        unnorm = np.exp(log_unnorm_shifted)
+        denom = unnorm.sum(axis=1, keepdims=True)
+        denom = np.where(denom > 0, denom, 1.0)
+        gamma = unnorm / denom
+
+        # Log-likelihood: Σ_f log(Σ_j w_j P(f|j))
+        ll = float(np.sum(np.log(denom.ravel()) + row_max.ravel()))
+
+        # M-step
+        w_new = gamma.mean(axis=0)
+        w_new = w_new / w_new.sum()
+
+        if np.max(np.abs(w_new - w)) < tol:
+            w = w_new
+            break
+        w = w_new
+
+    return w, gamma, ll
+
+
 class FragmentLevelDeconvolver:
     """EM deconvolver for ultra-low coverage data."""
 
@@ -46,30 +106,30 @@ class FragmentLevelDeconvolver:
         self.tol = tol
         self.unknown_profile = unknown_profile
 
-    def solve(
-        self,
+    @staticmethod
+    def _compute_log_p(
         fragments: list[Fragment],
-        reference_methylation: np.ndarray,
+        reference_augmented: np.ndarray,
     ) -> np.ndarray:
-        """Return (K+1,) mixture proportions including the unknown component."""
-        R = np.asarray(reference_methylation, dtype=np.float64)
-        # Augment with unknown column at 0.5
-        R_aug = np.hstack(
-            [R, np.full((R.shape[0], 1), self.unknown_profile, dtype=np.float64)]
-        )
+        """Pre-compute log P(f | j) for all fragments and cell types.
+
+        Parameters
+        ----------
+        fragments : list[Fragment]
+            Each fragment has cpg_indices and methylated arrays.
+        reference_augmented : ndarray, shape (M, K_total)
+            Reference methylation matrix already augmented with the
+            unknown column.
+
+        Returns
+        -------
+        log_p : ndarray, shape (F, K_total)
+        """
+        R_aug = reference_augmented
         K_total = R_aug.shape[1]
-
         F = len(fragments)
-        if F == 0:
-            uniform = np.zeros(K_total, dtype=np.float64)
-            uniform[-1] = 1.0
-            return uniform
-
-        # Pre-compute log P(f | j) for all fragments and cell types.
-        # Guard against NaN in the reference matrix: if any reference CpG
-        # row contains NaN, that CpG is excluded from the likelihood for
-        # the affected cell types (treated as uninformative).
         log_p = np.zeros((F, K_total), dtype=np.float64)
+
         for f, frag in enumerate(fragments):
             idx = np.asarray(frag.cpg_indices, dtype=np.int64)
             mask = (idx >= 0) & (idx < R_aug.shape[0])
@@ -90,30 +150,59 @@ class FragmentLevelDeconvolver:
                 ll[nan_mask] = 0.0
             log_p[f] = ll.sum(axis=0)
 
-        # Initialize w uniform
-        w = np.full(K_total, 1.0 / K_total, dtype=np.float64)
+        return log_p
 
-        for it in range(self.max_iter):
-            # E-step: compute responsibilities (numerically stable softmax of log p + log w)
-            with np.errstate(divide="ignore"):
-                log_unnorm = log_p + np.log(np.maximum(w, 1e-12))[None, :]
-            row_max = np.max(log_unnorm, axis=1, keepdims=True)
-            log_unnorm = log_unnorm - row_max
-            unnorm = np.exp(log_unnorm)
-            denom = unnorm.sum(axis=1, keepdims=True)
-            denom = np.where(denom > 0, denom, 1.0)
-            gamma = unnorm / denom
+    def _augment_reference(self, reference_methylation: np.ndarray) -> np.ndarray:
+        """Add the unknown column (uniform at ``self.unknown_profile``)."""
+        R = np.asarray(reference_methylation, dtype=np.float64)
+        return np.hstack(
+            [R, np.full((R.shape[0], 1), self.unknown_profile, dtype=np.float64)]
+        )
 
-            # M-step
-            w_new = gamma.mean(axis=0)
-            w_new = w_new / w_new.sum()
+    def solve_full(
+        self,
+        fragments: list[Fragment],
+        reference_methylation: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Run fragment EM and return full results.
 
-            if np.max(np.abs(w_new - w)) < self.tol:
-                w = w_new
-                break
-            w = w_new
+        Returns
+        -------
+        w : ndarray, shape (K+1,)
+            Estimated mixture proportions including the unknown component.
+        gamma : ndarray, shape (N, K+1)
+            Per-fragment responsibilities from the final E-step.
+        ll : float
+            Final log-likelihood.
+        log_p : ndarray, shape (N, K+1)
+            Pre-computed log P(f | j) matrix (for bootstrap / LRT reuse).
+        """
+        R_aug = self._augment_reference(reference_methylation)
+        K_total = R_aug.shape[1]
+        F = len(fragments)
 
+        if F == 0:
+            uniform = np.zeros(K_total, dtype=np.float64)
+            uniform[-1] = 1.0
+            empty_gamma = np.zeros((0, K_total), dtype=np.float64)
+            empty_log_p = np.zeros((0, K_total), dtype=np.float64)
+            return uniform, empty_gamma, 0.0, empty_log_p
+
+        log_p = self._compute_log_p(fragments, R_aug)
+        w, gamma, ll = _em_from_log_p(log_p, self.max_iter, self.tol)
+        return w, gamma, ll, log_p
+
+    def solve(
+        self,
+        fragments: list[Fragment],
+        reference_methylation: np.ndarray,
+    ) -> np.ndarray:
+        """Return (K+1,) mixture proportions including the unknown component.
+
+        Backward-compatible wrapper around ``solve_full()``.
+        """
+        w, _gamma, _ll, _log_p = self.solve_full(fragments, reference_methylation)
         return w
 
 
-__all__ = ["Fragment", "FragmentLevelDeconvolver"]
+__all__ = ["Fragment", "FragmentLevelDeconvolver", "_em_from_log_p"]
