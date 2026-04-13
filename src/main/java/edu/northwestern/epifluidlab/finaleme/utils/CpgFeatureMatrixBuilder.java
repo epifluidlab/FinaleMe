@@ -1003,23 +1003,29 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											int fragEnd = Math.max(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
 											if(r.getInferredInsertSize() == 0) continue;
 
-											byte[] refBasesFrag = binRefParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
-											if(negStrand && useStrandSpecificFragBase){
-												SequenceUtil.reverseComplement(refBasesFrag);
-											}
 											HashMap<String, Double> kmerMapsFrag = new HashMap<String, Double>();
-											if(useFragBaseKmer){
-												for(int j = 2; j <= kmerLen; j++){
-													kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
+											try {
+												byte[] refBasesFrag = binRefParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
+												if(negStrand && useStrandSpecificFragBase){
+													SequenceUtil.reverseComplement(refBasesFrag);
 												}
+												if(useFragBaseKmer){
+													for(int j = 2; j <= kmerLen; j++){
+														kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
+													}
+												}
+											} catch (Exception e) {
+												// TwoBitParser can fail at N-block boundaries; skip kmer for this CpG
 											}
 
 											// 5' end motif extraction and scoring (BAM path)
+											// BAM coords: fragStart is 1-based inclusive, fragEnd is 1-based
+											// exclusive (alignmentStart + insertSize). TwoBitParser needs
+											// 0-based coords: start=fragStart-1, end=fragEnd (already 0-based exclusive).
 											String bamMotif = null;
 											double bamMotifScore = Double.NaN;
 											if (useEndMotif) {
-												// BAM coords are 1-based; subtract 1 for 0-based TwoBitParser
-												bamMotif = extractFivePrimeMotif(binRefParser, fragStart - 1, fragEnd - 1, negStrand);
+												bamMotif = extractFivePrimeMotif(binRefParser, fragStart - 1, fragEnd, negStrand);
 												if (saveMotifLookup != null) {
 													accumulateMotifCount(bamMotif, methyStat);
 												}
@@ -1695,8 +1701,14 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	 * For + strand fragments: 5' end is at fragStart, extract [fragStart, fragStart+4).
 	 * For - strand fragments: 5' end is at fragEnd, extract reverse complement of [fragEnd-4, fragEnd).
 	 *
-	 * All coordinates must be 0-based. For BAM input, subtract 1 from the 1-based SAMRecord
-	 * coordinates at the call site.
+	 * Coordinate convention (0-based half-open, matching BED/TwoBitParser):
+	 *   fragStart = 0-based start position
+	 *   fragEnd   = 0-based exclusive end position
+	 *
+	 * For BAM input: fragStart = SAMRecord.getAlignmentStart() - 1,
+	 *                fragEnd   = getAlignmentStart() + getInferredInsertSize()
+	 *                (already 0-based exclusive since TLEN includes the +1).
+	 * For Tabix input: coords are already 0-based half-open.
 	 *
 	 * @param binRefParser TwoBitParser set to the current chromosome
 	 * @param fragStart    0-based fragment start (genomic)
@@ -1706,15 +1718,16 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	 */
 	private String extractFivePrimeMotif(TwoBitParser binRefParser, int fragStart, int fragEnd, boolean negStrand) {
 		try {
+			if (fragStart < 0 || fragEnd <= fragStart) return null;
 			String seq;
 			if (!negStrand) {
-				// + strand: 5' is at fragStart
-				if (fragStart < 0) return null;
+				// + strand: 5' is at fragStart, extract [fragStart, fragStart+4)
+				if (fragStart + 4 > fragEnd) return null;  // fragment too short
 				seq = binRefParser.loadFragment(fragStart, 4);
 			} else {
-				// - strand: 5' is at fragEnd, take reverse complement
+				// - strand: 5' is at fragEnd-1, extract RC of [fragEnd-4, fragEnd)
 				int motifStart = fragEnd - 4;
-				if (motifStart < 0) return null;
+				if (motifStart < 0 || motifStart < fragStart) return null;
 				seq = binRefParser.loadFragment(motifStart, 4);
 				byte[] seqBytes = seq.getBytes();
 				SequenceUtil.reverseComplement(seqBytes);
