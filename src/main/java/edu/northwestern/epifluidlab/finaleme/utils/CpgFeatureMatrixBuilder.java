@@ -705,6 +705,10 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 										List<SAMRecord> activeReads = new ArrayList<SAMRecord>();
 										SAMRecord nextCandidateRead = null;
 										long localCpgCount = 0;
+										// Per-fragment motif cache: avoids redundant .2bit lookups when
+										// the same read covers multiple CpGs. Cleared per CpG.
+										HashMap<String, Double> motifCache = useEndMotif ? new HashMap<>() : null;
+										HashMap<String, String> motifStringCache = (useEndMotif && saveMotifLookup != null) ? new HashMap<>() : null;
 
 										for(Node<String> cpg : cpgNodes){
 											int start = cpg.getStart();
@@ -1003,34 +1007,49 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											int fragEnd = Math.max(r.getAlignmentStart(), r.getAlignmentStart()+r.getInferredInsertSize());
 											if(r.getInferredInsertSize() == 0) continue;
 
+											// Kmer reference sequence: only load when kmer features are requested.
+											// Previously this large loadFragment() was always called even when
+											// unused, wasting ~500-1000 bytes per read per CpG.
 											HashMap<String, Double> kmerMapsFrag = new HashMap<String, Double>();
-											try {
-												byte[] refBasesFrag = binRefParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
-												if(negStrand && useStrandSpecificFragBase){
-													SequenceUtil.reverseComplement(refBasesFrag);
-												}
-												if(useFragBaseKmer){
-													for(int j = 2; j <= kmerLen; j++){
-														kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
+											if (useFragBaseKmer || useStrandSpecificFragBase) {
+												try {
+													byte[] refBasesFrag = binRefParser.loadFragment(fragMostLeft, fragMostRight-fragMostLeft+1).getBytes();
+													if(negStrand && useStrandSpecificFragBase){
+														SequenceUtil.reverseComplement(refBasesFrag);
 													}
+													if(useFragBaseKmer){
+														for(int j = 2; j <= kmerLen; j++){
+															kmerMapsFrag.putAll(CcInferenceUtils.kmerFreqSearch(refBasesFrag, j));
+														}
+													}
+												} catch (Exception e) {
+													// TwoBitParser can fail at N-block boundaries; skip kmer for this CpG
 												}
-											} catch (Exception e) {
-												// TwoBitParser can fail at N-block boundaries; skip kmer for this CpG
 											}
 
-											// 5' end motif extraction and scoring (BAM path)
-											// BAM coords: fragStart is 1-based inclusive, fragEnd is 1-based
-											// exclusive (alignmentStart + insertSize). TwoBitParser needs
-											// 0-based coords: start=fragStart-1, end=fragEnd (already 0-based exclusive).
+											// 5' end motif extraction and scoring (BAM path).
+											// The motif is a per-fragment property (same for all CpGs within
+											// the same fragment). Cache by read name within this CpG bin to
+											// avoid redundant .2bit lookups when the same read covers multiple CpGs.
 											String bamMotif = null;
 											double bamMotifScore = Double.NaN;
 											if (useEndMotif) {
-												bamMotif = extractFivePrimeMotif(binRefParser, fragStart - 1, fragEnd, negStrand);
-												if (saveMotifLookup != null) {
-													accumulateMotifCount(bamMotif, methyStat);
-												}
-												if (motifScoreMap != null) {
+												String motifCacheKey = readName;
+												Double cachedScore = motifCache.get(motifCacheKey);
+												if (cachedScore != null) {
+													bamMotifScore = cachedScore;
+													// Lookup motif string only if training mode needs it
+													if (saveMotifLookup != null) {
+														bamMotif = motifStringCache.get(motifCacheKey);
+													}
+												} else {
+													bamMotif = extractFivePrimeMotif(binRefParser, fragStart - 1, fragEnd, negStrand);
 													bamMotifScore = getMotifScore(bamMotif);
+													motifCache.put(motifCacheKey, bamMotifScore);
+													if (saveMotifLookup != null) {
+														accumulateMotifCount(bamMotif, methyStat);
+														motifStringCache.put(motifCacheKey, bamMotif);
+													}
 												}
 											}
 
@@ -1112,6 +1131,9 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 										int fragmentCursor = 0;
 										ArrayList<FragmentRecord> activeFragments = new ArrayList<FragmentRecord>();
 										long localCpgCount = 0;
+										// Per-fragment motif cache (Tabix path)
+										HashMap<String, Double> tabixMotifCache = useEndMotif ? new HashMap<>() : null;
+										HashMap<String, String> tabixMotifStringCache = (useEndMotif && saveMotifLookup != null) ? new HashMap<>() : null;
 
 										for(Node<String> cpg : cpgNodes){
 											int start = cpg.getStart();
@@ -1327,16 +1349,24 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												}
 
 												// 5' end motif extraction and scoring (Tabix path)
+												// Cache by readName: same fragment at multiple CpGs gets same motif.
 												String tabixMotif = null;
 												double tabixMotifScore = Double.NaN;
 												if (useEndMotif) {
-													// Tabix/BED coords are 0-based; use directly
-													tabixMotif = extractFivePrimeMotif(binRefParser, fragment.start, fragment.end, negStrand);
-													if (saveMotifLookup != null) {
-														accumulateMotifCount(tabixMotif, methyStat);
-													}
-													if (motifScoreMap != null) {
+													Double cachedScore = tabixMotifCache.get(readName);
+													if (cachedScore != null) {
+														tabixMotifScore = cachedScore;
+														if (saveMotifLookup != null) {
+															tabixMotif = tabixMotifStringCache.get(readName);
+														}
+													} else {
+														tabixMotif = extractFivePrimeMotif(binRefParser, fragment.start, fragment.end, negStrand);
 														tabixMotifScore = getMotifScore(tabixMotif);
+														tabixMotifCache.put(readName, tabixMotifScore);
+														if (saveMotifLookup != null) {
+															accumulateMotifCount(tabixMotif, methyStat);
+															tabixMotifStringCache.put(readName, tabixMotif);
+														}
 													}
 												}
 
