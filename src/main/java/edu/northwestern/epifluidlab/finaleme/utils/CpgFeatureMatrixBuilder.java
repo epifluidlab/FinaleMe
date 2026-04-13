@@ -496,42 +496,75 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						readsNumTotal = estimateTotalFragmentsFromTabixInput(wgsBamFile);
 						log.info("Counted " + (long)readsNumTotal + " fragments from tabix fragment input");
 					}else{
-						// Strategy 1: BAM index metadata (instant, but some indices lack this data)
+						// Strategy 1: BAM index metadata (instant).
+						// Iterates by integer refIdx — not affected by chr prefix mismatch.
+						// Uses per-reference try-catch so one bad contig doesn't kill the count.
 						log.info("Get total reads number used for scaling from bam index... ");
 						boolean usedIndex = false;
 						if(wgsReader.indexing() != null && wgsReader.indexing().hasBrowseableIndex()){
 							try {
 								htsjdk.samtools.BAMIndex bamIndex = wgsReader.indexing().getIndex();
 								int nRefs = wgsReader.getFileHeader().getSequenceDictionary().getSequences().size();
+								int failedRefs = 0;
 								for(int refIdx = 0; refIdx < nRefs; refIdx++){
-									htsjdk.samtools.BAMIndexMetaData meta = bamIndex.getMetaData(refIdx);
-									if(meta != null){
-										readsNumTotal += meta.getAlignedRecordCount();
+									try {
+										htsjdk.samtools.BAMIndexMetaData meta = bamIndex.getMetaData(refIdx);
+										if(meta != null){
+											readsNumTotal += meta.getAlignedRecordCount();
+										}
+									} catch(Exception refEx){
+										failedRefs++;
 									}
+								}
+								if (failedRefs > 0) {
+									log.info("BAM index: skipped " + failedRefs + "/" + nRefs +
+											 " references due to metadata errors");
 								}
 								if (readsNumTotal > 0) {
 									usedIndex = true;
-									log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index (fast path)");
+									log.info("Estimated " + (long)readsNumTotal + " aligned reads from BAM index metadata");
 								} else {
-									log.info("BAM index returned 0 aligned reads (metadata bin may be missing)");
+									log.info("BAM index metadata returned 0 (metadata bin may be absent)");
 								}
 							} catch(Exception e){
-								log.info("Failed to get counts from BAM index: " + e.getMessage());
+								log.info("Failed to open BAM index: " + e.getMessage());
 								readsNumTotal = 0;
 							}
 						}
-						// Strategy 2: Estimate from BAM file size (fast heuristic).
-						// Average compressed BAM record is ~100-200 bytes; 150 is a good
-						// default for paired-end WGS. This is only used for coverage
-						// normalization, so an approximate count is acceptable.
+						// Strategy 2: samtools idxstats (instant, works even when
+						// the BAI metadata bin is absent — reads index bin/chunk
+						// offsets directly). This is the equivalent of `samtools idxstats`.
 						if(!usedIndex){
-							long bamFileSize = new File(wgsBamFile).length();
-							if (bamFileSize > 0) {
-								readsNumTotal = bamFileSize / 150;
-								log.info("Estimated " + (long)readsNumTotal +
-										 " reads from BAM file size (" + (bamFileSize / (1024*1024)) +
-										 " MB / ~150 bytes per record)");
-								usedIndex = true;
+							try {
+								log.info("Trying samtools idxstats ...");
+								ProcessBuilder pb = new ProcessBuilder("samtools", "idxstats", wgsBamFile);
+								pb.redirectErrorStream(true);
+								Process proc = pb.start();
+								BufferedReader idxReader = new BufferedReader(
+									new InputStreamReader(proc.getInputStream()));
+								String idxLine;
+								long idxTotal = 0;
+								while((idxLine = idxReader.readLine()) != null){
+									String[] parts = idxLine.split("\t");
+									if(parts.length >= 3){
+										try {
+											idxTotal += Long.parseLong(parts[2]);
+										} catch(NumberFormatException nfe){
+											// skip header or malformed lines
+										}
+									}
+								}
+								int exitCode = proc.waitFor();
+								if(exitCode == 0 && idxTotal > 0){
+									readsNumTotal = idxTotal;
+									usedIndex = true;
+									log.info("Estimated " + (long)readsNumTotal +
+											 " aligned reads from samtools idxstats");
+								} else {
+									log.info("samtools idxstats returned 0 or failed (exit=" + exitCode + ")");
+								}
+							} catch(Exception e){
+								log.info("samtools idxstats not available: " + e.getMessage());
 							}
 						}
 						// Strategy 3: Full scan (last resort, slow)
