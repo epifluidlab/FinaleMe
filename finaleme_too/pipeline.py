@@ -1058,7 +1058,7 @@ class TOOPipeline:
                     )
                     if fragments:
                         # Use solve_full() to get log_p for bootstrap/LRT
-                        w_hat_fragment, _gamma, fragment_ll, fragment_log_p = \
+                        w_hat_fragment, _gamma, fragment_ll, fragment_log_p, _frag_conv = \
                             self.fragment_deconvolver.solve_full(
                                 fragments, reference.methylation
                             )

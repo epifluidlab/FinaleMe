@@ -37,7 +37,7 @@ def _em_from_log_p(
     log_p: np.ndarray,
     max_iter: int = 200,
     tol: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, bool]:
     """Run EM on a precomputed log-likelihood matrix.
 
     This is the shared building block used by ``solve_full()``, the fragment
@@ -60,12 +60,15 @@ def _em_from_log_p(
         Per-fragment responsibilities from the final E-step.
     ll : float
         Final log-likelihood Σ_f log Σ_j w_j P(f|j).
+    converged : bool
+        True if EM reached tolerance before max_iter.
     """
     K_total = log_p.shape[1]
     w = np.full(K_total, 1.0 / K_total, dtype=np.float64)
 
     gamma = np.empty_like(log_p)
     ll = -np.inf
+    converged = False
 
     for _it in range(max_iter):
         # E-step: numerically stable softmax of log_p + log_w
@@ -87,10 +90,11 @@ def _em_from_log_p(
 
         if np.max(np.abs(w_new - w)) < tol:
             w = w_new
+            converged = True
             break
         w = w_new
 
-    return w, gamma, ll
+    return w, gamma, ll, converged
 
 
 class FragmentLevelDeconvolver:
@@ -101,10 +105,12 @@ class FragmentLevelDeconvolver:
         max_iter: int = 200,
         tol: float = 1e-6,
         unknown_profile: float = 0.5,
+        include_unknown: bool = True,
     ):
         self.max_iter = max_iter
         self.tol = tol
         self.unknown_profile = unknown_profile
+        self.include_unknown = include_unknown
 
     @staticmethod
     def _compute_log_p(
@@ -153,29 +159,34 @@ class FragmentLevelDeconvolver:
         return log_p
 
     def _augment_reference(self, reference_methylation: np.ndarray) -> np.ndarray:
-        """Add the unknown column (uniform at ``self.unknown_profile``)."""
+        """Optionally add the unknown column (uniform at ``self.unknown_profile``)."""
         R = np.asarray(reference_methylation, dtype=np.float64)
-        return np.hstack(
-            [R, np.full((R.shape[0], 1), self.unknown_profile, dtype=np.float64)]
-        )
+        if self.include_unknown:
+            return np.hstack(
+                [R, np.full((R.shape[0], 1), self.unknown_profile, dtype=np.float64)]
+            )
+        return R
 
     def solve_full(
         self,
         fragments: list[Fragment],
         reference_methylation: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
         """Run fragment EM and return full results.
 
         Returns
         -------
-        w : ndarray, shape (K+1,)
-            Estimated mixture proportions including the unknown component.
-        gamma : ndarray, shape (N, K+1)
+        w : ndarray, shape (K+1,) or (K,)
+            Estimated mixture proportions. Includes unknown component only
+            when ``include_unknown=True``.
+        gamma : ndarray, shape (N, K_total)
             Per-fragment responsibilities from the final E-step.
         ll : float
             Final log-likelihood.
-        log_p : ndarray, shape (N, K+1)
+        log_p : ndarray, shape (N, K_total)
             Pre-computed log P(f | j) matrix (for bootstrap / LRT reuse).
+        converged : bool
+            True if EM reached tolerance before max_iter.
         """
         R_aug = self._augment_reference(reference_methylation)
         K_total = R_aug.shape[1]
@@ -183,25 +194,28 @@ class FragmentLevelDeconvolver:
 
         if F == 0:
             uniform = np.zeros(K_total, dtype=np.float64)
-            uniform[-1] = 1.0
+            if self.include_unknown:
+                uniform[-1] = 1.0
+            else:
+                uniform[:] = 1.0 / K_total
             empty_gamma = np.zeros((0, K_total), dtype=np.float64)
             empty_log_p = np.zeros((0, K_total), dtype=np.float64)
-            return uniform, empty_gamma, 0.0, empty_log_p
+            return uniform, empty_gamma, 0.0, empty_log_p, False
 
         log_p = self._compute_log_p(fragments, R_aug)
-        w, gamma, ll = _em_from_log_p(log_p, self.max_iter, self.tol)
-        return w, gamma, ll, log_p
+        w, gamma, ll, converged = _em_from_log_p(log_p, self.max_iter, self.tol)
+        return w, gamma, ll, log_p, converged
 
     def solve(
         self,
         fragments: list[Fragment],
         reference_methylation: np.ndarray,
     ) -> np.ndarray:
-        """Return (K+1,) mixture proportions including the unknown component.
+        """Return mixture proportions array.
 
         Backward-compatible wrapper around ``solve_full()``.
         """
-        w, _gamma, _ll, _log_p = self.solve_full(fragments, reference_methylation)
+        w, _gamma, _ll, _log_p, _converged = self.solve_full(fragments, reference_methylation)
         return w
 
 
