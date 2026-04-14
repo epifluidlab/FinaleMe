@@ -2810,28 +2810,25 @@ public class FinaleMe {
 		}
 
 		// Phase 2: Load data into memory for adaptation.
-		// Baum-Welch requires >= 2 CpGs per fragment for xi computation.
-		// Temporarily enforce miniDataPoints >= 2 during data loading.
+		// Use the user's -miniDataPoints (e.g. 7) for training fragment selection.
+		// Baum-Welch requires >= 2 CpGs per fragment; enforce as a floor.
+		int adaptMiniDataPoints = Math.max(miniDataPoints, 2);
 		int savedMiniDataPoints = miniDataPoints;
-		if (miniDataPoints < 2) {
-			log.info("Raising miniDataPoints from " + miniDataPoints + " to 2 for adaptation (BW requires >= 2 observations)");
-			miniDataPoints = 2;
-		}
-		log.info("Phase 2: Loading data for adaptation ...");
+		miniDataPoints = adaptMiniDataPoints;
+		log.info("Phase 2: Loading data for adaptation (miniDataPoints=" + adaptMiniDataPoints + ") ...");
 		MatrixObj matrixObj = processMatrixFile(inputFile);
-		miniDataPoints = savedMiniDataPoints; // restore for decode phase
+		miniDataPoints = savedMiniDataPoints; // restore original
 		matrixObj.cpgDistFreq = null;
 
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix =
 			new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		for (org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> row : matrixObj.matrix) {
-			// Double-check: skip any fragment with < 2 observations (safety net)
 			if (row.getMiddle().size() >= 2) {
 				matrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(row.getLeft(), row.getMiddle()));
 			}
 		}
 
-		log.info("Loaded " + matrix.size() + " fragments for adaptation (>= 2 CpGs each)");
+		log.info("Loaded " + matrix.size() + " fragments for adaptation (>= " + adaptMiniDataPoints + " CpGs each)");
 
 		// Phase 3: Constrained Baum-Welch adaptation
 		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
@@ -2895,16 +2892,18 @@ public class FinaleMe {
 			log.info("Adapted model saved to: " + saveAdaptedModel);
 		}
 
-		// Free adaptation data
+		// Free adaptation data before decode to reduce memory
 		matrix = null;
-		matrixObj.matrixU = null;
-		matrixObj.matrixM = null;
-		matrixObj.pi = null;
-		matrixObj.a = null;
+		matrixObj = null;
 
-		// Phase 4: Viterbi decode all fragments with adapted model (loaded from temp file)
-		log.info("Phase 4: Decoding with adapted model ...");
-		decodeHmm(matrixObj, adaptedModelTmp.getAbsolutePath(), outputFile, inputFile, false, cpgIndex, chromOrder);
+		// Phase 4: Viterbi decode ALL fragments (miniDataPoints=1) using the
+		// adapted model via streaming decode. This outputs every fragment
+		// regardless of the -miniDataPoints used for adaptation training.
+		log.info("Phase 4: Streaming decode with adapted model (all fragments) ...");
+		int decodeMiniDataPoints = miniDataPoints;
+		miniDataPoints = 1;  // decode everything
+		decodeOnlyStreaming(inputFile, adaptedModelTmp.getAbsolutePath(), outputFile, cpgIndex, chromOrder);
+		miniDataPoints = decodeMiniDataPoints;  // restore
 		adaptedModelTmp.delete();
 	}
 
