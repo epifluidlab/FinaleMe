@@ -2451,7 +2451,7 @@ public class FinaleMe {
 		if(lowCoverage){
 			features = useEndMotif ? 3 : 2;
 		}
-		
+
 		if(mixNumberInFeature == null || mixNumberInFeature.isEmpty()){
 			mixNumberInFeature = new ArrayList<Integer>();
 			for(int i = 0; i < features; i++){
@@ -2460,8 +2460,17 @@ public class FinaleMe {
 		}else if(mixNumberInFeature.size() != features){
 			throw new IllegalArgumentException("Wrong number of mixNumberInFeature" + mixNumberInFeature);
 		}
-		
-		
+
+		// Validate adaptation flags
+		if(adaptEmissionOnly && !decodeModeOnly){
+			throw new IllegalArgumentException("-adaptEmissionOnly requires -decodeModeOnly");
+		}
+		if(saveAdaptedModel != null && !adaptEmissionOnly){
+			throw new IllegalArgumentException("-saveAdaptedModel requires -adaptEmissionOnly");
+		}
+		if(saveAdaptedModel != null && !decodeModeOnly){
+			throw new IllegalArgumentException("-saveAdaptedModel requires -decodeModeOnly");
+		}
 	}
 
 	private void finish(){
