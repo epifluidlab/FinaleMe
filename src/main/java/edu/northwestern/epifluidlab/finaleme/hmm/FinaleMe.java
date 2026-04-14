@@ -680,13 +680,15 @@ public class FinaleMe {
 			br = new BufferedReader(new FileReader(matrixFile));
 		}
 
-			// Two-pass file-based approach: read the matrix file twice to avoid
-			// storing ~35GB of intermediate String/array data in memory.
-			// Pass 1: collect feature statistics (no storage).
-			// Pass 2: re-read file, apply z-score normalization, build matrixProcess directly.
-			// Re-reading a 3GB gzipped file takes ~30s — trivial vs saving ~35GB RAM.
+			// Two-pass file-based approach to avoid storing intermediate data.
+			// Pass 1: collect feature statistics AND count CpGs per readName.
+			//          The per-read CpG count lets Pass 2 skip reads that won't
+			//          meet miniDataPoints — typically ~90% of all rows, saving
+			//          ~60GB of matrixProcess memory.
+			// Pass 2: re-read file, skip reads below threshold, z-score normalize,
+			//          build matrixProcess directly.
 
-			// === Pass 1: Collect stats only ===
+			// === Pass 1: Stats + per-read CpG count ===
 			String line;
 			int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
 			SummaryStatistics[] stats = new SummaryStatistics[numStats];
@@ -694,6 +696,10 @@ public class FinaleMe {
 				stats[i] = new SummaryStatistics();
 			}
 			long statsRows = 0;
+
+			// Count CpGs per readName so Pass 2 can skip reads with too few CpGs.
+			// At 30X WGS: ~30M unique reads × ~100 bytes/entry ≈ 3-5GB.
+			HashMap<String, int[]> readCpgCount = new HashMap<>();
 
 			while( (line = br.readLine()) != null){
 				ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
@@ -705,6 +711,13 @@ public class FinaleMe {
 					stats[3].addValue(row.motifScore);
 				}
 				statsRows++;
+				// Count CpGs per read (use int[1] to avoid Integer boxing)
+				int[] cnt = readCpgCount.get(row.readName);
+				if(cnt == null){
+					readCpgCount.put(row.readName, new int[]{1});
+				}else{
+					cnt[0]++;
+				}
 			}
 			if(matrixFile.endsWith(".gz")){
 				gzipInputStream.close();
@@ -712,10 +725,17 @@ public class FinaleMe {
 			br.close();
 
 		logFeatureStats(stats);
-		log.info("Pass 1 done: " + statsRows + " rows for statistics");
+		long totalReads = readCpgCount.size();
+		long qualifyingReads = 0;
+		for(int[] cnt : readCpgCount.values()){
+			if(cnt[0] >= miniDataPoints) qualifyingReads++;
+		}
+		log.info("Pass 1 done: " + statsRows + " rows, " + totalReads +
+				 " unique reads, " + qualifyingReads + " with >= " + miniDataPoints + " CpGs");
 
-		// === Pass 2: Re-read file, z-score normalize, build matrixProcess directly ===
-		log.info("Pass 2: Re-reading matrix file for z-score normalization ...");
+		// === Pass 2: Re-read file, skip non-qualifying reads, build matrixProcess ===
+		log.info("Pass 2: Building observation vectors (skipping " +
+				 (totalReads - qualifyingReads) + " reads with < " + miniDataPoints + " CpGs) ...");
 		GZIPInputStream gzipInputStream2 = null;
 		BufferedReader br2;
 		if(matrixFile.endsWith(".gz")){
@@ -724,10 +744,20 @@ public class FinaleMe {
 		}else{
 			br2 = new BufferedReader(new FileReader(matrixFile));
 		}
+		long skippedRows = 0;
 
 		while( (line = br2.readLine()) != null){
 			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
 			if(row == null) continue;
+
+			// Early skip: if this read has fewer CpGs than miniDataPoints,
+			// it will be discarded by assembleFragment anyway. Skip it now
+			// to avoid allocating ObservationVector/Triple/Pair/loc String.
+			int[] cnt = readCpgCount.get(row.readName);
+			if(cnt == null || cnt[0] < miniDataPoints){
+				skippedRows++;
+				continue;
+			}
 
 			if(covOutlier > 0 && ((row.coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
 					(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
@@ -774,6 +804,8 @@ public class FinaleMe {
 			gzipInputStream2.close();
 		}
 		br2.close();
+		readCpgCount = null; // free the count map
+		log.info("Pass 2 done: " + points + " points loaded, " + skippedRows + " rows skipped");
 			log.info("Number of point in total is loaded : " + points);
 
 			ArrayList<ObservationVector> matrixU = new ArrayList<ObservationVector>();
