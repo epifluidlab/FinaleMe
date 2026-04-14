@@ -202,6 +202,9 @@ public class FinaleMe {
 	@Option(name="-adaptMinFragments",usage="minimum fragments with >= miniDataPoints CpGs to attempt adaptation; below this, use reference model directly. Default: 1000")
 	public int adaptMinFragments = 1000;
 
+	@Option(name="-saveAdaptedModel",usage="save the adapted model to this path. If not set, the adapted model is used for decoding but not saved, and the reference model is not modified.")
+	public String saveAdaptedModel = null;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -2855,11 +2858,22 @@ public class FinaleMe {
 		adaptedHmm.setMinCpgNum(1);
 		System.out.println("Adapted HMM:\n" + adaptedHmm);
 
-		// Save adapted model BEFORE decoding (decodeHmm reloads from file)
-		log.info("Saving adapted model to " + modelFile + " ...");
-		ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(modelFile));
+		// Write adapted model to a temp file for decodeHmm (which reloads from disk).
+		// The original reference model file is NEVER modified.
+		File adaptedModelTmp = File.createTempFile("adapted_model_", ".ser");
+		adaptedModelTmp.deleteOnExit();
+		ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(adaptedModelTmp));
 		oos.writeObject(adaptedHmm);
 		oos.close();
+		log.info("Adapted model written to temp file: " + adaptedModelTmp.getAbsolutePath());
+
+		// Optionally save adapted model to a user-specified path
+		if (saveAdaptedModel != null) {
+			java.nio.file.Files.copy(adaptedModelTmp.toPath(),
+				new File(saveAdaptedModel).toPath(),
+				java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+			log.info("Adapted model saved to: " + saveAdaptedModel);
+		}
 
 		// Free adaptation data
 		matrix = null;
@@ -2868,9 +2882,10 @@ public class FinaleMe {
 		matrixObj.pi = null;
 		matrixObj.a = null;
 
-		// Phase 4: Viterbi decode all fragments with adapted model
+		// Phase 4: Viterbi decode all fragments with adapted model (loaded from temp file)
 		log.info("Phase 4: Decoding with adapted model ...");
-		decodeHmm(matrixObj, modelFile, outputFile, inputFile, false, cpgIndex, chromOrder);
+		decodeHmm(matrixObj, adaptedModelTmp.getAbsolutePath(), outputFile, inputFile, false, cpgIndex, chromOrder);
+		adaptedModelTmp.delete();
 	}
 
 }
