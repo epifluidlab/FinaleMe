@@ -2809,18 +2809,29 @@ public class FinaleMe {
 			return;
 		}
 
-		// Phase 2: Load data into memory for adaptation
+		// Phase 2: Load data into memory for adaptation.
+		// Baum-Welch requires >= 2 CpGs per fragment for xi computation.
+		// Temporarily enforce miniDataPoints >= 2 during data loading.
+		int savedMiniDataPoints = miniDataPoints;
+		if (miniDataPoints < 2) {
+			log.info("Raising miniDataPoints from " + miniDataPoints + " to 2 for adaptation (BW requires >= 2 observations)");
+			miniDataPoints = 2;
+		}
 		log.info("Phase 2: Loading data for adaptation ...");
 		MatrixObj matrixObj = processMatrixFile(inputFile);
+		miniDataPoints = savedMiniDataPoints; // restore for decode phase
 		matrixObj.cpgDistFreq = null;
 
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix =
 			new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		for (org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> row : matrixObj.matrix) {
-			matrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(row.getLeft(), row.getMiddle()));
+			// Double-check: skip any fragment with < 2 observations (safety net)
+			if (row.getMiddle().size() >= 2) {
+				matrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(row.getLeft(), row.getMiddle()));
+			}
 		}
 
-		log.info("Loaded " + matrix.size() + " fragments for adaptation");
+		log.info("Loaded " + matrix.size() + " fragments for adaptation (>= 2 CpGs each)");
 
 		// Phase 3: Constrained Baum-Welch adaptation
 		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
