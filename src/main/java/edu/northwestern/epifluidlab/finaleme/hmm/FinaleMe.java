@@ -680,119 +680,31 @@ public class FinaleMe {
 			br = new BufferedReader(new FileReader(matrixFile));
 		}
 
+			// Two-pass file-based approach: read the matrix file twice to avoid
+			// storing ~35GB of intermediate String/array data in memory.
+			// Pass 1: collect feature statistics (no storage).
+			// Pass 2: re-read file, apply z-score normalization, build matrixProcess directly.
+			// Re-reading a 3GB gzipped file takes ~30s — trivial vs saving ~35GB RAM.
+
+			// === Pass 1: Collect stats only ===
 			String line;
 			int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
 			SummaryStatistics[] stats = new SummaryStatistics[numStats];
 			for(int i = 0; i < numStats; i++){
 				stats[i] = new SummaryStatistics();
 			}
-
-			// Compact parallel arrays for raw parsed rows (replaces ArrayList<Object[]>).
-			// Avoids boxing overhead: ~50 bytes/row vs ~500 bytes/row with Object[].
-			// For 182M rows: ~9GB vs ~90GB.
-			final int INITIAL_CAPACITY = 10_000_000;
-			int rawCount = 0;
-			String[] rawReadName = new String[INITIAL_CAPACITY];
-			byte[]   rawMethyStat = new byte[INITIAL_CAPACITY];     // 'm'=1, 'u'=0, '.'=2
-			String[] rawLoc = new String[INITIAL_CAPACITY];
-			int[]    rawOffset = new int[INITIAL_CAPACITY];
-			float[]  rawMethyPrior = new float[INITIAL_CAPACITY];   // float sufficient for prior
-			float[]  rawFragLen = new float[INITIAL_CAPACITY];
-			float[]  rawCoverage = new float[INITIAL_CAPACITY];
-			float[]  rawDistToCenter = new float[INITIAL_CAPACITY];
-			float[]  rawMotifScore = (lowCoverage && useEndMotif) ? new float[INITIAL_CAPACITY] : null;
+			long statsRows = 0;
 
 			while( (line = br.readLine()) != null){
-				if(line.startsWith("#"))
-					continue;
-				String[] splitLines = line.split("\t");
-				int minCols = features + 4 + (useEndMotif ? 1 : 0);
-				if(splitLines.length< minCols || splitLines[1].equalsIgnoreCase("start") || Integer.parseInt(splitLines[4]) >= maxFragLen || Integer.parseInt(splitLines[4])  <= minFragLen || Double.parseDouble(splitLines[8]) <= 5){
-					continue;
+				ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
+				if(row == null) continue;
+				stats[0].addValue(row.fragLen);
+				stats[1].addValue(row.coverage);
+				stats[2].addValue(row.distToCenter);
+				if(lowCoverage && useEndMotif && !Double.isNaN(row.motifScore)){
+					stats[3].addValue(row.motifScore);
 				}
-				String chr = splitLines[0];
-				int start = Integer.parseInt(splitLines[1]);
-				int end = Integer.parseInt(splitLines[2]);
-
-				if(region!=null ){
-					if(overlapLoc.containsKey(chr)){
-						if(overlapLoc.get(chr).minOverlapper(start, end)==null){
-							continue;
-						}
-					}else{
-						continue;
-					}
-				}
-
-				if(exclude !=null ){
-					if(excludeLoc.containsKey(chr)){
-						if(excludeLoc.get(chr).minOverlapper(start, end)!=null){
-							continue;
-						}
-					}
-				}
-
-				int offset = Integer.parseInt(splitLines[9]);
-				if(offset < 0){
-					continue;
-				}
-				// When -useEndMotif, motif_score is at col [11] and methyPrior shifts to [12]
-				double motifScore = Double.NaN;
-				int methyPriorCol = 11;
-				if (useEndMotif) {
-					motifScore = Double.parseDouble(splitLines[11]);
-					methyPriorCol = 12;
-				}
-				double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
-				if(Double.isNaN(methyPrior)){
-					continue;
-				}
-				double fragLen = Double.parseDouble(splitLines[4]);
-				double coverage = Double.parseDouble(splitLines[7]);
-				double DistToCenter = fragLen/2-Double.parseDouble(splitLines[10])+0.5;
-				stats[0].addValue(fragLen);
-				stats[1].addValue(coverage);
-				stats[2].addValue(DistToCenter);
-				if (lowCoverage && useEndMotif && !Double.isNaN(motifScore)) {
-					stats[3].addValue(motifScore);
-				}
-
-				// Adjust methyPrior for boundary values
-				if(Double.compare(methyPrior, 100.0)==0){
-					methyPrior -= 0.01;
-				}else if(Double.compare(methyPrior, 0.0)==0){
-					methyPrior += 0.01;
-				}
-				methyPrior /= 100;
-				if(Double.isNaN(methyPrior)){
-					continue;
-				}
-
-				// Grow arrays if needed (doubling strategy)
-				if(rawCount >= rawReadName.length){
-					int newCap = rawReadName.length + (rawReadName.length >> 1); // 1.5x
-					rawReadName = Arrays.copyOf(rawReadName, newCap);
-					rawMethyStat = Arrays.copyOf(rawMethyStat, newCap);
-					rawLoc = Arrays.copyOf(rawLoc, newCap);
-					rawOffset = Arrays.copyOf(rawOffset, newCap);
-					rawMethyPrior = Arrays.copyOf(rawMethyPrior, newCap);
-					rawFragLen = Arrays.copyOf(rawFragLen, newCap);
-					rawCoverage = Arrays.copyOf(rawCoverage, newCap);
-					rawDistToCenter = Arrays.copyOf(rawDistToCenter, newCap);
-					if(rawMotifScore != null) rawMotifScore = Arrays.copyOf(rawMotifScore, newCap);
-				}
-
-				rawReadName[rawCount] = splitLines[3];
-				char ms = splitLines[6].charAt(0);
-				rawMethyStat[rawCount] = (byte)(ms == 'm' ? 1 : (ms == 'u' ? 0 : 2));
-				rawLoc[rawCount] = chr + ":" + start + ":" + end;
-				rawOffset[rawCount] = offset;
-				rawMethyPrior[rawCount] = (float) methyPrior;
-				rawFragLen[rawCount] = (float) fragLen;
-				rawCoverage[rawCount] = (float) coverage;
-				rawDistToCenter[rawCount] = (float) DistToCenter;
-				if(rawMotifScore != null) rawMotifScore[rawCount] = (float) motifScore;
-				rawCount++;
+				statsRows++;
 			}
 			if(matrixFile.endsWith(".gz")){
 				gzipInputStream.close();
@@ -800,65 +712,68 @@ public class FinaleMe {
 			br.close();
 
 		logFeatureStats(stats);
-		log.info("Loaded " + rawCount + " raw data points into compact arrays");
+		log.info("Pass 1 done: " + statsRows + " rows for statistics");
 
-		// Second phase: iterate compact arrays, apply z-score normalization
-		for(int ri = 0; ri < rawCount; ri++){
-			String readName = rawReadName[ri];
-			String methyStat = rawMethyStat[ri] == 1 ? "m" : (rawMethyStat[ri] == 0 ? "u" : ".");
-			String loc = rawLoc[ri];
-			int offset = rawOffset[ri];
-			double methyPrior = rawMethyPrior[ri];
-			double fragLen = rawFragLen[ri];
-			double coverage = rawCoverage[ri];
-			double DistToCenter = rawDistToCenter[ri];
-			double rowMotifScore = rawMotifScore != null ? rawMotifScore[ri] : Double.NaN;
+		// === Pass 2: Re-read file, z-score normalize, build matrixProcess directly ===
+		log.info("Pass 2: Re-reading matrix file for z-score normalization ...");
+		GZIPInputStream gzipInputStream2 = null;
+		BufferedReader br2;
+		if(matrixFile.endsWith(".gz")){
+			gzipInputStream2 = new GZIPInputStream(new FileInputStream(matrixFile));
+			br2 = new BufferedReader(new InputStreamReader(gzipInputStream2));
+		}else{
+			br2 = new BufferedReader(new FileReader(matrixFile));
+		}
 
-			if(covOutlier > 0 && ((coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
-					(fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
-					(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation() > covOutlier)){
+		while( (line = br2.readLine()) != null){
+			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
+			if(row == null) continue;
+
+			if(covOutlier > 0 && ((row.coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
+					(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
+					(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation() > covOutlier)){
 				continue;
 			}
 			double[] value;
 
 			if(lowCoverage && useEndMotif){
 				value = new double[]{
-						(fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
-						(rowMotifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
+						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
+						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
+						(row.motifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
 				};
 			}else if(lowCoverage){
 				value = new double[]{
-						(fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
+						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
+						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
 				};
 			}else{
 				value = new double[]{
-						(fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
-						(DistToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
+						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
+						(row.coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
+						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
 				};
 			}
 
 			ObservationVector vector = new ObservationVector(value);
 
 			points++;
-			if(matrixProcess.containsKey(readName)){
-				TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat = matrixProcess.get(readName);
-				if(!readStat.containsKey(offset)){
-					readStat.put(offset, Triple.of(methyStat, vector, new Pair<String, Double>(loc, methyPrior)));
+			if(matrixProcess.containsKey(row.readName)){
+				TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat = matrixProcess.get(row.readName);
+				if(!readStat.containsKey(row.offset)){
+					readStat.put(row.offset, Triple.of(row.methyStat, vector, new Pair<String, Double>(row.loc, row.methyPrior)));
 				}
-				matrixProcess.put(readName, readStat);
+				matrixProcess.put(row.readName, readStat);
 			}else{
 				TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>> readStat =  new TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>();
-				readStat.put(offset, Triple.of(methyStat, vector, new Pair<String, Double>(loc, methyPrior)));
-				matrixProcess.put(readName, readStat);
+				readStat.put(row.offset, Triple.of(row.methyStat, vector, new Pair<String, Double>(row.loc, row.methyPrior)));
+				matrixProcess.put(row.readName, readStat);
 			}
 		}
-		// Free compact arrays
-		rawReadName = null; rawMethyStat = null; rawLoc = null; rawOffset = null;
-		rawMethyPrior = null; rawFragLen = null; rawCoverage = null; rawDistToCenter = null;
-		rawMotifScore = null;
+		if(matrixFile.endsWith(".gz")){
+			gzipInputStream2.close();
+		}
+		br2.close();
 			log.info("Number of point in total is loaded : " + points);
 
 			ArrayList<ObservationVector> matrixU = new ArrayList<ObservationVector>();
