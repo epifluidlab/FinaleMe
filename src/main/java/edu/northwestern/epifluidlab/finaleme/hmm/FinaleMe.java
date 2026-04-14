@@ -687,9 +687,20 @@ public class FinaleMe {
 				stats[i] = new SummaryStatistics();
 			}
 
-			// Store raw parsed row data for second-phase processing
-			// Each entry: [readName, methyStat, loc, offset, methyPrior, fragLen, coverage, distToCenter, motifScore]
-			ArrayList<Object[]> rawRows = new ArrayList<Object[]>();
+			// Compact parallel arrays for raw parsed rows (replaces ArrayList<Object[]>).
+			// Avoids boxing overhead: ~50 bytes/row vs ~500 bytes/row with Object[].
+			// For 182M rows: ~9GB vs ~90GB.
+			final int INITIAL_CAPACITY = 10_000_000;
+			int rawCount = 0;
+			String[] rawReadName = new String[INITIAL_CAPACITY];
+			byte[]   rawMethyStat = new byte[INITIAL_CAPACITY];     // 'm'=1, 'u'=0, '.'=2
+			String[] rawLoc = new String[INITIAL_CAPACITY];
+			int[]    rawOffset = new int[INITIAL_CAPACITY];
+			float[]  rawMethyPrior = new float[INITIAL_CAPACITY];   // float sufficient for prior
+			float[]  rawFragLen = new float[INITIAL_CAPACITY];
+			float[]  rawCoverage = new float[INITIAL_CAPACITY];
+			float[]  rawDistToCenter = new float[INITIAL_CAPACITY];
+			float[]  rawMotifScore = (lowCoverage && useEndMotif) ? new float[INITIAL_CAPACITY] : null;
 
 			while( (line = br.readLine()) != null){
 				if(line.startsWith("#"))
@@ -721,7 +732,7 @@ public class FinaleMe {
 					}
 				}
 
-				Integer offset = Integer.parseInt(splitLines[9]);
+				int offset = Integer.parseInt(splitLines[9]);
 				if(offset < 0){
 					continue;
 				}
@@ -732,7 +743,7 @@ public class FinaleMe {
 					motifScore = Double.parseDouble(splitLines[11]);
 					methyPriorCol = 12;
 				}
-				Double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
+				double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
 				if(Double.isNaN(methyPrior)){
 					continue;
 				}
@@ -757,9 +768,31 @@ public class FinaleMe {
 					continue;
 				}
 
-				String loc = chr + ":" + start + ":" + end;
-				String readName = splitLines[3];
-				rawRows.add(new Object[]{readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, DistToCenter, motifScore});
+				// Grow arrays if needed (doubling strategy)
+				if(rawCount >= rawReadName.length){
+					int newCap = rawReadName.length + (rawReadName.length >> 1); // 1.5x
+					rawReadName = Arrays.copyOf(rawReadName, newCap);
+					rawMethyStat = Arrays.copyOf(rawMethyStat, newCap);
+					rawLoc = Arrays.copyOf(rawLoc, newCap);
+					rawOffset = Arrays.copyOf(rawOffset, newCap);
+					rawMethyPrior = Arrays.copyOf(rawMethyPrior, newCap);
+					rawFragLen = Arrays.copyOf(rawFragLen, newCap);
+					rawCoverage = Arrays.copyOf(rawCoverage, newCap);
+					rawDistToCenter = Arrays.copyOf(rawDistToCenter, newCap);
+					if(rawMotifScore != null) rawMotifScore = Arrays.copyOf(rawMotifScore, newCap);
+				}
+
+				rawReadName[rawCount] = splitLines[3];
+				char ms = splitLines[6].charAt(0);
+				rawMethyStat[rawCount] = (byte)(ms == 'm' ? 1 : (ms == 'u' ? 0 : 2));
+				rawLoc[rawCount] = chr + ":" + start + ":" + end;
+				rawOffset[rawCount] = offset;
+				rawMethyPrior[rawCount] = (float) methyPrior;
+				rawFragLen[rawCount] = (float) fragLen;
+				rawCoverage[rawCount] = (float) coverage;
+				rawDistToCenter[rawCount] = (float) DistToCenter;
+				if(rawMotifScore != null) rawMotifScore[rawCount] = (float) motifScore;
+				rawCount++;
 			}
 			if(matrixFile.endsWith(".gz")){
 				gzipInputStream.close();
@@ -767,18 +800,19 @@ public class FinaleMe {
 			br.close();
 
 		logFeatureStats(stats);
+		log.info("Loaded " + rawCount + " raw data points into compact arrays");
 
-		// Second phase: iterate in-memory raw rows, apply z-score normalization
-		for(Object[] row : rawRows){
-			String readName = (String) row[0];
-			String methyStat = (String) row[1];
-			String loc = (String) row[2];
-			Integer offset = (Integer) row[3];
-			Double methyPrior = (Double) row[4];
-			double fragLen = (Double) row[5];
-			double coverage = (Double) row[6];
-			double DistToCenter = (Double) row[7];
-			double rowMotifScore = (Double) row[8];
+		// Second phase: iterate compact arrays, apply z-score normalization
+		for(int ri = 0; ri < rawCount; ri++){
+			String readName = rawReadName[ri];
+			String methyStat = rawMethyStat[ri] == 1 ? "m" : (rawMethyStat[ri] == 0 ? "u" : ".");
+			String loc = rawLoc[ri];
+			int offset = rawOffset[ri];
+			double methyPrior = rawMethyPrior[ri];
+			double fragLen = rawFragLen[ri];
+			double coverage = rawCoverage[ri];
+			double DistToCenter = rawDistToCenter[ri];
+			double rowMotifScore = rawMotifScore != null ? rawMotifScore[ri] : Double.NaN;
 
 			if(covOutlier > 0 && ((coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
 					(fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
@@ -821,7 +855,10 @@ public class FinaleMe {
 				matrixProcess.put(readName, readStat);
 			}
 		}
-		rawRows = null; // allow GC
+		// Free compact arrays
+		rawReadName = null; rawMethyStat = null; rawLoc = null; rawOffset = null;
+		rawMethyPrior = null; rawFragLen = null; rawCoverage = null; rawDistToCenter = null;
+		rawMotifScore = null;
 			log.info("Number of point in total is loaded : " + points);
 
 			ArrayList<ObservationVector> matrixU = new ArrayList<ObservationVector>();
