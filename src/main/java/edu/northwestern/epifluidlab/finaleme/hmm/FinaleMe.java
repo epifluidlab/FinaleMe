@@ -2462,7 +2462,7 @@ public class FinaleMe {
 			randomEngine = new MersenneTwister(seed);
 		}
 		if(lowCoverage){
-			features = 2;
+			features = useEndMotif ? 3 : 2;
 		}
 		
 		if(mixNumberInFeature == null || mixNumberInFeature.isEmpty()){
