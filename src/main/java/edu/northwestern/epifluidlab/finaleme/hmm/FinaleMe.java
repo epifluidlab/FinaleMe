@@ -212,6 +212,9 @@ public class FinaleMe {
 	@Option(name="-loadNormStats",usage="load reference normalization statistics from TSV file. Used by -adaptEmissionOnly to re-center reference GMM into the target sample's z-score space.")
 	public String loadNormStats = null;
 
+	@Option(name="-adaptReinitGmm",usage="re-initialize emission GMM on the target data before constrained Baum-Welch. Escapes the reference-model local optimum so emissions reflect the target distribution. Combine with -adaptLambda 0 for full emission retraining. Default: false")
+	public boolean adaptReinitGmm = false;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -2510,6 +2513,9 @@ public class FinaleMe {
 		if(saveAdaptedModel != null && !decodeModeOnly){
 			throw new IllegalArgumentException("-saveAdaptedModel requires -decodeModeOnly");
 		}
+		if(adaptReinitGmm && !adaptEmissionOnly){
+			throw new IllegalArgumentException("-adaptReinitGmm requires -adaptEmissionOnly");
+		}
 	}
 
 	private void finish(){
@@ -2893,6 +2899,21 @@ public class FinaleMe {
 			}
 		} else {
 			log.info("No -loadNormStats; skipping re-centering (ref and target z-score spaces may differ)");
+		}
+
+		// Optional: re-initialize emissions via GMM on the target data.
+		// This escapes the reference-model's local optimum in EM. Transitions
+		// and pi stay frozen to the reference model; only the emission GMMs
+		// are replaced with target-data-derived initial estimates.
+		if (adaptReinitGmm) {
+			log.info("Re-initializing emission GMM on target data (transitions/pi stay frozen) ...");
+			BayesianNhmmV5<ObservationVector> gmmInitHmm = buildInitNhmmByGMM(matrixObj, matrix);
+			// Copy target-data GMM emissions into refHmmForAdapt (replacing
+			// reference emissions). Transitions/pi in refHmmForAdapt stay intact.
+			for (int s = 0; s < refHmmForAdapt.nbStates(); s++) {
+				refHmmForAdapt.setOpdf(s, gmmInitHmm.getOpdf(s));
+			}
+			logEmissionParams("REFERENCE MODEL (after GMM re-init on target)", refHmmForAdapt);
 		}
 
 		BayesianNhmmV5<ObservationVector> adaptedHmm;
