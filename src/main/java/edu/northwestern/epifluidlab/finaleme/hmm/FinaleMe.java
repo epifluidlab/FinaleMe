@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -781,12 +782,20 @@ public class FinaleMe {
 		}
 
 		long totalReads = readCpgCount.size();
-		long qualifyingReads = 0;
-		for(int[] cnt : readCpgCount.values()){
-			if(cnt[0] >= miniDataPoints) qualifyingReads++;
+		// Convert the count map into a compact HashSet of qualifying reads.
+		// Saves ~75% memory vs keeping full HashMap<String,int[]> through Pass 2:
+		// at 150M reads, the HashMap is ~22GB vs the HashSet ~600MB (after filter).
+		HashSet<String> qualifyingReadSet = new HashSet<>(Math.max(16, (int)(totalReads / 20)));
+		for(java.util.Map.Entry<String, int[]> e : readCpgCount.entrySet()){
+			if(e.getValue()[0] >= miniDataPoints){
+				qualifyingReadSet.add(e.getKey());
+			}
 		}
+		long qualifyingReads = qualifyingReadSet.size();
+		readCpgCount = null; // drop the full count map — frees ~22GB for 150M reads
 		log.info("Pass 1 done: " + statsRows + " rows, " + totalReads +
 				 " unique reads, " + qualifyingReads + " with >= " + miniDataPoints + " CpGs");
+		log.info("Dropped readCpgCount map; retaining " + qualifyingReads + "-entry qualifying-read set");
 
 		// === Pass 2: Re-read file, skip non-qualifying reads, build matrixProcess ===
 		log.info("Pass 2: Building observation vectors (skipping " +
@@ -798,11 +807,9 @@ public class FinaleMe {
 			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
 			if(row == null) continue;
 
-			// Early skip: if this read has fewer CpGs than miniDataPoints,
-			// it will be discarded by assembleFragment anyway. Skip it now
-			// to avoid allocating ObservationVector/Triple/Pair/loc String.
-			int[] cnt = readCpgCount.get(row.readName);
-			if(cnt == null || cnt[0] < miniDataPoints){
+			// Early skip: if this read is not in the qualifying set (< miniDataPoints CpGs),
+			// skip it now to avoid allocating ObservationVector/Triple/Pair/loc String.
+			if(!qualifyingReadSet.contains(row.readName)){
 				skippedRows++;
 				continue;
 			}
@@ -849,7 +856,7 @@ public class FinaleMe {
 			}
 		}
 		br2.close();
-		readCpgCount = null; // free the count map
+		qualifyingReadSet = null; // free the qualifying-read set
 		log.info("Pass 2 done: " + points + " points loaded, " + skippedRows + " rows skipped");
 			log.info("Number of point in total is loaded : " + points);
 
