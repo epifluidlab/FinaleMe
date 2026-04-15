@@ -2939,16 +2939,33 @@ public class FinaleMe {
 						}
 					}
 				}
-				gmmMatrix = sampled;
-				// Build a minimal MatrixObj that buildInitNhmmByGMM can consume.
-				// Only the .matrix field is actually used by GMMLearner.
+				// Clip z-scored feature values to +/-OBS_CLIP_SD to prevent extreme
+				// outliers (e.g. the 0.5 default for unknown motifs when the motif
+				// distribution has tiny sd) from making the GMM covariance singular
+				// and producing NaN emissions.
+				final double OBS_CLIP_SD = 5.0;
 				ArrayList<org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>> tripleMatrix =
 					new ArrayList<>(sampled.size());
 				for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> p : sampled) {
+					ArrayList<ObservationVector> clippedObs = new ArrayList<>(p.getSecond().size());
+					for (ObservationVector ov : p.getSecond()) {
+						double[] vals = ov.values();
+						double[] clipped = new double[vals.length];
+						for (int d = 0; d < vals.length; d++) {
+							double v = vals[d];
+							if (Double.isNaN(v) || Double.isInfinite(v)) v = 0.0;
+							clipped[d] = Math.max(-OBS_CLIP_SD, Math.min(OBS_CLIP_SD, v));
+						}
+						clippedObs.add(new ObservationVector(clipped));
+					}
 					tripleMatrix.add(org.apache.commons.lang3.tuple.Triple.of(
-						p.getFirst(),
-						new ArrayList<>(p.getSecond()),
-						new ArrayList<String>()));
+						p.getFirst(), clippedObs, new ArrayList<String>()));
+				}
+				// Build gmmMatrix from the clipped tripleMatrix (not from original sampled)
+				gmmMatrix = new ArrayList<>(tripleMatrix.size());
+				for (org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> t : tripleMatrix) {
+					gmmMatrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(
+						t.getLeft(), t.getMiddle()));
 				}
 				gmmMatrixObj = matrixObj.cloneShallowWithMatrix(tripleMatrix);
 			} else {
@@ -2957,12 +2974,26 @@ public class FinaleMe {
 			}
 			log.info("Re-initializing emission GMM on target data (transitions/pi stay frozen) ...");
 			BayesianNhmmV5<ObservationVector> gmmInitHmm = buildInitNhmmByGMM(gmmMatrixObj, gmmMatrix);
-			// Copy target-data GMM emissions into refHmmForAdapt (replacing
-			// reference emissions). Transitions/pi in refHmmForAdapt stay intact.
-			for (int s = 0; s < refHmmForAdapt.nbStates(); s++) {
-				refHmmForAdapt.setOpdf(s, gmmInitHmm.getOpdf(s));
+
+			// Validate GMM output — fall back to re-centered reference if NaN.
+			boolean gmmHasNaN = false;
+			for (int s = 0; s < gmmInitHmm.nbStates() && !gmmHasNaN; s++) {
+				double[] m = ((OpdfMultiMixtureGaussian) gmmInitHmm.getOpdf(s)).mean();
+				for (double v : m) {
+					if (Double.isNaN(v) || Double.isInfinite(v)) { gmmHasNaN = true; break; }
+				}
 			}
-			logEmissionParams("REFERENCE MODEL (after GMM re-init on target)", refHmmForAdapt);
+			if (gmmHasNaN) {
+				log.warn("GMM re-init produced NaN emissions (likely from extreme feature outliers); " +
+						 "keeping re-centered reference emissions as initialization");
+			} else {
+				// Copy target-data GMM emissions into refHmmForAdapt (replacing
+				// reference emissions). Transitions/pi in refHmmForAdapt stay intact.
+				for (int s = 0; s < refHmmForAdapt.nbStates(); s++) {
+					refHmmForAdapt.setOpdf(s, gmmInitHmm.getOpdf(s));
+				}
+				logEmissionParams("REFERENCE MODEL (after GMM re-init on target)", refHmmForAdapt);
+			}
 			// Free subsampled structures
 			gmmMatrix = null;
 			gmmMatrixObj = null;
