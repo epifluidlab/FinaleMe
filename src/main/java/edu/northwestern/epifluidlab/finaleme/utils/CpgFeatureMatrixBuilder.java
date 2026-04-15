@@ -12,6 +12,7 @@ import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.ValidationStringency;
+import htsjdk.samtools.util.BlockCompressedOutputStream;
 import htsjdk.samtools.util.IntervalTree;
 import htsjdk.samtools.util.SequenceUtil;
 import htsjdk.samtools.util.IntervalTree.Node;
@@ -685,9 +686,14 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						}
 						log.info("Total CpGs scheduled for processing: " + totalCpgTargets);
 
-					// Write header to output file
+					// Write header to output file using BGZF (bgzip) format.
+					// Bgzipped files are valid gzip but split into ~64KB independent
+					// blocks, enabling parallel decompression (via `bgzip -d -@ N`)
+					// and random access via tabix index. File extension stays .gz for
+					// compatibility with standard gzip readers.
 					FileOutputStream output = new FileOutputStream(detailFile);
-					OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
+					BlockCompressedOutputStream bgzipOut = new BlockCompressedOutputStream(output, (java.io.File) null);
+					OutputStreamWriter writer = new OutputStreamWriter(bgzipOut, "UTF-8");
 					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
 					if (useEndMotif) {
 						writer.write("\tmotif_score");
@@ -1641,6 +1647,18 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					writer.close();
 					output.close();
 
+					// Build tabix index (.tbi) for the bgzipped output.
+					// The output columns start with chr/start/end, so we use
+					// the standard BED format with 0-based half-open semantics.
+					// The index enables parallel block-level reads downstream.
+					try {
+						log.info("Building tabix index for " + detailFile + " ...");
+						buildTabixIndex(detailFile);
+						log.info("Tabix index written to " + detailFile + ".tbi");
+					} catch (Exception tbxEx) {
+						log.warn("Failed to build tabix index (output is still bgzipped and readable): " + tbxEx.getMessage());
+					}
+
 					// Save motif lookup table
 					if (saveMotifLookup != null && motifCounts != null) {
 						saveMotifLookupFile(saveMotifLookup);
@@ -1992,6 +2010,64 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 		}
 		br.close();
 		return map;
+	}
+
+	/**
+	 * Build a tabix index (.tbi) for a bgzipped TSV file whose first three
+	 * columns are chr, start, end. Uses htsjdk's TabixIndexCreator with
+	 * BED-like semantics (0-based start, half-open end).
+	 */
+	private void buildTabixIndex(String bgzippedFile) throws IOException {
+		// Feature input: read bgzipped file, use a BED-style codec to emit
+		// a minimal Feature per line (chr, start, end). The tabix index
+		// only needs chr/start/end, so we build a lightweight one.
+		htsjdk.tribble.index.tabix.TabixFormat fmt = new htsjdk.tribble.index.tabix.TabixFormat(
+			htsjdk.tribble.index.tabix.TabixFormat.GENERIC_FLAGS,
+			1,      // seq column (1-based: chr)
+			2,      // begin column (1-based: start)
+			3,      // end column (1-based: end)
+			'#',    // meta (comment) char
+			0       // number of header lines to skip (header starts with # or "chr"/"start")
+		);
+		htsjdk.tribble.index.tabix.TabixIndexCreator creator =
+			new htsjdk.tribble.index.tabix.TabixIndexCreator(fmt);
+
+		htsjdk.samtools.util.BlockCompressedInputStream bcis =
+			new htsjdk.samtools.util.BlockCompressedInputStream(new java.io.File(bgzippedFile));
+		try {
+			long virtualOffset = bcis.getFilePointer();
+			String line;
+			while ((line = bcis.readLine()) != null) {
+				if (line.length() == 0 || line.charAt(0) == '#') {
+					virtualOffset = bcis.getFilePointer();
+					continue;
+				}
+				String[] cols = line.split("\t", 4);
+				if (cols.length < 3) {
+					virtualOffset = bcis.getFilePointer();
+					continue;
+				}
+				try {
+					String chr = cols[0];
+					final int start = Integer.parseInt(cols[1]);
+					final int end = Integer.parseInt(cols[2]);
+					final String finalChr = chr;
+					htsjdk.tribble.Feature feat = new htsjdk.tribble.Feature() {
+						@Override public String getContig() { return finalChr; }
+						@Override public int getStart() { return start + 1; } // tabix uses 1-based
+						@Override public int getEnd() { return end; }
+					};
+					creator.addFeature(feat, virtualOffset);
+				} catch (NumberFormatException nfe) {
+					// skip malformed lines
+				}
+				virtualOffset = bcis.getFilePointer();
+			}
+		} finally {
+			bcis.close();
+		}
+		htsjdk.tribble.index.Index idx = creator.finalizeIndex(0L);
+		idx.writeBasedOnFeatureFile(new java.io.File(bgzippedFile));
 	}
 
 	/**
