@@ -287,10 +287,10 @@ public class FinaleMe {
 		GZIPInputStream gzipInputStream = null;
 		BufferedReader br;
 		if (path.endsWith(".gz")) {
-			gzipInputStream = new GZIPInputStream(new FileInputStream(path));
-			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+			gzipInputStream = new GZIPInputStream(new FileInputStream(path), GZIP_BUFFER_SIZE);
+			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 		} else {
-			br = new BufferedReader(new FileReader(path));
+			br = new BufferedReader(new FileReader(path), READER_BUFFER_SIZE);
 		}
 		String line;
 		while ((line = br.readLine()) != null) {
@@ -433,6 +433,11 @@ public class FinaleMe {
 		return new AssembledFragment(cpgDistRow, matrixRow, locRow, observedRow);
 	}
 
+	// 64KB buffer for GZIPInputStream (default is 512 bytes — 128x larger reduces
+	// inflate syscall overhead dramatically on large files like 356M-row matrices).
+	private static final int GZIP_BUFFER_SIZE = 65536;
+	private static final int READER_BUFFER_SIZE = 131072;
+
 	private SummaryStatistics[] collectStats(String matrixFile,
 											 HashMap<String, IntervalTree<Integer>> overlapLoc,
 											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
@@ -445,10 +450,10 @@ public class FinaleMe {
 		GZIPInputStream gzipInputStream = null;
 		BufferedReader br;
 		if (matrixFile.endsWith(".gz")) {
-			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile));
-			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
+			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 		} else {
-			br = new BufferedReader(new FileReader(matrixFile));
+			br = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
 		}
 
 		String line;
@@ -608,11 +613,11 @@ public class FinaleMe {
 			GZIPInputStream gzipInputStream = null;
 			BufferedReader br;
 			if(region.endsWith(".gz")){
-				gzipInputStream = new GZIPInputStream(new FileInputStream(region));
-				br = new BufferedReader(new InputStreamReader(gzipInputStream));
+				gzipInputStream = new GZIPInputStream(new FileInputStream(region), GZIP_BUFFER_SIZE);
+				br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 				
 			}else{
-				br = new BufferedReader(new FileReader(region));
+				br = new BufferedReader(new FileReader(region), READER_BUFFER_SIZE);
 			}
 			String line;
 			while( (line = br.readLine()) != null){
@@ -649,11 +654,11 @@ public class FinaleMe {
 			GZIPInputStream gzipInputStream = null;
 			BufferedReader br;
 			if(exclude.endsWith(".gz")){
-				gzipInputStream = new GZIPInputStream(new FileInputStream(exclude));
-				br = new BufferedReader(new InputStreamReader(gzipInputStream));
+				gzipInputStream = new GZIPInputStream(new FileInputStream(exclude), GZIP_BUFFER_SIZE);
+				br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 				
 			}else{
-				br = new BufferedReader(new FileReader(exclude));
+				br = new BufferedReader(new FileReader(exclude), READER_BUFFER_SIZE);
 			}
 			String line;
 			while( (line = br.readLine()) != null){
@@ -687,10 +692,10 @@ public class FinaleMe {
 		GZIPInputStream gzipInputStream = null;
 		BufferedReader br;
 		if(matrixFile.endsWith(".gz")){
-			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile));
-			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
+			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 		}else{
-			br = new BufferedReader(new FileReader(matrixFile));
+			br = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
 		}
 
 			// Two-pass file-based approach to avoid storing intermediate data.
@@ -759,10 +764,10 @@ public class FinaleMe {
 		GZIPInputStream gzipInputStream2 = null;
 		BufferedReader br2;
 		if(matrixFile.endsWith(".gz")){
-			gzipInputStream2 = new GZIPInputStream(new FileInputStream(matrixFile));
-			br2 = new BufferedReader(new InputStreamReader(gzipInputStream2));
+			gzipInputStream2 = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
+			br2 = new BufferedReader(new InputStreamReader(gzipInputStream2), READER_BUFFER_SIZE);
 		}else{
-			br2 = new BufferedReader(new FileReader(matrixFile));
+			br2 = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
 		}
 		long skippedRows = 0;
 
@@ -1334,10 +1339,10 @@ public class FinaleMe {
 		GZIPInputStream gzipInputStream = null;
 		BufferedReader br;
 		if (inputFile.endsWith(".gz")) {
-			gzipInputStream = new GZIPInputStream(new FileInputStream(inputFile));
-			br = new BufferedReader(new InputStreamReader(gzipInputStream));
+			gzipInputStream = new GZIPInputStream(new FileInputStream(inputFile), GZIP_BUFFER_SIZE);
+			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
 		} else {
-			br = new BufferedReader(new FileReader(inputFile));
+			br = new BufferedReader(new FileReader(inputFile), READER_BUFFER_SIZE);
 		}
 
 		String line;
@@ -1636,7 +1641,7 @@ public class FinaleMe {
 		BufferedReader br = null;
 		try {
 			if (cpgIndexFile.endsWith(".gz")) {
-				input = new GZIPInputStream(new FileInputStream(cpgIndexFile));
+				input = new GZIPInputStream(new FileInputStream(cpgIndexFile), GZIP_BUFFER_SIZE);
 			} else {
 				input = new FileInputStream(cpgIndexFile);
 			}
@@ -1797,7 +1802,7 @@ public class FinaleMe {
 		int index = 0;
 		try {
 			if (chromSizeFile.endsWith(".gz")) {
-				input = new GZIPInputStream(new FileInputStream(chromSizeFile));
+				input = new GZIPInputStream(new FileInputStream(chromSizeFile), GZIP_BUFFER_SIZE);
 			} else {
 				input = new FileInputStream(chromSizeFile);
 			}
@@ -1842,7 +1847,7 @@ public class FinaleMe {
 		BufferedReader br = null;
 		try {
 			if (chromSizeFile.endsWith(".gz")) {
-				input = new GZIPInputStream(new FileInputStream(chromSizeFile));
+				input = new GZIPInputStream(new FileInputStream(chromSizeFile), GZIP_BUFFER_SIZE);
 			} else {
 				input = new FileInputStream(chromSizeFile);
 			}
@@ -3021,7 +3026,7 @@ public class FinaleMe {
 	 */
 	private double[][] loadNormalizationStats(String path) throws IOException {
 		ArrayList<double[]> rows = new ArrayList<>();
-		try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+		try (BufferedReader br = new BufferedReader(new FileReader(path), READER_BUFFER_SIZE)) {
 			String line;
 			boolean header = true;
 			while ((line = br.readLine()) != null) {
