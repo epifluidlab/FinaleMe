@@ -2579,6 +2579,14 @@ public class FinaleMe {
 				return matrixTmp.subList(0, n);
 			}
 		}
+
+		/** Build a MatrixObj sharing this object's matrixU/matrixM/pi/a/matrixObserved/cpgDistFreq
+		 *  but with a different matrix reference. Used by adaptReinitGmm to feed a subsampled
+		 *  matrix to GMMLearner without copying unrelated fields. */
+		public MatrixObj cloneShallowWithMatrix(ArrayList<Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>> newMatrix) {
+			MatrixObj clone = new MatrixObj(newMatrix, this.matrixU, this.matrixM, this.pi, this.a, this.matrixObserved, this.cpgDistFreq);
+			return clone;
+		}
 	}
 
 	private static class LocTuple {
@@ -2906,14 +2914,59 @@ public class FinaleMe {
 		// and pi stay frozen to the reference model; only the emission GMMs
 		// are replaced with target-data-derived initial estimates.
 		if (adaptReinitGmm) {
+			// Subsample the matrix before GMM init: ClustersGMM allocates a
+			// per-ObservationVector Hashtable entry (~100 bytes each), which
+			// blows up at ~60M observations. A random sample of ~100K fragments
+			// (~1M observations) is plenty to capture the emission distribution
+			// for a 2-state 2-3-feature GMM.
+			final int GMM_MAX_FRAGMENTS = 100_000;
+			List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> gmmMatrix;
+			MatrixObj gmmMatrixObj;
+			if (matrix.size() > GMM_MAX_FRAGMENTS) {
+				log.info("Subsampling " + GMM_MAX_FRAGMENTS + " of " + matrix.size() +
+						 " fragments for GMM initialization ...");
+				java.util.Random rng = seed >= 0 ? new java.util.Random(seed) : new java.util.Random();
+				// Reservoir sampling: pick GMM_MAX_FRAGMENTS uniformly at random
+				List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> sampled =
+					new ArrayList<>(GMM_MAX_FRAGMENTS);
+				for (int i = 0; i < matrix.size(); i++) {
+					if (i < GMM_MAX_FRAGMENTS) {
+						sampled.add(matrix.get(i));
+					} else {
+						int j = rng.nextInt(i + 1);
+						if (j < GMM_MAX_FRAGMENTS) {
+							sampled.set(j, matrix.get(i));
+						}
+					}
+				}
+				gmmMatrix = sampled;
+				// Build a minimal MatrixObj that buildInitNhmmByGMM can consume.
+				// Only the .matrix field is actually used by GMMLearner.
+				ArrayList<org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>> tripleMatrix =
+					new ArrayList<>(sampled.size());
+				for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> p : sampled) {
+					tripleMatrix.add(org.apache.commons.lang3.tuple.Triple.of(
+						p.getFirst(),
+						new ArrayList<>(p.getSecond()),
+						new ArrayList<String>()));
+				}
+				gmmMatrixObj = matrixObj.cloneShallowWithMatrix(tripleMatrix);
+			} else {
+				gmmMatrix = matrix;
+				gmmMatrixObj = matrixObj;
+			}
 			log.info("Re-initializing emission GMM on target data (transitions/pi stay frozen) ...");
-			BayesianNhmmV5<ObservationVector> gmmInitHmm = buildInitNhmmByGMM(matrixObj, matrix);
+			BayesianNhmmV5<ObservationVector> gmmInitHmm = buildInitNhmmByGMM(gmmMatrixObj, gmmMatrix);
 			// Copy target-data GMM emissions into refHmmForAdapt (replacing
 			// reference emissions). Transitions/pi in refHmmForAdapt stay intact.
 			for (int s = 0; s < refHmmForAdapt.nbStates(); s++) {
 				refHmmForAdapt.setOpdf(s, gmmInitHmm.getOpdf(s));
 			}
 			logEmissionParams("REFERENCE MODEL (after GMM re-init on target)", refHmmForAdapt);
+			// Free subsampled structures
+			gmmMatrix = null;
+			gmmMatrixObj = null;
+			gmmInitHmm = null;
 		}
 
 		BayesianNhmmV5<ObservationVector> adaptedHmm;
