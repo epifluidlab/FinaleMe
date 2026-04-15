@@ -275,12 +275,12 @@ def _aggregate_bissnp_files(
     return methy, total
 
 
-def _aggregate_bigwig_files(
-    methy_bw_paths: list[Path],
-    cov_bw_paths: list[Path],
+def _aggregate_single_bigwig(
+    methy_bw_path: Path,
+    cov_bw_path: Path,
     cpg_index: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Aggregate paired bigWig files into per-CpG counts."""
+    """Process a single pair of bigWig files. Picklable for multiprocessing."""
     try:
         import pyBigWig
     except ImportError:
@@ -296,25 +296,24 @@ def _aggregate_bigwig_files(
     methy = np.zeros(total_sites, dtype=np.float64)
     total = np.zeros(total_sites, dtype=np.float64)
 
-    for methy_bw_path, cov_bw_path in zip(methy_bw_paths, cov_bw_paths):
-        bw_methy = pyBigWig.open(str(methy_bw_path))
-        bw_cov = pyBigWig.open(str(cov_bw_path))
+    bw_methy = pyBigWig.open(str(methy_bw_path))
+    bw_cov = pyBigWig.open(str(cov_bw_path))
 
-        for chrom, positions in chr_positions.items():
-            offset = chr_offsets[chrom]
-            for i, pos in enumerate(positions):
-                global_idx = offset + i
-                try:
-                    mv = bw_methy.values(chrom, int(pos), int(pos) + 1)
-                    cv = bw_cov.values(chrom, int(pos), int(pos) + 1)
-                    if mv and cv and mv[0] is not None and cv[0] is not None:
-                        methy[global_idx] += mv[0]
-                        total[global_idx] += cv[0]
-                except RuntimeError:
-                    continue
+    for chrom, positions in chr_positions.items():
+        offset = chr_offsets[chrom]
+        for i, pos in enumerate(positions):
+            global_idx = offset + i
+            try:
+                mv = bw_methy.values(chrom, int(pos), int(pos) + 1)
+                cv = bw_cov.values(chrom, int(pos), int(pos) + 1)
+                if mv and cv and mv[0] is not None and cv[0] is not None:
+                    methy[global_idx] += mv[0]
+                    total[global_idx] += cv[0]
+            except RuntimeError:
+                continue
 
-        bw_methy.close()
-        bw_cov.close()
+    bw_methy.close()
+    bw_cov.close()
 
     return methy.astype(np.int64), total.astype(np.int64)
 
@@ -322,6 +321,32 @@ def _aggregate_bigwig_files(
 # ============================================================================
 # Aggregation dispatcher
 # ============================================================================
+
+def _dispatch_single_file(task: dict) -> tuple[str, int, np.ndarray, np.ndarray]:
+    """Process one file and return (cell_type, cell_type_index, methy, total).
+
+    Top-level function so it is picklable by ProcessPoolExecutor.
+    """
+    fmt = task["format"]
+    ct = task["cell_type"]
+    ci = task["cell_type_index"]
+    cpg_index = task["cpg_index"]
+    total_sites = task["total_sites"]
+
+    if fmt == "pat":
+        m, t = _aggregate_single_pat(Path(task["file_path"]), total_sites)
+    elif fmt == "beta":
+        m, t = _aggregate_single_beta(Path(task["file_path"]), total_sites)
+    elif fmt == "bissnp":
+        m, t = _aggregate_single_bissnp(Path(task["file_path"]), cpg_index)
+    elif fmt == "bigwig":
+        m, t = _aggregate_single_bigwig(
+            Path(task["methy_bw"]), Path(task["cov_bw"]), cpg_index
+        )
+    else:
+        raise ValueError(f"Unknown format: {fmt}")
+    return ct, ci, m, t
+
 
 def aggregate_to_cpg_matrix(
     manifest_df: pd.DataFrame,
@@ -331,6 +356,10 @@ def aggregate_to_cpg_matrix(
     n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray]:
     """Aggregate all input files into a CpG x cell_type matrix.
+
+    All files across ALL cell types are dispatched to a single shared
+    process pool so that --threads is fully utilized regardless of how
+    files are distributed across cell types.
 
     Returns
     -------
@@ -347,28 +376,58 @@ def aggregate_to_cpg_matrix(
     # Group by cell type
     groups = sorted(manifest_df["group"].unique())
     cell_types = groups
+    ct_to_idx = {ct: i for i, ct in enumerate(groups)}
 
     methy_matrix = np.zeros((total_sites, len(cell_types)), dtype=np.int64)
     total_matrix = np.zeros((total_sites, len(cell_types)), dtype=np.int64)
 
-    for ci, ct in enumerate(cell_types):
-        ct_rows = manifest_df[manifest_df["group"] == ct]
-
-        if input_format == "pat":
-            paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_pat_files(paths, cpg_index, total_sites, n_jobs=n_jobs)
-        elif input_format == "beta":
-            paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_beta_files(paths, total_sites, n_jobs=n_jobs)
-        elif input_format == "bissnp":
-            paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_bissnp_files(paths, cpg_index, n_jobs=n_jobs)
-        elif input_format == "bigwig":
-            methy_paths = [Path(p) for p in ct_rows["methy_bw"]]
-            cov_paths = [Path(p) for p in ct_rows["cov_bw"]]
-            mk, tt = _aggregate_bigwig_files(methy_paths, cov_paths, cpg_index)
+    # Build flat task list across ALL cell types and files
+    tasks: list[dict] = []
+    for _, row in manifest_df.iterrows():
+        ct = row["group"]
+        ci = ct_to_idx[ct]
+        task = {
+            "format": input_format,
+            "cell_type": ct,
+            "cell_type_index": ci,
+            "cpg_index": cpg_index,
+            "total_sites": total_sites,
+        }
+        if input_format == "bigwig":
+            task["methy_bw"] = row["methy_bw"]
+            task["cov_bw"] = row["cov_bw"]
         else:
-            raise ValueError(f"Unknown input format: {input_format}")
+            task["file_path"] = row["file_path"]
+        tasks.append(task)
+
+    log.info("Dispatching %d files across %d cell types (n_jobs=%d) ...",
+             len(tasks), len(cell_types), n_jobs)
+
+    if n_jobs <= 1 or len(tasks) <= 1:
+        # Sequential
+        for i, task in enumerate(tasks):
+            ct, ci, mk, tt = _dispatch_single_file(task)
+            methy_matrix[:, ci] += mk
+            total_matrix[:, ci] += tt
+            log.info("  [%d/%d] %s (%s)", i + 1, len(tasks), task.get("file_path", task.get("methy_bw", "")), ct)
+    else:
+        # Parallel: all files in one pool, results accumulated as they complete
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(_dispatch_single_file, task): task for task in tasks}
+            done_count = 0
+            for future in as_completed(futures):
+                task = futures[future]
+                ct, ci, mk, tt = future.result()
+                methy_matrix[:, ci] += mk
+                total_matrix[:, ci] += tt
+                done_count += 1
+                fname = task.get("file_path", task.get("methy_bw", ""))
+                log.info("  [%d/%d] %s (%s)", done_count, len(tasks), Path(fname).name, ct)
+
+    for ct in cell_types:
+        ci = ct_to_idx[ct]
+        n_files = int((manifest_df["group"] == ct).sum())
+        log.info("Cell type '%s': aggregated %d files", ct, n_files)
 
         methy_matrix[:, ci] = mk
         total_matrix[:, ci] = tt
