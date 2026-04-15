@@ -2827,6 +2827,8 @@ public class FinaleMe {
 		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
 				 ", maxIter=" + adaptMaxIter + ") ...");
 
+		logEmissionParams("REFERENCE MODEL (before adaptation)", refHmm);
+
 		BayesianNhmmV5<ObservationVector> adaptedHmm;
 		try {
 			adaptedHmm = refHmm.clone();
@@ -2850,6 +2852,7 @@ public class FinaleMe {
 
 			distance = klc.distance(prevHmm, adaptedHmm, true);
 			log.info("Adaptation iteration " + (iter + 1) + ": KL distance = " + distance);
+			logEmissionParams("After iteration " + (iter + 1), adaptedHmm);
 
 			if (Double.isNaN(distance)) {
 				log.warn("KL distance is NaN at iteration " + (iter + 1) +
@@ -2862,6 +2865,8 @@ public class FinaleMe {
 				break;
 			}
 		}
+
+		logEmissionDelta("EMISSION DELTA (adapted - reference)", refHmm, adaptedHmm);
 
 		this.methylatedState = adaptedHmm.getMethyState(lowCoverage);
 		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
@@ -2898,6 +2903,112 @@ public class FinaleMe {
 		decodeOnlyStreaming(inputFile, adaptedModelTmp.getAbsolutePath(), outputFile, cpgIndex, chromOrder);
 		miniDataPoints = decodeMiniDataPoints;  // restore
 		adaptedModelTmp.delete();
+	}
+
+	/**
+	 * Log per-state emission GMM parameters (mean, variance, mixture proportions)
+	 * for adaptation diagnostics.
+	 */
+	private void logEmissionParams(String label, BayesianNhmmV5<ObservationVector> hmm) {
+		final String[] featureNames = lowCoverage && useEndMotif
+			? new String[]{"FragLen", "DistToCenter", "MotifScore"}
+			: (lowCoverage ? new String[]{"FragLen", "DistToCenter"}
+			: new String[]{"FragLen", "Coverage", "DistToCenter"});
+
+		log.info("=== " + label + " ===");
+		for (int s = 0; s < hmm.nbStates(); s++) {
+			OpdfMultiMixtureGaussian opdf = (OpdfMultiMixtureGaussian) hmm.getOpdf(s);
+			MultiMixtureGaussianDistribution dist = opdf.getDistribution();
+			double[] mean = opdf.mean();
+			double[][] cov = opdf.covariance();
+			StringBuilder sb = new StringBuilder();
+			sb.append("  State ").append(s).append(": mean=[");
+			for (int d = 0; d < mean.length; d++) {
+				if (d > 0) sb.append(", ");
+				sb.append(String.format("%.6f", mean[d]));
+			}
+			sb.append("] var=[");
+			for (int d = 0; d < cov.length; d++) {
+				if (d > 0) sb.append(", ");
+				sb.append(String.format("%.6f", cov[d][d]));
+			}
+			sb.append("]");
+			log.info(sb.toString());
+
+			// Per-feature per-component details
+			for (int d = 0; d < dist.getDimension(); d++) {
+				String fname = d < featureNames.length ? featureNames[d] : ("Feat" + d);
+				ArrayList<Double> means = dist.getMeanInEachGaussian().get(d);
+				ArrayList<Double> vars = dist.getVarianceInEachGaussian().get(d);
+				ArrayList<Double> props = dist.getPropInEachGaussian().get(d);
+				StringBuilder csb = new StringBuilder();
+				csb.append("    ").append(fname).append(": ");
+				for (int k = 0; k < means.size(); k++) {
+					if (k > 0) csb.append(" | ");
+					csb.append(String.format("mu=%.6f var=%.6f w=%.4f",
+						means.get(k), vars.get(k), props.get(k)));
+				}
+				log.info(csb.toString());
+			}
+		}
+	}
+
+	/**
+	 * Log the difference between reference and adapted emission parameters.
+	 */
+	private void logEmissionDelta(String label, BayesianNhmmV5<ObservationVector> refHmm,
+								  BayesianNhmmV5<ObservationVector> adaptedHmm) {
+		final String[] featureNames = lowCoverage && useEndMotif
+			? new String[]{"FragLen", "DistToCenter", "MotifScore"}
+			: (lowCoverage ? new String[]{"FragLen", "DistToCenter"}
+			: new String[]{"FragLen", "Coverage", "DistToCenter"});
+
+		log.info("=== " + label + " ===");
+		for (int s = 0; s < refHmm.nbStates(); s++) {
+			OpdfMultiMixtureGaussian refOpdf = (OpdfMultiMixtureGaussian) refHmm.getOpdf(s);
+			OpdfMultiMixtureGaussian adpOpdf = (OpdfMultiMixtureGaussian) adaptedHmm.getOpdf(s);
+			double[] refMean = refOpdf.mean();
+			double[] adpMean = adpOpdf.mean();
+			double[][] refCov = refOpdf.covariance();
+			double[][] adpCov = adpOpdf.covariance();
+
+			StringBuilder sb = new StringBuilder();
+			sb.append("  State ").append(s).append(": delta_mean=[");
+			for (int d = 0; d < refMean.length; d++) {
+				if (d > 0) sb.append(", ");
+				sb.append(String.format("%+.6f", adpMean[d] - refMean[d]));
+			}
+			sb.append("] delta_var=[");
+			for (int d = 0; d < refCov.length; d++) {
+				if (d > 0) sb.append(", ");
+				sb.append(String.format("%+.6f", adpCov[d][d] - refCov[d][d]));
+			}
+			sb.append("]");
+			log.info(sb.toString());
+
+			// Per-feature per-component deltas
+			MultiMixtureGaussianDistribution refDist = refOpdf.getDistribution();
+			MultiMixtureGaussianDistribution adpDist = adpOpdf.getDistribution();
+			for (int d = 0; d < refDist.getDimension(); d++) {
+				String fname = d < featureNames.length ? featureNames[d] : ("Feat" + d);
+				ArrayList<Double> refMeans = refDist.getMeanInEachGaussian().get(d);
+				ArrayList<Double> adpMeans = adpDist.getMeanInEachGaussian().get(d);
+				ArrayList<Double> refVars = refDist.getVarianceInEachGaussian().get(d);
+				ArrayList<Double> adpVars = adpDist.getVarianceInEachGaussian().get(d);
+				ArrayList<Double> refProps = refDist.getPropInEachGaussian().get(d);
+				ArrayList<Double> adpProps = adpDist.getPropInEachGaussian().get(d);
+				StringBuilder csb = new StringBuilder();
+				csb.append("    ").append(fname).append(": ");
+				for (int k = 0; k < refMeans.size(); k++) {
+					if (k > 0) csb.append(" | ");
+					csb.append(String.format("Δmu=%+.6f Δvar=%+.6f Δw=%+.4f",
+						adpMeans.get(k) - refMeans.get(k),
+						adpVars.get(k) - refVars.get(k),
+						adpProps.get(k) - refProps.get(k)));
+				}
+				log.info(csb.toString());
+			}
+		}
 	}
 
 }
