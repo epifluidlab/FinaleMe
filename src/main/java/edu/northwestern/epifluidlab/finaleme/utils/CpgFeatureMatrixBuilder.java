@@ -694,7 +694,8 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					FileOutputStream output = new FileOutputStream(detailFile);
 					BlockCompressedOutputStream bgzipOut = new BlockCompressedOutputStream(output, (java.io.File) null);
 					OutputStreamWriter writer = new OutputStreamWriter(bgzipOut, "UTF-8");
-					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
+					// Header prefixed with '#' so tabix skips it automatically.
+					writer.write("#chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
 					if (useEndMotif) {
 						writer.write("\tmotif_score");
 					}
