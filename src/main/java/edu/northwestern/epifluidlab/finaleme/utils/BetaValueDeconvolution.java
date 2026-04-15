@@ -1009,15 +1009,17 @@ public class BetaValueDeconvolution {
             throws IOException {
         if (queryFile.endsWith(".beta") || queryFile.endsWith(".lbeta")) {
             return loadQueryFromBeta(queryFile, windows, cpgIndex);
+        } else if (isPredictionPath(queryFile)) {
+            return loadQueryFromPredictionOverlap(queryFile, windows);
         } else if (queryFile.endsWith(".bed.gz") || queryFile.endsWith(".bed")) {
-            if (isPredictionBedPath(queryFile)) {
-                return loadQueryFromPredictionOverlap(queryFile, windows);
-            }
             return loadQueryFromBed(queryFile, windows, cpgIndex);
+        } else if (queryFile.endsWith(".txt.gz") || queryFile.endsWith(".txt")) {
+            // FinaleMe prediction output can also use .txt.gz extension
+            return loadQueryFromPredictionOverlap(queryFile, windows);
         } else {
             throw new IllegalArgumentException(
                     "Unknown query file format: " + queryFile
-                            + ". Expected .beta, .prediction.bed.gz, or 6+2 BED.");
+                            + ". Expected .beta, .prediction.bed.gz, .prediction.txt.gz, or 6+2 BED.");
         }
     }
 
@@ -1038,6 +1040,12 @@ public class BetaValueDeconvolution {
     private boolean isPredictionBedPath(String path) {
         String lower = path.toLowerCase(Locale.ROOT);
         return lower.endsWith(".prediction.bed") || lower.endsWith(".prediction.bed.gz");
+    }
+
+    private boolean isPredictionPath(String path) {
+        String lower = path.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".prediction.bed") || lower.endsWith(".prediction.bed.gz")
+                || lower.endsWith(".prediction.txt") || lower.endsWith(".prediction.txt.gz");
     }
 
     /**
