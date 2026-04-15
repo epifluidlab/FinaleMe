@@ -140,8 +140,8 @@ public class CcinferenceMetricsFromBed {
 					FileOutputStream output = new FileOutputStream(detailFile);
 					OutputStreamWriter writer = new OutputStreamWriter(new GZIPOutputStream(output), "UTF-8");
 					
-					//basic
-					writer.write("chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
+					//basic (header prefixed with '#' so tabix / FinaleMe skip it)
+					writer.write("#chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
 					
 					BigWigFileReader wigReader = null;
 					if(valueWig != null){
