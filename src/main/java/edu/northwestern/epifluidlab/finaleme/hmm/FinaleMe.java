@@ -496,7 +496,7 @@ public class FinaleMe {
 	private SummaryStatistics[] collectStats(String matrixFile,
 											 HashMap<String, IntervalTree<Integer>> overlapLoc,
 											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
-		int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
+		int numStats = useEndMotif ? 4 : 3;
 		SummaryStatistics[] stats = new SummaryStatistics[numStats];
 		for (int i = 0; i < numStats; i++) {
 			stats[i] = new SummaryStatistics();
@@ -511,7 +511,7 @@ public class FinaleMe {
 			stats[0].addValue(row.fragLen);
 			stats[1].addValue(row.coverage);
 			stats[2].addValue(row.distToCenter);
-			if (lowCoverage && useEndMotif && !Double.isNaN(row.motifScore)) {
+			if (useEndMotif && !Double.isNaN(row.motifScore)) {
 				stats[3].addValue(row.motifScore);
 			}
 		}
@@ -745,7 +745,7 @@ public class FinaleMe {
 
 			// === Pass 1: Stats + per-read CpG count ===
 			String line;
-			int numStats = (lowCoverage && useEndMotif) ? 4 : 3;
+			int numStats = useEndMotif ? 4 : 3;
 			SummaryStatistics[] stats = new SummaryStatistics[numStats];
 			for(int i = 0; i < numStats; i++){
 				stats[i] = new SummaryStatistics();
@@ -762,7 +762,7 @@ public class FinaleMe {
 				stats[0].addValue(row.fragLen);
 				stats[1].addValue(row.coverage);
 				stats[2].addValue(row.distToCenter);
-				if(lowCoverage && useEndMotif && !Double.isNaN(row.motifScore)){
+				if(useEndMotif && !Double.isNaN(row.motifScore)){
 					stats[3].addValue(row.motifScore);
 				}
 				statsRows++;
@@ -825,17 +825,28 @@ public class FinaleMe {
 			double[] value;
 
 			if(lowCoverage && useEndMotif){
+				// 3D: fragLen, distToCenter, motifScore
 				value = new double[]{
 						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
 						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
 						(row.motifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
 				};
 			}else if(lowCoverage){
+				// 2D: fragLen, distToCenter
 				value = new double[]{
 						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
 						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
 				};
+			}else if(useEndMotif){
+				// 4D: fragLen, coverage, distToCenter, motifScore
+				value = new double[]{
+						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
+						(row.coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
+						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
+						(row.motifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
+				};
 			}else{
+				// 3D: fragLen, coverage, distToCenter
 				value = new double[]{
 						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
 						(row.coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
@@ -1383,17 +1394,28 @@ public class FinaleMe {
 			// Z-score normalize
 			double[] value;
 			if (lowCoverage && useEndMotif) {
+				// 3D: fragLen, distToCenter, motifScore
 				value = new double[]{
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
 					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
 					(row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation(),
 				};
 			} else if (lowCoverage) {
+				// 2D: fragLen, distToCenter
 				value = new double[]{
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
 					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
 				};
+			} else if (useEndMotif) {
+				// 4D: fragLen, coverage, distToCenter, motifScore
+				value = new double[]{
+					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
+					(row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation(),
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
+					(row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation(),
+				};
 			} else {
+				// 3D: fragLen, coverage, distToCenter
 				value = new double[]{
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
 					(row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation(),
@@ -3081,10 +3103,16 @@ public class FinaleMe {
 	 * for adaptation diagnostics.
 	 */
 	private void logEmissionParams(String label, BayesianNhmmV5<ObservationVector> hmm) {
-		final String[] featureNames = lowCoverage && useEndMotif
-			? new String[]{"FragLen", "DistToCenter", "MotifScore"}
-			: (lowCoverage ? new String[]{"FragLen", "DistToCenter"}
-			: new String[]{"FragLen", "Coverage", "DistToCenter"});
+		final String[] featureNames;
+		if (lowCoverage && useEndMotif) {
+			featureNames = new String[]{"FragLen", "DistToCenter", "MotifScore"};
+		} else if (lowCoverage) {
+			featureNames = new String[]{"FragLen", "DistToCenter"};
+		} else if (useEndMotif) {
+			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter", "MotifScore"};
+		} else {
+			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter"};
+		}
 
 		log.info("=== " + label + " ===");
 		for (int s = 0; s < hmm.nbStates(); s++) {
@@ -3194,14 +3222,17 @@ public class FinaleMe {
 
 			for (int d = 0; d < dim; d++) {
 				// Map feature dimension to stats index:
-				// lowCoverage+endMotif: value[0]=fragLen(stats[0]), value[1]=distToCenter(stats[2]), value[2]=motifScore(stats[3])
-				// lowCoverage: value[0]=fragLen(stats[0]), value[1]=distToCenter(stats[2])
-				// normal: value[0]=fragLen(stats[0]), value[1]=coverage(stats[1]), value[2]=distToCenter(stats[2])
+				// lowCoverage+endMotif (3D):   [0]=fragLen(s0), [1]=distToCenter(s2), [2]=motifScore(s3)
+				// lowCoverage (2D):            [0]=fragLen(s0), [1]=distToCenter(s2)
+				// !lowCoverage+endMotif (4D):  [0]=fragLen(s0), [1]=coverage(s1), [2]=distToCenter(s2), [3]=motifScore(s3)
+				// normal (3D):                 [0]=fragLen(s0), [1]=coverage(s1), [2]=distToCenter(s2)
 				int statsIdx;
 				if (lowCoverage && useEndMotif) {
 					statsIdx = (d == 0) ? 0 : (d == 1) ? 2 : 3;
 				} else if (lowCoverage) {
 					statsIdx = (d == 0) ? 0 : 2;
+				} else if (useEndMotif) {
+					statsIdx = d; // 0→fragLen, 1→coverage, 2→distToCenter, 3→motifScore
 				} else {
 					statsIdx = d; // 0→fragLen, 1→coverage, 2→distToCenter
 				}
@@ -3238,10 +3269,16 @@ public class FinaleMe {
 
 	private void logEmissionDelta(String label, BayesianNhmmV5<ObservationVector> refHmm,
 								  BayesianNhmmV5<ObservationVector> adaptedHmm) {
-		final String[] featureNames = lowCoverage && useEndMotif
-			? new String[]{"FragLen", "DistToCenter", "MotifScore"}
-			: (lowCoverage ? new String[]{"FragLen", "DistToCenter"}
-			: new String[]{"FragLen", "Coverage", "DistToCenter"});
+		final String[] featureNames;
+		if (lowCoverage && useEndMotif) {
+			featureNames = new String[]{"FragLen", "DistToCenter", "MotifScore"};
+		} else if (lowCoverage) {
+			featureNames = new String[]{"FragLen", "DistToCenter"};
+		} else if (useEndMotif) {
+			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter", "MotifScore"};
+		} else {
+			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter"};
+		}
 
 		log.info("=== " + label + " ===");
 		for (int s = 0; s < refHmm.nbStates(); s++) {
