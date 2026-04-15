@@ -205,6 +205,12 @@ public class FinaleMe {
 	@Option(name="-saveAdaptedModel",usage="save the adapted model to this path. If not set, the adapted model is used for decoding but not saved, and the reference model is not modified.")
 	public String saveAdaptedModel = null;
 
+	@Option(name="-saveNormStats",usage="save per-feature normalization statistics (mean/sd) to TSV file during training. Required for proper adaptation re-centering.")
+	public String saveNormStats = null;
+
+	@Option(name="-loadNormStats",usage="load reference normalization statistics from TSV file. Used by -adaptEmissionOnly to re-center reference GMM into the target sample's z-score space.")
+	public String loadNormStats = null;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -215,6 +221,10 @@ public class FinaleMe {
 	final private static String USAGE = "FinaleMe [opts] model input_matrix.txt[.gz] prediction.txt.gz";
 	
 	private static final Logger log = LoggerFactory.getLogger(FinaleMe.class);
+
+	// Last computed feature normalization stats from processMatrixFile/collectStats.
+	// Used by adaptAndDecodeStreaming to access target sample stats for re-centering.
+	private SummaryStatistics[] lastComputedStats = null;
 
 	private static long startTime = -1;
 	private static long points = 0;
@@ -728,6 +738,13 @@ public class FinaleMe {
 			br.close();
 
 		logFeatureStats(stats);
+		lastComputedStats = stats; // expose for adaptAndDecodeStreaming
+
+		// Save normalization stats for future adaptation re-centering
+		if (saveNormStats != null) {
+			saveNormalizationStats(stats, saveNormStats);
+		}
+
 		long totalReads = readCpgCount.size();
 		long qualifyingReads = 0;
 		for(int[] cnt : readCpgCount.values()){
@@ -2829,9 +2846,36 @@ public class FinaleMe {
 
 		logEmissionParams("REFERENCE MODEL (before adaptation)", refHmm);
 
+		// Re-center reference GMM means from reference z-score space into
+		// the target sample's z-score space (design doc §3.3.3):
+		//   μ_adjusted = (μ_ref × σ_ref + mean_ref − mean_target) / σ_target
+		// This corrects for the fact that z-score normalization uses each
+		// sample's own mean/sd, so the same raw value gets different z-scores
+		// in different samples.
+		BayesianNhmmV5<ObservationVector> refHmmForAdapt;
+		try {
+			refHmmForAdapt = refHmm.clone();
+		} catch (CloneNotSupportedException e) {
+			throw new RuntimeException("Failed to clone reference HMM", e);
+		}
+		if (loadNormStats != null) {
+			double[][] refNormStats = loadNormalizationStats(loadNormStats);
+			SummaryStatistics[] targetStats = lastComputedStats; // from processMatrixFile above
+			if (targetStats != null && refNormStats != null) {
+				log.info("Re-centering reference GMM from ref z-score space to target z-score space ...");
+				recenterEmissions(refHmmForAdapt, refNormStats, targetStats);
+				logEmissionParams("REFERENCE MODEL (after re-centering)", refHmmForAdapt);
+			} else {
+				log.warn("Cannot re-center: " +
+						(targetStats == null ? "target stats not available" : "ref norm stats not loaded"));
+			}
+		} else {
+			log.info("No -loadNormStats; skipping re-centering (ref and target z-score spaces may differ)");
+		}
+
 		BayesianNhmmV5<ObservationVector> adaptedHmm;
 		try {
-			adaptedHmm = refHmm.clone();
+			adaptedHmm = refHmmForAdapt.clone();
 		} catch (CloneNotSupportedException e) {
 			throw new RuntimeException("Failed to clone reference HMM", e);
 		}
@@ -2848,7 +2892,7 @@ public class FinaleMe {
 				throw new RuntimeException("Failed to clone HMM at iteration " + iter, e);
 			}
 
-			adaptedHmm = adaptIteration(adaptedHmm, refHmm, matrix, adaptLambda);
+			adaptedHmm = adaptIteration(adaptedHmm, refHmmForAdapt, matrix, adaptLambda);
 
 			distance = klc.distance(prevHmm, adaptedHmm, true);
 			log.info("Adaptation iteration " + (iter + 1) + ": KL distance = " + distance);
@@ -2857,7 +2901,7 @@ public class FinaleMe {
 			if (Double.isNaN(distance)) {
 				log.warn("KL distance is NaN at iteration " + (iter + 1) +
 						 "; falling back to reference model.");
-				adaptedHmm = refHmm;
+				adaptedHmm = refHmmForAdapt;
 				break;
 			}
 			if (Math.abs(distance) < tol) {
@@ -2866,7 +2910,7 @@ public class FinaleMe {
 			}
 		}
 
-		logEmissionDelta("EMISSION DELTA (adapted - reference)", refHmm, adaptedHmm);
+		logEmissionDelta("EMISSION DELTA (adapted - re-centered reference)", refHmmForAdapt, adaptedHmm);
 
 		this.methylatedState = adaptedHmm.getMethyState(lowCoverage);
 		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
@@ -2956,6 +3000,115 @@ public class FinaleMe {
 	/**
 	 * Log the difference between reference and adapted emission parameters.
 	 */
+	/**
+	 * Save per-feature normalization statistics (mean, sd) to a TSV file.
+	 * Format: feature_index \t mean \t sd
+	 */
+	private void saveNormalizationStats(SummaryStatistics[] stats, String path) throws IOException {
+		try (OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(path), StandardCharsets.UTF_8)) {
+			w.write("feature\tmean\tsd\n");
+			for (int i = 0; i < stats.length; i++) {
+				w.write(i + "\t" + stats[i].getMean() + "\t" +
+						(stats[i].getN() > 1 ? stats[i].getStandardDeviation() : 1.0) + "\n");
+			}
+		}
+		log.info("Normalization stats saved to " + path + " (" + stats.length + " features)");
+	}
+
+	/**
+	 * Load per-feature normalization statistics from a TSV file.
+	 * Returns double[nFeatures][2] where [i][0] = mean, [i][1] = sd.
+	 */
+	private double[][] loadNormalizationStats(String path) throws IOException {
+		ArrayList<double[]> rows = new ArrayList<>();
+		try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+			String line;
+			boolean header = true;
+			while ((line = br.readLine()) != null) {
+				if (header) { header = false; continue; }
+				String[] parts = line.split("\t");
+				if (parts.length >= 3) {
+					rows.add(new double[]{Double.parseDouble(parts[1]), Double.parseDouble(parts[2])});
+				}
+			}
+		}
+		log.info("Loaded normalization stats from " + path + " (" + rows.size() + " features)");
+		return rows.toArray(new double[0][]);
+	}
+
+	/**
+	 * Re-center GMM emission means from reference z-score space to target z-score space.
+	 *
+	 * For each feature dimension d:
+	 *   μ_adjusted = (μ_ref × σ_ref + mean_ref − mean_target) / σ_target
+	 *   σ²_adjusted = σ²_ref × (σ_ref / σ_target)²
+	 *
+	 * This corrects for the fact that each sample's features are z-score
+	 * normalized using its own mean/sd, so the reference GMM parameters
+	 * are in a different coordinate system than the target data.
+	 */
+	private void recenterEmissions(BayesianNhmmV5<ObservationVector> hmm,
+								   double[][] refNormStats,
+								   SummaryStatistics[] targetStats) {
+		for (int s = 0; s < hmm.nbStates(); s++) {
+			OpdfMultiMixtureGaussian opdf = (OpdfMultiMixtureGaussian) hmm.getOpdf(s);
+			MultiMixtureGaussianDistribution dist = opdf.getDistribution();
+			int dim = dist.getDimension();
+
+			// Build re-centered parameters
+			double[] newMean = opdf.mean().clone();
+			double[][] newCov = opdf.covariance().clone();
+			for (int i = 0; i < dim; i++) {
+				newCov[i] = newCov[i].clone();
+			}
+			ArrayList<ArrayList<Double>> newMeans = new ArrayList<>();
+			ArrayList<ArrayList<Double>> newVars = new ArrayList<>();
+			ArrayList<ArrayList<Double>> newProps = new ArrayList<>();
+
+			for (int d = 0; d < dim; d++) {
+				// Map feature dimension to stats index:
+				// lowCoverage+endMotif: value[0]=fragLen(stats[0]), value[1]=distToCenter(stats[2]), value[2]=motifScore(stats[3])
+				// lowCoverage: value[0]=fragLen(stats[0]), value[1]=distToCenter(stats[2])
+				// normal: value[0]=fragLen(stats[0]), value[1]=coverage(stats[1]), value[2]=distToCenter(stats[2])
+				int statsIdx;
+				if (lowCoverage && useEndMotif) {
+					statsIdx = (d == 0) ? 0 : (d == 1) ? 2 : 3;
+				} else if (lowCoverage) {
+					statsIdx = (d == 0) ? 0 : 2;
+				} else {
+					statsIdx = d; // 0→fragLen, 1→coverage, 2→distToCenter
+				}
+
+				double meanRef = refNormStats[statsIdx][0];
+				double sdRef = refNormStats[statsIdx][1];
+				double meanTarget = targetStats[statsIdx].getMean();
+				double sdTarget = targetStats[statsIdx].getN() > 1 ? targetStats[statsIdx].getStandardDeviation() : 1.0;
+				if (sdTarget == 0) sdTarget = 1.0;
+				double scale = sdRef / sdTarget;
+
+				// Re-center top-level mean and variance
+				newMean[d] = (newMean[d] * sdRef + meanRef - meanTarget) / sdTarget;
+				newCov[d][d] = newCov[d][d] * scale * scale;
+
+				// Re-center per-component means and variances
+				ArrayList<Double> compMeans = new ArrayList<>(dist.getMeanInEachGaussian().get(d));
+				ArrayList<Double> compVars = new ArrayList<>(dist.getVarianceInEachGaussian().get(d));
+				ArrayList<Double> compProps = new ArrayList<>(dist.getPropInEachGaussian().get(d));
+				for (int k = 0; k < compMeans.size(); k++) {
+					compMeans.set(k, (compMeans.get(k) * sdRef + meanRef - meanTarget) / sdTarget);
+					compVars.set(k, compVars.get(k) * scale * scale);
+				}
+				newMeans.add(compMeans);
+				newVars.add(compVars);
+				newProps.add(compProps);
+			}
+
+			OpdfMultiMixtureGaussian recentered = new OpdfMultiMixtureGaussian(
+				newMean, newCov, dist.getMixNumberInFeature(), newMeans, newVars, newProps);
+			hmm.setOpdf(s, recentered);
+		}
+	}
+
 	private void logEmissionDelta(String label, BayesianNhmmV5<ObservationVector> refHmm,
 								  BayesianNhmmV5<ObservationVector> adaptedHmm) {
 		final String[] featureNames = lowCoverage && useEndMotif
