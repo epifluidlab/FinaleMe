@@ -438,6 +438,57 @@ public class FinaleMe {
 	private static final int GZIP_BUFFER_SIZE = 65536;
 	private static final int READER_BUFFER_SIZE = 131072;
 
+	/**
+	 * Detect whether a gzipped file is actually BGZF (bgzipped). Bgzip files
+	 * have a specific extra field 'BC' in the gzip header at bytes 14-15.
+	 * Returns false if not bgzipped or on I/O error.
+	 */
+	private static boolean isBgzippedFile(String path) {
+		try (FileInputStream fis = new FileInputStream(path)) {
+			byte[] hdr = new byte[18];
+			int n = fis.read(hdr);
+			if (n < 18) return false;
+			// gzip magic: 1f 8b, FLG.FEXTRA = 0x04
+			if ((hdr[0] & 0xff) != 0x1f || (hdr[1] & 0xff) != 0x8b) return false;
+			if ((hdr[3] & 0x04) == 0) return false;
+			// BGZF subfield: SI1='B'=0x42, SI2='C'=0x43 at offset 12-13
+			return hdr[12] == 0x42 && hdr[13] == 0x43;
+		} catch (IOException e) {
+			return false;
+		}
+	}
+
+	/**
+	 * Open a gzipped file for reading, using parallel bgzip decompression
+	 * when the file is bgzipped and threads > 1 and `bgzip` is on PATH.
+	 * Falls back to single-threaded GZIPInputStream otherwise.
+	 *
+	 * The returned BufferedReader must be closed by the caller. If a
+	 * subprocess was spawned, closing the reader also closes its stream;
+	 * the subprocess terminates when stdin EOF is reached.
+	 */
+	private BufferedReader openGzipReader(String path) throws IOException {
+		if (!path.endsWith(".gz")) {
+			return new BufferedReader(new FileReader(path), READER_BUFFER_SIZE);
+		}
+		int nThreads = resolveThreadCount();
+		if (nThreads > 1 && isBgzippedFile(path)) {
+			try {
+				ProcessBuilder pb = new ProcessBuilder(
+					"bgzip", "-d", "-c", "-@", String.valueOf(nThreads), path);
+				pb.redirectErrorStream(false);
+				Process proc = pb.start();
+				log.info("Reading bgzipped file with parallel decompression: bgzip -d -@ " + nThreads);
+				return new BufferedReader(new InputStreamReader(proc.getInputStream()), READER_BUFFER_SIZE);
+			} catch (IOException e) {
+				log.info("bgzip not available on PATH, falling back to single-threaded gzip read: " + e.getMessage());
+			}
+		}
+		return new BufferedReader(
+			new InputStreamReader(new GZIPInputStream(new FileInputStream(path), GZIP_BUFFER_SIZE)),
+			READER_BUFFER_SIZE);
+	}
+
 	private SummaryStatistics[] collectStats(String matrixFile,
 											 HashMap<String, IntervalTree<Integer>> overlapLoc,
 											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
@@ -447,14 +498,7 @@ public class FinaleMe {
 			stats[i] = new SummaryStatistics();
 		}
 
-		GZIPInputStream gzipInputStream = null;
-		BufferedReader br;
-		if (matrixFile.endsWith(".gz")) {
-			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
-			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
-		} else {
-			br = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
-		}
+		BufferedReader br = openGzipReader(matrixFile);
 
 		String line;
 		while ((line = br.readLine()) != null) {
@@ -466,10 +510,6 @@ public class FinaleMe {
 			if (lowCoverage && useEndMotif && !Double.isNaN(row.motifScore)) {
 				stats[3].addValue(row.motifScore);
 			}
-		}
-
-		if (matrixFile.endsWith(".gz")) {
-			gzipInputStream.close();
 		}
 		br.close();
 
@@ -689,14 +729,7 @@ public class FinaleMe {
 		
 		
 		// Single-pass: read matrix file once, accumulate stats and store raw parsed rows
-		GZIPInputStream gzipInputStream = null;
-		BufferedReader br;
-		if(matrixFile.endsWith(".gz")){
-			gzipInputStream = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
-			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
-		}else{
-			br = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
-		}
+		BufferedReader br = openGzipReader(matrixFile);
 
 			// Two-pass file-based approach to avoid storing intermediate data.
 			// Pass 1: collect feature statistics AND count CpGs per readName.
@@ -737,9 +770,6 @@ public class FinaleMe {
 					cnt[0]++;
 				}
 			}
-			if(matrixFile.endsWith(".gz")){
-				gzipInputStream.close();
-			}
 			br.close();
 
 		logFeatureStats(stats);
@@ -761,14 +791,7 @@ public class FinaleMe {
 		// === Pass 2: Re-read file, skip non-qualifying reads, build matrixProcess ===
 		log.info("Pass 2: Building observation vectors (skipping " +
 				 (totalReads - qualifyingReads) + " reads with < " + miniDataPoints + " CpGs) ...");
-		GZIPInputStream gzipInputStream2 = null;
-		BufferedReader br2;
-		if(matrixFile.endsWith(".gz")){
-			gzipInputStream2 = new GZIPInputStream(new FileInputStream(matrixFile), GZIP_BUFFER_SIZE);
-			br2 = new BufferedReader(new InputStreamReader(gzipInputStream2), READER_BUFFER_SIZE);
-		}else{
-			br2 = new BufferedReader(new FileReader(matrixFile), READER_BUFFER_SIZE);
-		}
+		BufferedReader br2 = openGzipReader(matrixFile);
 		long skippedRows = 0;
 
 		while( (line = br2.readLine()) != null){
@@ -824,9 +847,6 @@ public class FinaleMe {
 				readStat.put(row.offset, Triple.of(row.methyStat, vector, new Pair<String, Double>(row.loc, row.methyPrior)));
 				matrixProcess.put(row.readName, readStat);
 			}
-		}
-		if(matrixFile.endsWith(".gz")){
-			gzipInputStream2.close();
 		}
 		br2.close();
 		readCpgCount = null; // free the count map
@@ -1335,15 +1355,8 @@ public class FinaleMe {
 		int batchReadCount = 0;
 		String lastReadName = null;
 
-		// Open input for second pass
-		GZIPInputStream gzipInputStream = null;
-		BufferedReader br;
-		if (inputFile.endsWith(".gz")) {
-			gzipInputStream = new GZIPInputStream(new FileInputStream(inputFile), GZIP_BUFFER_SIZE);
-			br = new BufferedReader(new InputStreamReader(gzipInputStream), READER_BUFFER_SIZE);
-		} else {
-			br = new BufferedReader(new FileReader(inputFile), READER_BUFFER_SIZE);
-		}
+		// Open input for second pass (uses parallel bgzip decompression if applicable)
+		BufferedReader br = openGzipReader(inputFile);
 
 		String line;
 		while ((line = br.readLine()) != null) {
@@ -1435,9 +1448,6 @@ public class FinaleMe {
 			skippedFragments += batchCounters[8];
 		}
 
-		if (inputFile.endsWith(".gz")) {
-			gzipInputStream.close();
-		}
 		br.close();
 
 		executor.shutdown();
