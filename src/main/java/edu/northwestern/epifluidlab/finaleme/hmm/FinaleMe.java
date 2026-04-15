@@ -2409,9 +2409,31 @@ public class FinaleMe {
 	}
 	
 	
-	protected BayesianNhmmV5<ObservationVector> buildInitNhmmByGMM(MatrixObj matrixObj, List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix){	
+	protected BayesianNhmmV5<ObservationVector> buildInitNhmmByGMM(MatrixObj matrixObj, List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix){
 		System.out.println("GMMLearner...");
-		GMMLearner kl = new GMMLearner(states, new OpdfMultiMixtureGaussianFactory(features, mixNumberInFeature),matrix,maxCpgDist/bin,features, mixNumberInFeature,bayesianFactor, randomEngine, tolKmeans,decayKmeans, cpgNumClip, 1, lowCoverage);
+		// Clip z-scored feature values to +/-OBS_CLIP_SD to prevent extreme
+		// outliers (e.g. 0.5 default motif score when target motif mean=0.99
+		// sd=0.001 produces z-score ~-420) from making the GMM covariance
+		// singular and returning NaN emissions. Replace NaN/Inf with 0.
+		final double OBS_CLIP_SD = 5.0;
+		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> clippedMatrix =
+			new ArrayList<>(matrix.size());
+		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> p : matrix) {
+			ArrayList<ObservationVector> clippedObs = new ArrayList<>(p.getSecond().size());
+			for (ObservationVector ov : p.getSecond()) {
+				double[] vals = ov.values();
+				double[] clipped = new double[vals.length];
+				for (int d = 0; d < vals.length; d++) {
+					double v = vals[d];
+					if (Double.isNaN(v) || Double.isInfinite(v)) v = 0.0;
+					clipped[d] = Math.max(-OBS_CLIP_SD, Math.min(OBS_CLIP_SD, v));
+				}
+				clippedObs.add(new ObservationVector(clipped));
+			}
+			clippedMatrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(
+				p.getFirst(), clippedObs));
+		}
+		GMMLearner kl = new GMMLearner(states, new OpdfMultiMixtureGaussianFactory(features, mixNumberInFeature),clippedMatrix,maxCpgDist/bin,features, mixNumberInFeature,bayesianFactor, randomEngine, tolKmeans,decayKmeans, cpgNumClip, 1, lowCoverage);
 		BayesianNhmmV5<ObservationVector> hmm = kl.learn();
 		methylatedState = kl.returnMethyState();
 		System.out.println("Methylated state is : " + methylatedState);
@@ -2948,7 +2970,8 @@ public class FinaleMe {
 				log.info("Subsampling " + GMM_MAX_FRAGMENTS + " of " + matrix.size() +
 						 " fragments for GMM initialization ...");
 				java.util.Random rng = seed >= 0 ? new java.util.Random(seed) : new java.util.Random();
-				// Reservoir sampling: pick GMM_MAX_FRAGMENTS uniformly at random
+				// Reservoir sampling: pick GMM_MAX_FRAGMENTS uniformly at random.
+				// Outlier clipping is handled inside buildInitNhmmByGMM.
 				List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> sampled =
 					new ArrayList<>(GMM_MAX_FRAGMENTS);
 				for (int i = 0; i < matrix.size(); i++) {
@@ -2961,33 +2984,13 @@ public class FinaleMe {
 						}
 					}
 				}
-				// Clip z-scored feature values to +/-OBS_CLIP_SD to prevent extreme
-				// outliers (e.g. the 0.5 default for unknown motifs when the motif
-				// distribution has tiny sd) from making the GMM covariance singular
-				// and producing NaN emissions.
-				final double OBS_CLIP_SD = 5.0;
+				gmmMatrix = sampled;
+				// Build a shallow matrixObj wrapping the sampled matrix for GMMLearner
 				ArrayList<org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>> tripleMatrix =
 					new ArrayList<>(sampled.size());
 				for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> p : sampled) {
-					ArrayList<ObservationVector> clippedObs = new ArrayList<>(p.getSecond().size());
-					for (ObservationVector ov : p.getSecond()) {
-						double[] vals = ov.values();
-						double[] clipped = new double[vals.length];
-						for (int d = 0; d < vals.length; d++) {
-							double v = vals[d];
-							if (Double.isNaN(v) || Double.isInfinite(v)) v = 0.0;
-							clipped[d] = Math.max(-OBS_CLIP_SD, Math.min(OBS_CLIP_SD, v));
-						}
-						clippedObs.add(new ObservationVector(clipped));
-					}
 					tripleMatrix.add(org.apache.commons.lang3.tuple.Triple.of(
-						p.getFirst(), clippedObs, new ArrayList<String>()));
-				}
-				// Build gmmMatrix from the clipped tripleMatrix (not from original sampled)
-				gmmMatrix = new ArrayList<>(tripleMatrix.size());
-				for (org.apache.commons.lang3.tuple.Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> t : tripleMatrix) {
-					gmmMatrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(
-						t.getLeft(), t.getMiddle()));
+						p.getFirst(), new ArrayList<>(p.getSecond()), new ArrayList<String>()));
 				}
 				gmmMatrixObj = matrixObj.cloneShallowWithMatrix(tripleMatrix);
 			} else {
