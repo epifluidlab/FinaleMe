@@ -24,6 +24,7 @@ import gzip
 import logging
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -105,77 +106,110 @@ def detect_input_format(manifest_df: pd.DataFrame, user_format: str) -> str:
 # Per-format aggregation to CpG-level counts
 # ============================================================================
 
+def _aggregate_single_pat(pat_path: Path, total_sites: int) -> tuple[np.ndarray, np.ndarray]:
+    """Process a single pat.gz file → (methy, total) arrays. Picklable for multiprocessing."""
+    methy = np.zeros(total_sites, dtype=np.int64)
+    total = np.zeros(total_sites, dtype=np.int64)
+    opener = gzip.open if str(pat_path).endswith(".gz") else open
+    with opener(pat_path, "rt") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                start_cpg = int(parts[1])  # 1-based global CpG index
+                pattern = parts[2]
+                count = int(parts[3]) if len(parts) >= 4 else 1
+            except (ValueError, IndexError):
+                continue
+            for offset, ch in enumerate(pattern):
+                if ch not in ("C", "T"):
+                    continue
+                cpg_idx = start_cpg + offset - 1  # convert to 0-based
+                if 0 <= cpg_idx < total_sites:
+                    total[cpg_idx] += count
+                    if ch == "C":
+                        methy[cpg_idx] += count
+    return methy, total
+
+
 def _aggregate_pat_files(
     file_paths: list[Path],
     cpg_index: dict,
     total_sites: int,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Aggregate pat.gz files into per-CpG (methylated, total) count arrays.
+    """Aggregate pat.gz files into per-CpG (methylated, total) count arrays."""
+    if n_jobs <= 1 or len(file_paths) <= 1:
+        methy = np.zeros(total_sites, dtype=np.int64)
+        total = np.zeros(total_sites, dtype=np.int64)
+        for p in file_paths:
+            m, t = _aggregate_single_pat(p, total_sites)
+            methy += m
+            total += t
+        return methy, total
 
-    Returns (methy_counts, total_counts) each of shape (total_sites,).
-    """
     methy = np.zeros(total_sites, dtype=np.int64)
     total = np.zeros(total_sites, dtype=np.int64)
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        futures = {executor.submit(_aggregate_single_pat, p, total_sites): p for p in file_paths}
+        for future in as_completed(futures):
+            p = futures[future]
+            m, t = future.result()
+            methy += m
+            total += t
+            log.info("  Finished %s", p.name)
+    return methy, total
 
-    for pat_path in file_paths:
-        opener = gzip.open if str(pat_path).endswith(".gz") else open
-        with opener(pat_path, "rt") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 3:
-                    continue
-                try:
-                    start_cpg = int(parts[1])  # 1-based global CpG index
-                    pattern = parts[2]
-                    count = int(parts[3]) if len(parts) >= 4 else 1
-                except (ValueError, IndexError):
-                    continue
-                for offset, ch in enumerate(pattern):
-                    if ch not in ("C", "T"):
-                        continue
-                    cpg_idx = start_cpg + offset - 1  # convert to 0-based
-                    if 0 <= cpg_idx < total_sites:
-                        total[cpg_idx] += count
-                        if ch == "C":
-                            methy[cpg_idx] += count
 
+def _aggregate_single_beta(beta_path: Path, total_sites: int) -> tuple[np.ndarray, np.ndarray]:
+    """Process a single .beta file → (methy, total) arrays. Picklable for multiprocessing."""
+    methy = np.zeros(total_sites, dtype=np.int64)
+    total = np.zeros(total_sites, dtype=np.int64)
+    with open(beta_path, "rb") as fh:
+        data = np.frombuffer(fh.read(), dtype=np.uint8)
+    if data.size % 2 != 0:
+        return methy, total
+    per_cpg = data.reshape((-1, 2)).astype(np.int64)
+    n = min(per_cpg.shape[0], total_sites)
+    methy[:n] += per_cpg[:n, 0]
+    total[:n] += per_cpg[:n, 1]
     return methy, total
 
 
 def _aggregate_beta_files(
     file_paths: list[Path],
     total_sites: int,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Aggregate .beta binary files into per-CpG (methylated, total) count arrays."""
+    if n_jobs <= 1 or len(file_paths) <= 1:
+        methy = np.zeros(total_sites, dtype=np.int64)
+        total = np.zeros(total_sites, dtype=np.int64)
+        for p in file_paths:
+            m, t = _aggregate_single_beta(p, total_sites)
+            methy += m
+            total += t
+        return methy, total
+
     methy = np.zeros(total_sites, dtype=np.int64)
     total = np.zeros(total_sites, dtype=np.int64)
-
-    for beta_path in file_paths:
-        with open(beta_path, "rb") as fh:
-            data = np.frombuffer(fh.read(), dtype=np.uint8)
-        if data.size % 2 != 0:
-            log.warning("Beta file size not a multiple of 2: %s (skipping)", beta_path)
-            continue
-        per_cpg = data.reshape((-1, 2)).astype(np.int64)
-        n = min(per_cpg.shape[0], total_sites)
-        methy[:n] += per_cpg[:n, 0]
-        total[:n] += per_cpg[:n, 1]
-
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        futures = {executor.submit(_aggregate_single_beta, p, total_sites): p for p in file_paths}
+        for future in as_completed(futures):
+            p = futures[future]
+            m, t = future.result()
+            methy += m
+            total += t
+            log.info("  Finished %s", p.name)
     return methy, total
 
 
-def _aggregate_bissnp_files(
-    file_paths: list[Path],
-    cpg_index: dict,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Aggregate Bis-SNP 6+2 BED files into per-CpG counts.
-
-    Format: chr start end name score strand methy_pct total_count
-    k = round(methy_pct / 100 * total_count)
-    """
+def _aggregate_single_bissnp(bed_path: Path, cpg_index: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Process a single Bis-SNP 6+2 BED file. Picklable for multiprocessing."""
     chr_positions = cpg_index["chr_positions"]
     chr_offsets = cpg_index["chr_offsets"]
     total_sites = cpg_index["total_sites"]
@@ -183,33 +217,61 @@ def _aggregate_bissnp_files(
     methy = np.zeros(total_sites, dtype=np.int64)
     total = np.zeros(total_sites, dtype=np.int64)
 
-    for bed_path in file_paths:
-        opener = gzip.open if str(bed_path).endswith(".gz") else open
-        with opener(bed_path, "rt") as fh:
-            df = pd.read_csv(
-                fh, sep="\t", comment="#", header=None,
-                usecols=[0, 1, 2, 6, 7],
-                names=["chrom", "start", "end", "methy_pct", "total_count"],
-                dtype={"chrom": str, "start": np.int64, "end": np.int64,
-                       "methy_pct": np.float64, "total_count": np.float64},
-            )
-        for _, row in df.iterrows():
-            chrom = str(row["chrom"])
-            positions = chr_positions.get(chrom)
-            offset = chr_offsets.get(chrom)
-            if positions is None or offset is None:
-                continue
-            # Find the CpG index for this position
-            pos = int(row["start"])
-            idx = int(np.searchsorted(positions, pos, side="left"))
-            if idx < len(positions) and positions[idx] == pos:
-                global_idx = offset + idx
-                if 0 <= global_idx < total_sites:
-                    tc = int(row["total_count"])
-                    mk = int(round(row["methy_pct"] / 100.0 * tc))
-                    methy[global_idx] += mk
-                    total[global_idx] += tc
+    opener = gzip.open if str(bed_path).endswith(".gz") else open
+    with opener(bed_path, "rt") as fh:
+        df = pd.read_csv(
+            fh, sep="\t", comment="#", header=None,
+            usecols=[0, 1, 6, 7],
+            names=["chrom", "start", "methy_pct", "total_count"],
+            dtype={"chrom": str, "start": np.int64,
+                   "methy_pct": np.float64, "total_count": np.float64},
+        )
+    # Vectorized per-chromosome processing (avoids slow iterrows)
+    for chrom, grp in df.groupby("chrom"):
+        positions = chr_positions.get(str(chrom))
+        offset = chr_offsets.get(str(chrom))
+        if positions is None or offset is None:
+            continue
+        starts = grp["start"].values
+        idxs = np.searchsorted(positions, starts, side="left")
+        valid = (idxs < len(positions)) & (positions[idxs] == starts)
+        global_idxs = offset + idxs[valid]
+        in_range = (global_idxs >= 0) & (global_idxs < total_sites)
+        global_idxs = global_idxs[in_range]
+        tc = grp["total_count"].values[valid][in_range].astype(np.int64)
+        mk = np.round(grp["methy_pct"].values[valid][in_range] / 100.0 * tc).astype(np.int64)
+        np.add.at(methy, global_idxs, mk)
+        np.add.at(total, global_idxs, tc)
 
+    return methy, total
+
+
+def _aggregate_bissnp_files(
+    file_paths: list[Path],
+    cpg_index: dict,
+    n_jobs: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate Bis-SNP 6+2 BED files into per-CpG counts."""
+    total_sites = cpg_index["total_sites"]
+    if n_jobs <= 1 or len(file_paths) <= 1:
+        methy = np.zeros(total_sites, dtype=np.int64)
+        total = np.zeros(total_sites, dtype=np.int64)
+        for p in file_paths:
+            m, t = _aggregate_single_bissnp(p, cpg_index)
+            methy += m
+            total += t
+        return methy, total
+
+    methy = np.zeros(total_sites, dtype=np.int64)
+    total = np.zeros(total_sites, dtype=np.int64)
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        futures = {executor.submit(_aggregate_single_bissnp, p, cpg_index): p for p in file_paths}
+        for future in as_completed(futures):
+            p = futures[future]
+            m, t = future.result()
+            methy += m
+            total += t
+            log.info("  Finished %s", p.name)
     return methy, total
 
 
@@ -294,13 +356,13 @@ def aggregate_to_cpg_matrix(
 
         if input_format == "pat":
             paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_pat_files(paths, cpg_index, total_sites)
+            mk, tt = _aggregate_pat_files(paths, cpg_index, total_sites, n_jobs=n_jobs)
         elif input_format == "beta":
             paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_beta_files(paths, total_sites)
+            mk, tt = _aggregate_beta_files(paths, total_sites, n_jobs=n_jobs)
         elif input_format == "bissnp":
             paths = [Path(p) for p in ct_rows["file_path"]]
-            mk, tt = _aggregate_bissnp_files(paths, cpg_index)
+            mk, tt = _aggregate_bissnp_files(paths, cpg_index, n_jobs=n_jobs)
         elif input_format == "bigwig":
             methy_paths = [Path(p) for p in ct_rows["methy_bw"]]
             cov_paths = [Path(p) for p in ct_rows["cov_bw"]]
