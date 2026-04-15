@@ -2789,33 +2789,15 @@ public class FinaleMe {
 		refHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
 		refHmm.setMinCpgNum(1);
 
-		// Load region/exclude intervals
-		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
-		HashMap<String, IntervalTree<Integer>> excludeLoc = loadIntervalFile(exclude);
-
-		// Phase 1: Collect stats
-		log.info("Phase 1: Collecting feature statistics ...");
-		SummaryStatistics[] stats = collectStats(inputFile, overlapLoc, excludeLoc);
-		logFeatureStats(stats);
-
-		long totalFragments = stats[0].getN();
-		log.info("Total data points: " + totalFragments);
-
-		if (totalFragments < adaptMinFragments) {
-			log.warn("Only " + totalFragments + " fragments (< " + adaptMinFragments +
-					 "); skipping adaptation, decoding with reference model directly.");
-			// Decode with reference model using streaming decode
-			decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
-			return;
-		}
-
-		// Phase 2: Load data into memory for adaptation.
+		// Load data for adaptation via processMatrixFile (handles its own
+		// two-pass stats + CpG-count pre-filter internally; no separate
+		// collectStats call needed).
 		// Use the user's -miniDataPoints (e.g. 7) for training fragment selection.
 		// Baum-Welch requires >= 2 CpGs per fragment; enforce as a floor.
 		int adaptMiniDataPoints = Math.max(miniDataPoints, 2);
 		int savedMiniDataPoints = miniDataPoints;
 		miniDataPoints = adaptMiniDataPoints;
-		log.info("Phase 2: Loading data for adaptation (miniDataPoints=" + adaptMiniDataPoints + ") ...");
+		log.info("Loading data for adaptation (miniDataPoints=" + adaptMiniDataPoints + ") ...");
 		MatrixObj matrixObj = processMatrixFile(inputFile);
 		miniDataPoints = savedMiniDataPoints; // restore original
 		matrixObj.cpgDistFreq = null;
@@ -2829,6 +2811,17 @@ public class FinaleMe {
 		}
 
 		log.info("Loaded " + matrix.size() + " fragments for adaptation (>= " + adaptMiniDataPoints + " CpGs each)");
+
+		if (matrix.size() < adaptMinFragments) {
+			log.warn("Only " + matrix.size() + " qualifying fragments (< " + adaptMinFragments +
+					 "); skipping adaptation, decoding with reference model directly.");
+			matrixObj = null;
+			matrix = null;
+			miniDataPoints = 1;
+			decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
+			miniDataPoints = savedMiniDataPoints;
+			return;
+		}
 
 		// Phase 3: Constrained Baum-Welch adaptation
 		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
