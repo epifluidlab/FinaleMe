@@ -2411,6 +2411,19 @@ public class FinaleMe {
 	
 	protected BayesianNhmmV5<ObservationVector> buildInitNhmmByGMM(MatrixObj matrixObj, List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix){
 		System.out.println("GMMLearner...");
+		// Sanity check: observation vector dimension must equal features.
+		// Mismatch typically means -features N was inconsistent with the file's
+		// feature columns (e.g. -useEndMotif mismatch with file schema).
+		if (!matrix.isEmpty() && !matrix.get(0).getSecond().isEmpty()) {
+			int obsDim = matrix.get(0).getSecond().get(0).dimension();
+			if (obsDim != features) {
+				throw new IllegalStateException(
+					"Observation vector dimension (" + obsDim + ") does not match -features (" + features + "). " +
+					"Check that -useEndMotif and -lowCoverage match the input file's feature schema, " +
+					"and that -features matches the expected dimension: " +
+					"3 for normal, 4 for !lowCoverage+useEndMotif, 2 for lowCoverage, 3 for lowCoverage+useEndMotif.");
+			}
+		}
 		// Clip z-scored feature values to +/-OBS_CLIP_SD to prevent extreme
 		// outliers (e.g. 0.5 default motif score when target motif mean=0.99
 		// sd=0.001 produces z-score ~-420) from making the GMM covariance
