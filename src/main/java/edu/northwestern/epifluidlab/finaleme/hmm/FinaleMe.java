@@ -218,6 +218,12 @@ public class FinaleMe {
 	@Option(name="-adaptTransitions",usage="also adapt transitions and pi (initial state probabilities) during Baum-Welch. Without this flag, transitions/pi are frozen to the reference model. The same -adaptLambda regularization is applied. Default: false")
 	public boolean adaptTransitions = false;
 
+	@Option(name="-autoTuneBayesianFactor",usage="auto-tune bayesianFactor from sample-specific prior-vs-emission concordance. Low concordance (prior disagrees with HMM) -> low bayesianFactor; high concordance -> high bayesianFactor. Overrides -bayesianFactor after adaptation. Default: false")
+	public boolean autoTuneBayesianFactor = false;
+
+	@Option(name="-autoTuneSampleFragments",usage="number of random fragments to sample for -autoTuneBayesianFactor. Default: 10000")
+	public int autoTuneSampleFragments = 10000;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -2629,6 +2635,9 @@ public class FinaleMe {
 		if(adaptTransitions && !adaptEmissionOnly){
 			throw new IllegalArgumentException("-adaptTransitions requires -adaptEmissionOnly");
 		}
+		if(autoTuneBayesianFactor && !adaptEmissionOnly){
+			throw new IllegalArgumentException("-autoTuneBayesianFactor requires -adaptEmissionOnly");
+		}
 	}
 
 	private void finish(){
@@ -3158,6 +3167,20 @@ public class FinaleMe {
 		this.methylatedState = adaptedHmm.getMethyState(lowCoverage);
 		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
 		adaptedHmm.setMinCpgNum(1);
+
+		// Auto-tune bayesianFactor based on prior-vs-emission concordance in the
+		// adapted model. If the HMM's emission-driven posterior closely matches
+		// the prior, the prior is a good match -> high bayesianFactor (trust prior).
+		// If they disagree, the prior is biased for this sample -> low bayesianFactor
+		// (trust the HMM more). Output is clipped to [0.05, 0.9].
+		if (autoTuneBayesianFactor) {
+			double tunedFactor = computeAutoTunedBayesianFactor(adaptedHmm, matrix, autoTuneSampleFragments);
+			log.info("Auto-tuned bayesianFactor: " + String.format("%.4f", tunedFactor) +
+					 " (was " + bayesianFactor + ")");
+			this.bayesianFactor = tunedFactor;
+			adaptedHmm.setBayesianFactor(tunedFactor);
+		}
+
 		System.out.println("Adapted HMM:\n" + adaptedHmm);
 
 		// Write adapted model to a temp file for decodeHmm (which reloads from disk).
@@ -3299,6 +3322,84 @@ public class FinaleMe {
 	 * normalized using its own mean/sd, so the reference GMM parameters
 	 * are in a different coordinate system than the target data.
 	 */
+	/**
+	 * Auto-tune bayesianFactor based on sample-specific concordance between
+	 * the HMM's emission-only posterior and the methylation prior.
+	 *
+	 * For each sampled CpG:
+	 *   emission_posterior(methylated) = P(obs | methylated) / (P(obs | methy) + P(obs | unmethy))
+	 *   prior_methylated = cpgDistState.getSecond()     (already in [0, 1] after parseLine/100)
+	 *   diff = |emission_posterior − prior_methylated|
+	 *
+	 * Average |diff| over all sampled CpGs in [0, 1]:
+	 *   diff = 0   -> perfect agreement -> full trust in prior (bayesianFactor=0.9)
+	 *   diff = 0.5 -> max disagreement   -> ignore prior        (bayesianFactor=0.05)
+	 *
+	 * Linear mapping clipped to [0.05, 0.9]:
+	 *   bayesianFactor = clip(0.9 - 1.7 * diff, 0.05, 0.9)
+	 */
+	private double computeAutoTunedBayesianFactor(
+			BayesianNhmmV5<ObservationVector> adaptedHmm,
+			List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix,
+			int sampleSize) {
+		if (matrix.isEmpty()) {
+			log.warn("Empty matrix for auto-tune; defaulting bayesianFactor to 0.5");
+			return 0.5;
+		}
+		int methyState = adaptedHmm.getMethyState(lowCoverage);
+		int unmethyState = 1 - methyState;
+
+		// Reservoir-sample up to sampleSize fragments
+		java.util.Random rng = seed >= 0 ? new java.util.Random(seed + 1) : new java.util.Random();
+		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> sampled;
+		if (matrix.size() <= sampleSize) {
+			sampled = matrix;
+		} else {
+			sampled = new ArrayList<>(sampleSize);
+			for (int i = 0; i < matrix.size(); i++) {
+				if (i < sampleSize) {
+					sampled.add(matrix.get(i));
+				} else {
+					int j = rng.nextInt(i + 1);
+					if (j < sampleSize) sampled.set(j, matrix.get(i));
+				}
+			}
+		}
+
+		double sumAbsDiff = 0.0;
+		long nCpGs = 0;
+		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> frag : sampled) {
+			HashMap<Integer, Pair<Integer, Double>> cpgDistState = frag.getFirst();
+			List<ObservationVector> obsSeq = frag.getSecond();
+			for (int i = 0; i < obsSeq.size(); i++) {
+				ObservationVector obs = obsSeq.get(i);
+				double pM = adaptedHmm.getOpdfProb(methyState, obs);
+				double pU = adaptedHmm.getOpdfProb(unmethyState, obs);
+				double denom = pM + pU;
+				if (denom <= 0 || Double.isNaN(denom) || Double.isInfinite(denom)) continue;
+				double emissionPosteriorM = pM / denom;
+				Pair<Integer, Double> cpg = cpgDistState.get(i);
+				if (cpg == null) continue;
+				double priorM = cpg.getSecond();
+				if (Double.isNaN(priorM) || priorM < 0 || priorM > 1) continue;
+				sumAbsDiff += Math.abs(emissionPosteriorM - priorM);
+				nCpGs++;
+			}
+		}
+		if (nCpGs == 0) {
+			log.warn("No valid CpGs sampled for auto-tune; defaulting bayesianFactor to 0.5");
+			return 0.5;
+		}
+		double meanAbsDiff = sumAbsDiff / nCpGs;
+		double tuned = 0.9 - 1.7 * meanAbsDiff;
+		if (tuned < 0.05) tuned = 0.05;
+		if (tuned > 0.9) tuned = 0.9;
+		log.info("Auto-tune concordance check: " + nCpGs + " CpGs sampled, " +
+				 "mean |emission_posterior − prior| = " + String.format("%.4f", meanAbsDiff) +
+				 " -> bayesianFactor = " + String.format("%.4f", tuned));
+		return tuned;
+	}
+
 	private void recenterEmissions(BayesianNhmmV5<ObservationVector> hmm,
 								   double[][] refNormStats,
 								   SummaryStatistics[] targetStats) {
