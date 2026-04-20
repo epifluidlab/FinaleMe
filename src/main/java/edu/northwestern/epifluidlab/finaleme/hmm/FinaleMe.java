@@ -3366,8 +3366,8 @@ public class FinaleMe {
 			}
 		}
 
-		double sumAbsDiff = 0.0;
-		long nCpGs = 0;
+		// Collect paired (emission_posterior, prior) per CpG
+		ArrayList<double[]> pairs = new ArrayList<>();
 		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> frag : sampled) {
 			HashMap<Integer, Pair<Integer, Double>> cpgDistState = frag.getFirst();
 			List<ObservationVector> obsSeq = frag.getSecond();
@@ -3382,21 +3382,100 @@ public class FinaleMe {
 				if (cpg == null) continue;
 				double priorM = cpg.getSecond();
 				if (Double.isNaN(priorM) || priorM < 0 || priorM > 1) continue;
-				sumAbsDiff += Math.abs(emissionPosteriorM - priorM);
-				nCpGs++;
+				pairs.add(new double[]{emissionPosteriorM, priorM});
 			}
 		}
-		if (nCpGs == 0) {
+		if (pairs.isEmpty()) {
 			log.warn("No valid CpGs sampled for auto-tune; defaulting bayesianFactor to 0.5");
 			return 0.5;
 		}
-		double meanAbsDiff = sumAbsDiff / nCpGs;
-		double tuned = 0.9 - 1.7 * meanAbsDiff;
+
+		// Observed mean absolute difference
+		double sumAbsDiff = 0.0;
+		for (double[] p : pairs) sumAbsDiff += Math.abs(p[0] - p[1]);
+		double meanAbsDiff = sumAbsDiff / pairs.size();
+
+		// Pearson correlation between emission_posterior and prior
+		double meanE = 0, meanP = 0;
+		for (double[] p : pairs) { meanE += p[0]; meanP += p[1]; }
+		meanE /= pairs.size();
+		meanP /= pairs.size();
+		double covEP = 0, varE = 0, varP = 0;
+		for (double[] p : pairs) {
+			double de = p[0] - meanE;
+			double dp = p[1] - meanP;
+			covEP += de * dp;
+			varE += de * de;
+			varP += dp * dp;
+		}
+		double pearsonR = (varE > 0 && varP > 0) ? covEP / Math.sqrt(varE * varP) : 0.0;
+
+		// Permutation test p-value for the trust hypothesis:
+		// H0: prior matches the sample (low mean_abs_diff is expected under random pairing too).
+		// H1: prior matches specifically BETTER than random (low diff is significant).
+		// Under H0, if we shuffle the prior labels across CpGs, we should see similar diff.
+		// Under H1 (prior matches), shuffled diff would be LARGER.
+		//
+		// We permute the prior column B times, compute each permutation's mean abs diff,
+		// and compute p = fraction of permutations with diff <= observed diff.
+		//   Small p (e.g. <0.05) -> observed diff is significantly smaller than random
+		//                         -> prior is informative for this sample -> trust it.
+		//   Large p              -> observed diff is indistinguishable from random
+		//                         -> prior is uninformative/biased        -> distrust it.
+		final int B = 200;
+		double[] shuffledDiffs = new double[B];
+		int n = pairs.size();
+		// Extract prior column once
+		double[] priorArr = new double[n];
+		double[] emissionArr = new double[n];
+		for (int i = 0; i < n; i++) {
+			emissionArr[i] = pairs.get(i)[0];
+			priorArr[i] = pairs.get(i)[1];
+		}
+		// Fisher-Yates shuffle buffer
+		int[] idx = new int[n];
+		for (int i = 0; i < n; i++) idx[i] = i;
+		int smallerOrEqual = 0;
+		for (int b = 0; b < B; b++) {
+			// Fisher-Yates on idx
+			for (int i = n - 1; i > 0; i--) {
+				int j = rng.nextInt(i + 1);
+				int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+			}
+			double s = 0;
+			for (int i = 0; i < n; i++) s += Math.abs(emissionArr[i] - priorArr[idx[i]]);
+			shuffledDiffs[b] = s / n;
+			if (shuffledDiffs[b] <= meanAbsDiff) smallerOrEqual++;
+		}
+		double pValue = (double)(smallerOrEqual + 1) / (B + 1);
+
+		// Map concordance to bayesianFactor: prior is trusted when p is small
+		// AND mean_abs_diff is small (both indicate real prior-sample agreement).
+		// Scale factor: use (1 - pValue) × concordance_weight
+		//   pValue ≤ 0.05 and mean_abs_diff ≤ 0.15 → strong prior signal → bayesianFactor = 0.9
+		//   pValue large or mean_abs_diff ≥ 0.4    → prior noisy/wrong   → bayesianFactor = 0.05
+		double concordanceWeight = Math.max(0.0, Math.min(1.0, (1.0 - pValue)));
+		double diffWeight = Math.max(0.0, Math.min(1.0, 1.0 - 1.7 * meanAbsDiff));
+		double tuned = 0.05 + 0.85 * concordanceWeight * diffWeight;
 		if (tuned < 0.05) tuned = 0.05;
 		if (tuned > 0.9) tuned = 0.9;
-		log.info("Auto-tune concordance check: " + nCpGs + " CpGs sampled, " +
-				 "mean |emission_posterior − prior| = " + String.format("%.4f", meanAbsDiff) +
-				 " -> bayesianFactor = " + String.format("%.4f", tuned));
+
+		log.info("Auto-tune concordance: " + n + " CpGs, " +
+				 "mean |emission − prior| = " + String.format("%.4f", meanAbsDiff) +
+				 ", Pearson r = " + String.format("%.4f", pearsonR) +
+				 ", permutation p-value = " + String.format("%.4g", pValue) +
+				 " (B=" + B + ")");
+		log.info("Auto-tune components: concordance_weight=(1-p)=" +
+				 String.format("%.4f", concordanceWeight) +
+				 ", diff_weight=max(0,1-1.7*d)=" + String.format("%.4f", diffWeight) +
+				 " -> bayesianFactor=0.05+0.85*cw*dw=" + String.format("%.4f", tuned));
+		if (pValue > 0.05) {
+			log.warn("Permutation p-value > 0.05: prior appears UNINFORMATIVE for this sample " +
+					 "(emission-prior agreement is indistinguishable from random). " +
+					 "Consider using a sample-appropriate -valueWigs track.");
+		} else if (pValue < 0.01 && meanAbsDiff < 0.15) {
+			log.info("Prior is HIGHLY INFORMATIVE (p<0.01, low diff); bayesianFactor tuned toward 0.9.");
+		}
 		return tuned;
 	}
 
