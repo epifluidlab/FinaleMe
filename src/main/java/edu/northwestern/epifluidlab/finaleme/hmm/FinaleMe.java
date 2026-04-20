@@ -215,6 +215,9 @@ public class FinaleMe {
 	@Option(name="-adaptReinitGmm",usage="re-initialize emission GMM on the target data before constrained Baum-Welch. Escapes the reference-model local optimum so emissions reflect the target distribution. Combine with -adaptLambda 0 for full emission retraining. Default: false")
 	public boolean adaptReinitGmm = false;
 
+	@Option(name="-adaptTransitions",usage="also adapt transitions and pi (initial state probabilities) during Baum-Welch. Without this flag, transitions/pi are frozen to the reference model. The same -adaptLambda regularization is applied. Default: false")
+	public boolean adaptTransitions = false;
+
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
 
@@ -2573,6 +2576,9 @@ public class FinaleMe {
 		if(adaptReinitGmm && !adaptEmissionOnly){
 			throw new IllegalArgumentException("-adaptReinitGmm requires -adaptEmissionOnly");
 		}
+		if(adaptTransitions && !adaptEmissionOnly){
+			throw new IllegalArgumentException("-adaptTransitions requires -adaptEmissionOnly");
+		}
 	}
 
 	private void finish(){
@@ -2855,12 +2861,31 @@ public class FinaleMe {
 		// Full BW iteration (updates everything: transitions, pi, emissions)
 		BayesianNhmmV5<ObservationVector> updatedHmm = bwl.iterate(currentHmm, sequences);
 
-		// Restore frozen transitions and pi from reference model
-		for (int r = 0; r <= refHmm.nbCpgDistState(); r++) {
-			for (int i = 0; i < refHmm.nbStates(); i++) {
-				updatedHmm.setPri(r, i, refHmm.getPri(r, i));
-				for (int j = 0; j < refHmm.nbStates(); j++) {
-					updatedHmm.setArij(r, i, j, refHmm.getArij(r, i, j));
+		if (adaptTransitions) {
+			// Regularize transitions and pi toward reference:
+			// new = (1 - lambda) * MLE + lambda * ref
+			// Both pi and Arij are probability distributions, so the interpolation
+			// preserves the sum-to-1 property (both inputs sum to 1).
+			for (int r = 0; r <= refHmm.nbCpgDistState(); r++) {
+				for (int i = 0; i < refHmm.nbStates(); i++) {
+					double mlePi = updatedHmm.getPri(r, i);
+					double refPi = refHmm.getPri(r, i);
+					updatedHmm.setPri(r, i, (1 - lambda) * mlePi + lambda * refPi);
+					for (int j = 0; j < refHmm.nbStates(); j++) {
+						double mleA = updatedHmm.getArij(r, i, j);
+						double refA = refHmm.getArij(r, i, j);
+						updatedHmm.setArij(r, i, j, (1 - lambda) * mleA + lambda * refA);
+					}
+				}
+			}
+		} else {
+			// Freeze transitions and pi: restore reference values
+			for (int r = 0; r <= refHmm.nbCpgDistState(); r++) {
+				for (int i = 0; i < refHmm.nbStates(); i++) {
+					updatedHmm.setPri(r, i, refHmm.getPri(r, i));
+					for (int j = 0; j < refHmm.nbStates(); j++) {
+						updatedHmm.setArij(r, i, j, refHmm.getArij(r, i, j));
+					}
 				}
 			}
 		}
@@ -2934,8 +2959,9 @@ public class FinaleMe {
 		}
 
 		// Phase 3: Constrained Baum-Welch adaptation
-		log.info("Phase 3: Constrained Baum-Welch emission adaptation (lambda=" + adaptLambda +
-				 ", maxIter=" + adaptMaxIter + ") ...");
+		log.info("Phase 3: Baum-Welch adaptation (lambda=" + adaptLambda +
+				 ", maxIter=" + adaptMaxIter +
+				 ", transitions=" + (adaptTransitions ? "ADAPTED" : "FROZEN") + ") ...");
 
 		logEmissionParams("REFERENCE MODEL (before adaptation)", refHmm);
 
