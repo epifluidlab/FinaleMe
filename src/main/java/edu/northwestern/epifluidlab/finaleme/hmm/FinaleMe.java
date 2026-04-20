@@ -650,6 +650,20 @@ public class FinaleMe {
 	}
 	
 	private MatrixObj processMatrixFile(String matrixFile) throws FileNotFoundException, IOException, FileFormatException{
+		return processMatrixFile(matrixFile, false);
+	}
+
+	/**
+	 * Process matrix file for adaptation/training.
+	 *
+	 * @param matrixFile Input feature matrix (possibly bgzipped).
+	 * @param minimalForAdaptation When true, skip building the auxiliary structures
+	 *   (matrixU, matrixM, pi, a, matrixObserved, cpgDistFreq) that are only used
+	 *   by the normal training's random/GMM initialization paths. The adaptation
+	 *   path uses only the assembled `matrix` list, so skipping these saves a
+	 *   second full copy of observation vector references (~12-20 GB at 30X WGS).
+	 */
+	private MatrixObj processMatrixFile(String matrixFile, boolean minimalForAdaptation) throws FileNotFoundException, IOException, FileFormatException{
 		ArrayList<Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>> matrix = new ArrayList<Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>>>();
 		HashMap<String, TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>> matrixProcess = new HashMap<String, TreeMap<Integer, Triple<String, ObservationVector, Pair<String, Double>>>>();
 		ArrayList<Pair<Integer, Double>> cpgDistFreq = new ArrayList<Pair<Integer, Double>>();
@@ -877,6 +891,11 @@ public class FinaleMe {
 		log.info("Pass 2 done: " + points + " points loaded, " + skippedRows + " rows skipped");
 			log.info("Number of point in total is loaded : " + points);
 
+			// Auxiliary structures populated below; they are only consumed by
+			// the normal training's random/GMM initialization and the final
+			// decode bookkeeping. When minimalForAdaptation is true we keep
+			// them empty to avoid a second copy of observation vector refs
+			// (~12-20 GB at 30X WGS).
 			ArrayList<ObservationVector> matrixU = new ArrayList<ObservationVector>();
 			ArrayList<ObservationVector> matrixM = new ArrayList<ObservationVector>();
 			ArrayList<ArrayList<Integer>> matrixObserved = new ArrayList<ArrayList<Integer>>();
@@ -925,6 +944,18 @@ public class FinaleMe {
 				}
 				if(matrixRow.size() >= miniDataPoints && matrixRow.size() <= maxCpgs){
 					matrix.add(Triple.of(cpgDistRow, matrixRow, locRow));
+					// Skip the expensive per-CpG bookkeeping when only the assembled
+					// matrix is needed (adaptation path).
+					if (minimalForAdaptation) {
+						double cpgDenseMinimal = (double) matrixRow.size();
+						if (cpgDenseMinimal > observedMaxCpgNum) {
+							observedMaxCpgNum = cpgDenseMinimal;
+						}
+						if (cpgNumClip < 0 && cpgDenseMinimal > this.maxCpgNum) {
+							this.maxCpgNum = cpgDenseMinimal;
+						}
+						continue; // skip matrixU/M/pi/aij/observed population
+					}
 					ArrayList<Integer> matrixRowObserved = new ArrayList<Integer>();
 					for(int i = 0; i < offsets.length; i++){
 						if(i==0 && offsets[0] < 0){
@@ -2951,9 +2982,10 @@ public class FinaleMe {
 		int adaptMiniDataPoints = Math.max(miniDataPoints, 2);
 		int savedMiniDataPoints = miniDataPoints;
 		miniDataPoints = adaptMiniDataPoints;
-		log.info("Loading data for adaptation (miniDataPoints=" + adaptMiniDataPoints + ") ...");
-		MatrixObj matrixObj = processMatrixFile(inputFile);
+		log.info("Loading data for adaptation (miniDataPoints=" + adaptMiniDataPoints + ", minimal mode) ...");
+		MatrixObj matrixObj = processMatrixFile(inputFile, /*minimalForAdaptation=*/ true);
 		miniDataPoints = savedMiniDataPoints; // restore original
+		// matrixU/M/pi/a/matrixObserved/cpgDistFreq are not populated in minimal mode
 		matrixObj.cpgDistFreq = null;
 
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix =
