@@ -1325,16 +1325,35 @@ public class FinaleMe {
 	 */
 	private void decodeOnlyStreaming(String inputFile, String modelFile, String outputFile,
 									CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception {
+		decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder, null);
+	}
+
+	/**
+	 * Streaming decode with optional pre-computed stats.
+	 * When {@code precomputedStats != null}, Pass 1 (collectStats) is skipped —
+	 * saving one full pass over the (large) bgzipped input when the caller
+	 * already computed the stats (e.g. adaptAndDecodeStreaming).
+	 */
+	private void decodeOnlyStreaming(String inputFile, String modelFile, String outputFile,
+									CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder,
+									SummaryStatistics[] precomputedStats) throws Exception {
 		System.out.println("\nStreaming decode-only mode ...\n");
 
 		// Load region/exclude intervals
 		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
 		HashMap<String, IntervalTree<Integer>> excludeLoc = loadIntervalFile(exclude);
 
-		// Phase 1: Collect stats for z-score normalization
-		log.info("Phase 1: Collecting feature statistics ...");
-		SummaryStatistics[] stats = collectStats(inputFile, overlapLoc, excludeLoc);
-		logFeatureStats(stats);
+		SummaryStatistics[] stats;
+		if (precomputedStats != null) {
+			log.info("Phase 1: Using pre-computed feature statistics (skipping file scan) ...");
+			stats = precomputedStats;
+			logFeatureStats(stats);
+		} else {
+			// Phase 1: Collect stats for z-score normalization
+			log.info("Phase 1: Collecting feature statistics ...");
+			stats = collectStats(inputFile, overlapLoc, excludeLoc);
+			logFeatureStats(stats);
+		}
 
 		// Load HMM model
 		BayesianNhmmV5<ObservationVector> hmm = loadHmmModel(modelFile);
@@ -2950,10 +2969,11 @@ public class FinaleMe {
 		if (matrix.size() < adaptMinFragments) {
 			log.warn("Only " + matrix.size() + " qualifying fragments (< " + adaptMinFragments +
 					 "); skipping adaptation, decoding with reference model directly.");
+			SummaryStatistics[] fallbackStats = lastComputedStats;
 			matrixObj = null;
 			matrix = null;
 			miniDataPoints = 1;
-			decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder);
+			decodeOnlyStreaming(inputFile, modelFile, outputFile, cpgIndex, chromOrder, fallbackStats);
 			miniDataPoints = savedMiniDataPoints;
 			return;
 		}
@@ -3132,10 +3152,13 @@ public class FinaleMe {
 		// Phase 4: Viterbi decode ALL fragments (miniDataPoints=1) using the
 		// adapted model via streaming decode. This outputs every fragment
 		// regardless of the -miniDataPoints used for adaptation training.
-		log.info("Phase 4: Streaming decode with adapted model (all fragments) ...");
+		// Pass the already-computed stats to skip a redundant file scan.
+		log.info("Phase 4: Streaming decode with adapted model (all fragments, reusing cached stats) ...");
 		int decodeMiniDataPoints = miniDataPoints;
 		miniDataPoints = 1;  // decode everything
-		decodeOnlyStreaming(inputFile, adaptedModelTmp.getAbsolutePath(), outputFile, cpgIndex, chromOrder);
+		SummaryStatistics[] cachedStats = lastComputedStats;
+		lastComputedStats = null; // free for GC
+		decodeOnlyStreaming(inputFile, adaptedModelTmp.getAbsolutePath(), outputFile, cpgIndex, chromOrder, cachedStats);
 		miniDataPoints = decodeMiniDataPoints;  // restore
 		adaptedModelTmp.delete();
 	}
