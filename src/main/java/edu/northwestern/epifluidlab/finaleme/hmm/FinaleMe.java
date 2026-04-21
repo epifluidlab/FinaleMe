@@ -194,8 +194,14 @@ public class FinaleMe {
 	@Option(name="-adaptEmissionOnly",usage="constrained Baum-Welch: freeze transitions/initiation, adapt emissions only. Requires -decodeModeOnly. Default: false")
 	public boolean adaptEmissionOnly = false;
 
-	@Option(name="-adaptLambda",usage="shrinkage regularization toward reference model (0=no regularization, 1=no adaptation). Default: 0.5")
+	@Option(name="-adaptLambda",usage="shrinkage regularization toward reference model (0=no regularization, 1=no adaptation). Default: 0.5. Ignored when -autoAdaptLambda is set.")
 	public double adaptLambda = 0.5;
+
+	@Option(name="-autoAdaptLambda",usage="auto-tune -adaptLambda based on qualifying fragment count via Bayesian shrinkage: lambda = 1 - N / (N + N0). Low coverage -> more regularization toward reference. Default: false")
+	public boolean autoAdaptLambda = false;
+
+	@Option(name="-autoAdaptLambdaN0",usage="characteristic fragment count for -autoAdaptLambda: at N=N0, lambda=0.5; at N >> N0, lambda->0; at N << N0, lambda->1. Default: 1000000 (~1M fragments for stable MLE of a 2-state 3-feature GMM with ~18 parameters)")
+	public long autoAdaptLambdaN0 = 1_000_000L;
 
 	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 5")
 	public int adaptMaxIter = 5;
@@ -2647,6 +2653,12 @@ public class FinaleMe {
 		if(autoTuneBayesianFactor && !adaptEmissionOnly){
 			throw new IllegalArgumentException("-autoTuneBayesianFactor requires -adaptEmissionOnly");
 		}
+		if(autoAdaptLambda && !adaptEmissionOnly){
+			throw new IllegalArgumentException("-autoAdaptLambda requires -adaptEmissionOnly");
+		}
+		if(autoAdaptLambda && autoAdaptLambdaN0 <= 0){
+			throw new IllegalArgumentException("-autoAdaptLambdaN0 must be positive");
+		}
 	}
 
 	private void finish(){
@@ -3028,8 +3040,24 @@ public class FinaleMe {
 			return;
 		}
 
+		// Auto-tune -adaptLambda via Bayesian shrinkage based on fragment count.
+		// Fewer fragments -> noisier MLE -> more regularization toward reference.
+		//   lambda = 1 - N / (N + N0)
+		// At N=N0: lambda=0.5. At N>>N0: lambda->0. At N<<N0: lambda->1.
+		if (autoAdaptLambda) {
+			long n = matrix.size();
+			double tunedLambda = 1.0 - (double) n / (double) (n + autoAdaptLambdaN0);
+			// Clip to [0.0, 0.95] so there's always at least some adaptation
+			if (tunedLambda < 0.0) tunedLambda = 0.0;
+			if (tunedLambda > 0.95) tunedLambda = 0.95;
+			log.info("Auto-adapt lambda: N=" + n + " qualifying fragments, N0=" + autoAdaptLambdaN0 +
+					 " -> lambda = 1 - " + n + "/(" + n + "+" + autoAdaptLambdaN0 + ") = " +
+					 String.format("%.4f", tunedLambda) + " (was " + adaptLambda + ")");
+			this.adaptLambda = tunedLambda;
+		}
+
 		// Phase 3: Constrained Baum-Welch adaptation
-		log.info("Phase 3: Baum-Welch adaptation (lambda=" + adaptLambda +
+		log.info("Phase 3: Baum-Welch adaptation (lambda=" + String.format("%.4f", adaptLambda) +
 				 ", maxIter=" + adaptMaxIter +
 				 ", transitions=" + (adaptTransitions ? "ADAPTED" : "FROZEN") + ") ...");
 
