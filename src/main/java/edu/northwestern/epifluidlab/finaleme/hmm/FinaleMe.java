@@ -197,11 +197,14 @@ public class FinaleMe {
 	@Option(name="-adaptLambda",usage="shrinkage regularization toward reference model (0=no regularization, 1=no adaptation). Default: 0.5. Ignored when -autoAdaptLambda is set.")
 	public double adaptLambda = 0.5;
 
-	@Option(name="-autoAdaptLambda",usage="auto-tune -adaptLambda based on qualifying fragment count via Bayesian shrinkage: lambda = 1 - N / (N + N0). Low coverage -> more regularization toward reference. Default: false")
+	@Option(name="-autoAdaptLambda",usage="auto-tune -adaptLambda based on qualifying fragment count via a generalized (Hill) shrinkage: lambda = 1 / (1 + (N/N0)^beta). Low coverage -> more regularization toward reference. Default: false")
 	public boolean autoAdaptLambda = false;
 
-	@Option(name="-autoAdaptLambdaN0",usage="characteristic fragment count for -autoAdaptLambda: at N=N0, lambda=0.5; at N >> N0, lambda->0; at N << N0, lambda->1. Default: 1000000 (~1M fragments for stable MLE of a 2-state 3-feature GMM with ~18 parameters)")
-	public long autoAdaptLambdaN0 = 1_000_000L;
+	@Option(name="-autoAdaptLambdaN0",usage="characteristic fragment count for -autoAdaptLambda: at N=N0, lambda=0.5. Default: 25000. With default beta=0.7, this gives lambda ~ 0.75 at 0.1X (5K), ~ 0.37 at 1X (53K), ~ 0.10 at 10X (530K), ~ 0.018 at 30X (6.3M).")
+	public long autoAdaptLambdaN0 = 25_000L;
+
+	@Option(name="-autoAdaptLambdaBeta",usage="curve steepness for -autoAdaptLambda: lambda = 1 / (1 + (N/N0)^beta). beta=1.0 reproduces the simple Bayesian shrinkage (linear in N). beta=0.7 (default) gives a gentle transition at low coverage (meaningful adaptation at 1X with ~53K fragments) while still strongly regularizing at 0.1X (~5K fragments, the effective noise floor for a 2-state 3-feature GMM). Larger beta -> sharper transition, smaller beta -> gentler.")
+	public double autoAdaptLambdaBeta = 0.7;
 
 	@Option(name="-autoTuneProbeLambda",usage="fixed lambda used for the 'signature probe' BW run that measures sample-vs-reference emission shift for -autoTuneBayesianFactor. Default: 0.0 (unregularized MLE -- maximum sample signature sensitivity). Decouples the shift signal from -autoAdaptLambda's decoding regularization. Set to a negative value to disable the probe and reuse the decoding-BW shift directly.")
 	public double autoTuneProbeLambda = 0.0;
@@ -2665,6 +2668,9 @@ public class FinaleMe {
 		if(autoAdaptLambda && autoAdaptLambdaN0 <= 0){
 			throw new IllegalArgumentException("-autoAdaptLambdaN0 must be positive");
 		}
+		if(autoAdaptLambda && autoAdaptLambdaBeta <= 0.0){
+			throw new IllegalArgumentException("-autoAdaptLambdaBeta must be positive");
+		}
 	}
 
 	private void finish(){
@@ -3046,18 +3052,27 @@ public class FinaleMe {
 			return;
 		}
 
-		// Auto-tune -adaptLambda via Bayesian shrinkage based on fragment count.
+		// Auto-tune -adaptLambda via generalized (Hill) Bayesian shrinkage based on fragment count.
 		// Fewer fragments -> noisier MLE -> more regularization toward reference.
-		//   lambda = 1 - N / (N + N0)
+		//   lambda = 1 / (1 + (N/N0)^beta)
 		// At N=N0: lambda=0.5. At N>>N0: lambda->0. At N<<N0: lambda->1.
+		// beta=1.0 recovers the simple Bayesian shrinkage 1 - N/(N+N0).
+		// Defaults (beta=0.7, N0=25K) produce:
+		//   0.1X (5K)    -> lambda ~ 0.75 (strong reg, noise floor for 2-state 3-feature GMM)
+		//   1X   (53K)   -> lambda ~ 0.37 (meaningful adaptation; prior does not dominate)
+		//   10X  (530K)  -> lambda ~ 0.10 (light reg; sample signature dominates)
+		//   30X  (6.3M)  -> lambda ~ 0.018 (near-unregularized MLE)
 		if (autoAdaptLambda) {
 			long n = matrix.size();
-			double tunedLambda = 1.0 - (double) n / (double) (n + autoAdaptLambdaN0);
+			double ratio = (double) n / (double) autoAdaptLambdaN0;
+			double tunedLambda = 1.0 / (1.0 + Math.pow(ratio, autoAdaptLambdaBeta));
 			// Clip to [0.0, 0.95] so there's always at least some adaptation
 			if (tunedLambda < 0.0) tunedLambda = 0.0;
 			if (tunedLambda > 0.95) tunedLambda = 0.95;
 			log.info("Auto-adapt lambda: N=" + n + " qualifying fragments, N0=" + autoAdaptLambdaN0 +
-					 " -> lambda = 1 - " + n + "/(" + n + "+" + autoAdaptLambdaN0 + ") = " +
+					 ", beta=" + String.format("%.3f", autoAdaptLambdaBeta) +
+					 " -> lambda = 1 / (1 + (" + n + "/" + autoAdaptLambdaN0 + ")^" +
+					 String.format("%.3f", autoAdaptLambdaBeta) + ") = " +
 					 String.format("%.4f", tunedLambda) + " (was " + adaptLambda + ")");
 			this.adaptLambda = tunedLambda;
 		}
@@ -3237,11 +3252,10 @@ public class FinaleMe {
 		// adapted emissions look ~= reference regardless of sample type.
 		// This artificially hides the sample signature from the shift metric.
 		//
-		// Solution: run a short "signature probe" BW with a FIXED moderate
-		// lambda (autoTuneProbeLambda, default 0.2) to produce a probe model
-		// that preserves the sample signature while still filtering some
-		// MLE noise. Measure shift from the probe, not from the heavily-
-		// regularized decoding model.
+		// Solution: run a short "signature probe" BW with a FIXED low
+		// lambda (autoTuneProbeLambda, default 0.0 = unregularized MLE)
+		// to preserve the sample signature. Measure shift from the probe,
+		// not from the heavily-regularized decoding model.
 		if (autoTuneBayesianFactor) {
 			BayesianNhmmV5<ObservationVector> shiftSourceHmm;
 			// Run unregularized probe BW whenever decoding BW is regularized
