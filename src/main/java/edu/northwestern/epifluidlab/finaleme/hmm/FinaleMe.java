@@ -3191,7 +3191,12 @@ public class FinaleMe {
 				throw new RuntimeException("Failed to clone HMM at iteration " + iter, e);
 			}
 
-			adaptedHmm = adaptIteration(adaptedHmm, refHmmForAdapt, matrix, adaptLambda);
+			// Regularize toward the PRISTINE re-centered reference, NOT
+			// refHmmForAdapt (which has its emissions replaced with GMM-init
+			// when -adaptReinitGmm is set). Using GMM-init as the reg target
+			// defeats lambda's purpose: BW would just stay near GMM-init
+			// regardless of lambda since GMM-init is already target-data-fit.
+			adaptedHmm = adaptIteration(adaptedHmm, refHmmPristine, matrix, adaptLambda);
 
 			distance = klc.distance(prevHmm, adaptedHmm, true);
 			log.info("Adaptation iteration " + (iter + 1) + ": KL distance = " + distance);
@@ -3199,8 +3204,8 @@ public class FinaleMe {
 
 			if (Double.isNaN(distance)) {
 				log.warn("KL distance is NaN at iteration " + (iter + 1) +
-						 "; falling back to reference model.");
-				adaptedHmm = refHmmForAdapt;
+						 "; falling back to pristine re-centered reference model.");
+				adaptedHmm = refHmmPristine;
 				break;
 			}
 			if (Math.abs(distance) < tol) {
