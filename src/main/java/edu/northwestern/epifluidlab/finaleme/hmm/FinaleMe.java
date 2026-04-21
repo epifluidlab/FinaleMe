@@ -82,8 +82,8 @@ public class FinaleMe {
 	@Option(name="-features",usage="number of features for each observation, default: 3")
 	public int features = 3;
 	
-	@Option(name="-tol",usage="tolerence level for the converge, default: 1e-4")
-	public double tol = 1e-4;
+	@Option(name="-tol",usage="tolerence level for the converge, default: 1e-5")
+	public double tol = 1e-5;
 	
 	@Option(name="-decayRate",usage="distance changes less than decayRate, default: 0.01")
 	public double decayRate = 0.01;
@@ -209,8 +209,8 @@ public class FinaleMe {
 	@Option(name="-autoTuneProbeMaxIter",usage="max iterations for the signature probe BW. Default: 20 (needs more at lambda=0 to fully converge the MLE). Usually converges in 5-10 iter.")
 	public int autoTuneProbeMaxIter = 20;
 
-	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 5")
-	public int adaptMaxIter = 5;
+	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 50")
+	public int adaptMaxIter = 50;
 
 	@Option(name="-adaptMinFragments",usage="minimum fragments with >= miniDataPoints CpGs to attempt adaptation; below this, use reference model directly. Default: 1000")
 	public int adaptMinFragments = 1000;
@@ -239,11 +239,11 @@ public class FinaleMe {
 	@Option(name="-autoTuneScale",usage="[deprecated; use -autoTuneMidpoint/-autoTuneSteepness] legacy linear scale factor. Kept only for backward compatibility; ignored when -autoTuneMidpoint is non-zero. Default: 1.5")
 	public double autoTuneScale = 1.5;
 
-	@Option(name="-autoTuneMidpoint",usage="emission shift (in z-score sd) at which bayesianFactor is halfway between 0.05 and 0.9. The sigmoid transitions sharply around this value. Default: 0.55 (calibrated from observed healthy ~0.37 sd vs disease ~0.72 sd shifts)")
-	public double autoTuneMidpoint = 0.55;
+	@Option(name="-autoTuneMidpoint",usage="emission shift (in z-score sd) at which bayesianFactor is halfway between 0.05 and 0.9. The sigmoid transitions sharply around this value. Default: 0.60 (calibrated from observed healthy vs disease shifts using unregularized signature probe)")
+	public double autoTuneMidpoint = 0.60;
 
-	@Option(name="-autoTuneSteepness",usage="sigmoid steepness: higher = sharper transition between trust-prior and distrust-prior regimes. Default: 15.0")
-	public double autoTuneSteepness = 15.0;
+	@Option(name="-autoTuneSteepness",usage="sigmoid steepness: higher = sharper transition between trust-prior and distrust-prior regimes. Default: 20.0")
+	public double autoTuneSteepness = 20.0;
 
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
