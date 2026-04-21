@@ -221,8 +221,11 @@ public class FinaleMe {
 	@Option(name="-autoTuneBayesianFactor",usage="auto-tune bayesianFactor from sample-specific prior-vs-emission concordance. Low concordance (prior disagrees with HMM) -> low bayesianFactor; high concordance -> high bayesianFactor. Overrides -bayesianFactor after adaptation. Default: false")
 	public boolean autoTuneBayesianFactor = false;
 
-	@Option(name="-autoTuneSampleFragments",usage="number of random fragments to sample for -autoTuneBayesianFactor. Default: 10000")
+	@Option(name="-autoTuneSampleFragments",usage="[deprecated: kept for compatibility] number of random fragments to sample. No longer used. Default: 10000")
 	public int autoTuneSampleFragments = 10000;
+
+	@Option(name="-autoTuneScale",usage="scale factor for the linear mapping from emission shift to bayesianFactor: bayesianFactor = clip(0.9 - scale * shift, 0.05, 0.9). Larger scale -> more aggressive distrust of prior when emissions differ from reference. Default: 1.5")
+	public double autoTuneScale = 1.5;
 
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -3168,13 +3171,13 @@ public class FinaleMe {
 		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
 		adaptedHmm.setMinCpgNum(1);
 
-		// Auto-tune bayesianFactor based on prior-vs-emission concordance in the
-		// adapted model. If the HMM's emission-driven posterior closely matches
-		// the prior, the prior is a good match -> high bayesianFactor (trust prior).
-		// If they disagree, the prior is biased for this sample -> low bayesianFactor
-		// (trust the HMM more). Output is clipped to [0.05, 0.9].
+		// Auto-tune bayesianFactor based on HOW MUCH the HMM emissions moved
+		// from the (re-centered) reference during adaptation. Small movement
+		// means this sample looks like healthy -> trust the healthy prior.
+		// Large movement means the sample differs from healthy -> distrust the
+		// prior. Output is clipped to [0.05, 0.9].
 		if (autoTuneBayesianFactor) {
-			double tunedFactor = computeAutoTunedBayesianFactor(adaptedHmm, matrix, autoTuneSampleFragments);
+			double tunedFactor = computeAutoTunedBayesianFactor(refHmmForAdapt, adaptedHmm, klc, autoTuneScale);
 			log.info("Auto-tuned bayesianFactor: " + String.format("%.4f", tunedFactor) +
 					 " (was " + bayesianFactor + ")");
 			this.bayesianFactor = tunedFactor;
@@ -3323,158 +3326,83 @@ public class FinaleMe {
 	 * are in a different coordinate system than the target data.
 	 */
 	/**
-	 * Auto-tune bayesianFactor based on sample-specific concordance between
-	 * the HMM's emission-only posterior and the methylation prior.
+	 * Auto-tune bayesianFactor based on emission-distribution shift between
+	 * the reference HMM (re-centered into target z-score space) and the
+	 * adapted HMM. Uses model parameters directly, not per-CpG posteriors,
+	 * which are noisy at sparse coverage.
 	 *
-	 * For each sampled CpG:
-	 *   emission_posterior(methylated) = P(obs | methylated) / (P(obs | methy) + P(obs | unmethy))
-	 *   prior_methylated = cpgDistState.getSecond()     (already in [0, 1] after parseLine/100)
-	 *   diff = |emission_posterior − prior_methylated|
+	 * Primary metric: max over states of ||adapted_mean[s] - ref_mean[s]||
+	 *   (L2 distance in feature space, in z-score units)
+	 *   Small shift -> sample looks like reference (healthy) -> trust prior
+	 *   Large shift -> sample differs from reference -> distrust prior
 	 *
-	 * Average |diff| over all sampled CpGs in [0, 1]:
-	 *   diff = 0   -> perfect agreement -> full trust in prior (bayesianFactor=0.9)
-	 *   diff = 0.5 -> max disagreement   -> ignore prior        (bayesianFactor=0.05)
+	 * Mapping: bayesianFactor = clip(0.9 - autoTuneScale * shift, 0.05, 0.9)
+	 * With default autoTuneScale=1.5:
+	 *   shift = 0    -> 0.90 (full trust)
+	 *   shift = 0.1  -> 0.75
+	 *   shift = 0.3  -> 0.45
+	 *   shift = 0.5  -> 0.15
+	 *   shift >= 0.57 -> 0.05 (ignore prior)
 	 *
-	 * Linear mapping clipped to [0.05, 0.9]:
-	 *   bayesianFactor = clip(0.9 - 1.7 * diff, 0.05, 0.9)
+	 * Secondary diagnostic: KL divergence between reference and adapted
+	 * HMMs on the target's own observation sequences. Not used for tuning;
+	 * logged for interpretation.
 	 */
 	private double computeAutoTunedBayesianFactor(
+			BayesianNhmmV5<ObservationVector> refHmm,
 			BayesianNhmmV5<ObservationVector> adaptedHmm,
-			List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix,
-			int sampleSize) {
-		if (matrix.isEmpty()) {
-			log.warn("Empty matrix for auto-tune; defaulting bayesianFactor to 0.5");
-			return 0.5;
-		}
-		int methyState = adaptedHmm.getMethyState(lowCoverage);
-		int unmethyState = 1 - methyState;
-
-		// Reservoir-sample up to sampleSize fragments
-		java.util.Random rng = seed >= 0 ? new java.util.Random(seed + 1) : new java.util.Random();
-		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> sampled;
-		if (matrix.size() <= sampleSize) {
-			sampled = matrix;
-		} else {
-			sampled = new ArrayList<>(sampleSize);
-			for (int i = 0; i < matrix.size(); i++) {
-				if (i < sampleSize) {
-					sampled.add(matrix.get(i));
-				} else {
-					int j = rng.nextInt(i + 1);
-					if (j < sampleSize) sampled.set(j, matrix.get(i));
-				}
+			KullbackLeiblerDistanceBayesianNhmmV5Calculator klc,
+			double scale) {
+		int nStates = refHmm.nbStates();
+		double maxShift = 0.0;
+		double[] perStateShift = new double[nStates];
+		for (int s = 0; s < nStates; s++) {
+			double[] refMean = ((OpdfMultiMixtureGaussian) refHmm.getOpdf(s)).mean();
+			double[] adpMean = ((OpdfMultiMixtureGaussian) adaptedHmm.getOpdf(s)).mean();
+			double sumSq = 0;
+			int d = Math.min(refMean.length, adpMean.length);
+			for (int k = 0; k < d; k++) {
+				double diff = adpMean[k] - refMean[k];
+				sumSq += diff * diff;
 			}
+			double shift = Math.sqrt(sumSq);
+			perStateShift[s] = shift;
+			if (shift > maxShift) maxShift = shift;
 		}
 
-		// Collect paired (emission_posterior, prior) per CpG
-		ArrayList<double[]> pairs = new ArrayList<>();
-		for (Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>> frag : sampled) {
-			HashMap<Integer, Pair<Integer, Double>> cpgDistState = frag.getFirst();
-			List<ObservationVector> obsSeq = frag.getSecond();
-			for (int i = 0; i < obsSeq.size(); i++) {
-				ObservationVector obs = obsSeq.get(i);
-				double pM = adaptedHmm.getOpdfProb(methyState, obs);
-				double pU = adaptedHmm.getOpdfProb(unmethyState, obs);
-				double denom = pM + pU;
-				if (denom <= 0 || Double.isNaN(denom) || Double.isInfinite(denom)) continue;
-				double emissionPosteriorM = pM / denom;
-				Pair<Integer, Double> cpg = cpgDistState.get(i);
-				if (cpg == null) continue;
-				double priorM = cpg.getSecond();
-				if (Double.isNaN(priorM) || priorM < 0 || priorM > 1) continue;
-				pairs.add(new double[]{emissionPosteriorM, priorM});
-			}
-		}
-		if (pairs.isEmpty()) {
-			log.warn("No valid CpGs sampled for auto-tune; defaulting bayesianFactor to 0.5");
-			return 0.5;
+		// Also compute KL divergence as a supplementary diagnostic
+		double klDist = Double.NaN;
+		try {
+			klDist = klc.distance(refHmm, adaptedHmm, true);
+		} catch (Exception e) {
+			log.info("KL divergence computation failed (non-fatal): " + e.getMessage());
 		}
 
-		// Observed mean absolute difference
-		double sumAbsDiff = 0.0;
-		for (double[] p : pairs) sumAbsDiff += Math.abs(p[0] - p[1]);
-		double meanAbsDiff = sumAbsDiff / pairs.size();
-
-		// Pearson correlation between emission_posterior and prior
-		double meanE = 0, meanP = 0;
-		for (double[] p : pairs) { meanE += p[0]; meanP += p[1]; }
-		meanE /= pairs.size();
-		meanP /= pairs.size();
-		double covEP = 0, varE = 0, varP = 0;
-		for (double[] p : pairs) {
-			double de = p[0] - meanE;
-			double dp = p[1] - meanP;
-			covEP += de * dp;
-			varE += de * de;
-			varP += dp * dp;
-		}
-		double pearsonR = (varE > 0 && varP > 0) ? covEP / Math.sqrt(varE * varP) : 0.0;
-
-		// Permutation test p-value for the trust hypothesis:
-		// H0: prior matches the sample (low mean_abs_diff is expected under random pairing too).
-		// H1: prior matches specifically BETTER than random (low diff is significant).
-		// Under H0, if we shuffle the prior labels across CpGs, we should see similar diff.
-		// Under H1 (prior matches), shuffled diff would be LARGER.
-		//
-		// We permute the prior column B times, compute each permutation's mean abs diff,
-		// and compute p = fraction of permutations with diff <= observed diff.
-		//   Small p (e.g. <0.05) -> observed diff is significantly smaller than random
-		//                         -> prior is informative for this sample -> trust it.
-		//   Large p              -> observed diff is indistinguishable from random
-		//                         -> prior is uninformative/biased        -> distrust it.
-		final int B = 200;
-		double[] shuffledDiffs = new double[B];
-		int n = pairs.size();
-		// Extract prior column once
-		double[] priorArr = new double[n];
-		double[] emissionArr = new double[n];
-		for (int i = 0; i < n; i++) {
-			emissionArr[i] = pairs.get(i)[0];
-			priorArr[i] = pairs.get(i)[1];
-		}
-		// Fisher-Yates shuffle buffer
-		int[] idx = new int[n];
-		for (int i = 0; i < n; i++) idx[i] = i;
-		int smallerOrEqual = 0;
-		for (int b = 0; b < B; b++) {
-			// Fisher-Yates on idx
-			for (int i = n - 1; i > 0; i--) {
-				int j = rng.nextInt(i + 1);
-				int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
-			}
-			double s = 0;
-			for (int i = 0; i < n; i++) s += Math.abs(emissionArr[i] - priorArr[idx[i]]);
-			shuffledDiffs[b] = s / n;
-			if (shuffledDiffs[b] <= meanAbsDiff) smallerOrEqual++;
-		}
-		double pValue = (double)(smallerOrEqual + 1) / (B + 1);
-
-		// Map concordance to bayesianFactor: prior is trusted when p is small
-		// AND mean_abs_diff is small (both indicate real prior-sample agreement).
-		// Scale factor: use (1 - pValue) × concordance_weight
-		//   pValue ≤ 0.05 and mean_abs_diff ≤ 0.15 → strong prior signal → bayesianFactor = 0.9
-		//   pValue large or mean_abs_diff ≥ 0.4    → prior noisy/wrong   → bayesianFactor = 0.05
-		double concordanceWeight = Math.max(0.0, Math.min(1.0, (1.0 - pValue)));
-		double diffWeight = Math.max(0.0, Math.min(1.0, 1.0 - 1.7 * meanAbsDiff));
-		double tuned = 0.05 + 0.85 * concordanceWeight * diffWeight;
+		double tuned = 0.9 - scale * maxShift;
 		if (tuned < 0.05) tuned = 0.05;
 		if (tuned > 0.9) tuned = 0.9;
 
-		log.info("Auto-tune concordance: " + n + " CpGs, " +
-				 "mean |emission − prior| = " + String.format("%.4f", meanAbsDiff) +
-				 ", Pearson r = " + String.format("%.4f", pearsonR) +
-				 ", permutation p-value = " + String.format("%.4g", pValue) +
-				 " (B=" + B + ")");
-		log.info("Auto-tune components: concordance_weight=(1-p)=" +
-				 String.format("%.4f", concordanceWeight) +
-				 ", diff_weight=max(0,1-1.7*d)=" + String.format("%.4f", diffWeight) +
-				 " -> bayesianFactor=0.05+0.85*cw*dw=" + String.format("%.4f", tuned));
-		if (pValue > 0.05) {
-			log.warn("Permutation p-value > 0.05: prior appears UNINFORMATIVE for this sample " +
-					 "(emission-prior agreement is indistinguishable from random). " +
-					 "Consider using a sample-appropriate -valueWigs track.");
-		} else if (pValue < 0.01 && meanAbsDiff < 0.15) {
-			log.info("Prior is HIGHLY INFORMATIVE (p<0.01, low diff); bayesianFactor tuned toward 0.9.");
+		StringBuilder shiftStr = new StringBuilder();
+		shiftStr.append("per-state L2 shifts: [");
+		for (int s = 0; s < nStates; s++) {
+			if (s > 0) shiftStr.append(", ");
+			shiftStr.append(String.format("state%d=%.4f", s, perStateShift[s]));
+		}
+		shiftStr.append("]");
+		log.info("Auto-tune emission shift (adapted vs re-centered reference): " + shiftStr.toString());
+		log.info("Auto-tune max shift = " + String.format("%.4f", maxShift) +
+				 " sd, KL divergence = " + String.format("%.6f", klDist) +
+				 ", scale = " + scale +
+				 " -> bayesianFactor = clip(0.9 - " + scale + " * " + String.format("%.4f", maxShift) +
+				 ", 0.05, 0.9) = " + String.format("%.4f", tuned));
+
+		if (maxShift < 0.1) {
+			log.info("Adapted emissions ~= reference: sample appears SIMILAR to reference. " +
+					 "bayesianFactor tuned toward 0.9 (high prior trust).");
+		} else if (maxShift > 0.5) {
+			log.warn("Adapted emissions DIVERGED substantially from reference (shift > 0.5 sd): " +
+					 "sample differs from reference tissue type. bayesianFactor tuned toward 0.05 " +
+					 "(low prior trust). Consider using a sample-appropriate -valueWigs track.");
 		}
 		return tuned;
 	}
