@@ -168,6 +168,9 @@ class MLEDeconvolver:
         binarization_count_weight: float = 1.0,
         binarization_model: str = "legacy",
         hierarchical_quadrature_points: int = 24,
+        unknown_prior_weight: float = 0.0,
+        unknown_prior_weight_auto: bool = False,
+        unknown_prior_weight_auto_alpha: float = 0.01,
     ):
         self.max_iter = max_iter
         self.tol = tol
@@ -179,6 +182,26 @@ class MLEDeconvolver:
         self.hierarchical_quadrature_points = max(
             int(hierarchical_quadrature_points), 2
         )
+        # Prior on the Unknown component w_u: adds -lambda * log(1 - w_u + eps)
+        # to the negative log-likelihood, equivalent to a Beta(1, lambda+1)
+        # prior marginally on w_u. See design §X.Y and docstring below.
+        self.unknown_prior_weight = max(float(unknown_prior_weight), 0.0)
+        self.unknown_prior_weight_auto = bool(unknown_prior_weight_auto)
+        self.unknown_prior_weight_auto_alpha = max(
+            float(unknown_prior_weight_auto_alpha), 0.0
+        )
+
+    def _effective_unknown_prior_weight(self, m_valid: int) -> float:
+        """Resolve the Unknown-prior lambda for a given valid-marker count.
+
+        When ``unknown_prior_weight_auto`` is enabled, returns
+        ``alpha * M_valid`` so the prior:likelihood balance stays stable as
+        the number of usable markers varies between samples. Otherwise
+        returns the raw ``unknown_prior_weight``.
+        """
+        if self.unknown_prior_weight_auto:
+            return self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
+        return self.unknown_prior_weight
 
     def solve(
         self,
@@ -253,17 +276,29 @@ class MLEDeconvolver:
         w_obj = weights[valid]
         K_total = R.shape[1]
 
-        # Objective: negative weighted log-likelihood
+        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        eps_prior = 1e-9
+
+        # Objective: negative weighted log-likelihood + optional Unknown prior
+        #   prior term:  -lambda * log(1 - w_unknown + eps)
+        # Unknown is the last component (index K_total - 1).
         def neg_ll(w: np.ndarray) -> float:
             mu = R @ w
             mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
             ll = log_likelihood_per_marker(k, n, mu, phi_v)
-            return -float(np.sum(w_obj * ll))
+            nll = -float(np.sum(w_obj * ll))
+            if lam > 0.0:
+                nll += -lam * float(np.log(1.0 - w[-1] + eps_prior))
+            return nll
 
         def neg_grad(w: np.ndarray) -> np.ndarray:
             mu = R @ w
             mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
-            return -gradient_w(k, n, mu, phi_v, R, weights=w_obj)
+            g = -gradient_w(k, n, mu, phi_v, R, weights=w_obj)
+            if lam > 0.0:
+                # d/dw_u [-lambda * log(1 - w_u + eps)] = lambda / (1 - w_u + eps)
+                g[-1] += lam / (1.0 - w[-1] + eps_prior)
+            return g
 
         return self._run_slsqp(
             neg_ll, neg_grad, K_total, sample_id=model.sample_id
@@ -374,38 +409,47 @@ class MLEDeconvolver:
             phi_v = phi[valid]
             R_v = R[valid]
 
+        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        eps_prior = 1e-9
+
         def neg_ll(w: np.ndarray) -> float:
             p_obs = coef_v @ w
             p_obs = np.clip(p_obs, 1e-15, 1.0)
             ll_state = float(np.sum(w_obj * np.log(p_obs)))
-            if not use_count_term:
-                return -ll_state
-
-            mu = R_v @ w
-            mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
-            ll_count_vec = log_likelihood_per_marker(k_v, n_v, mu, phi_v)
-            ll_count_per_read = ll_count_vec / np.maximum(n_v, 1.0)
-            ll_count = float(np.sum(w_obj * ll_count_per_read))
-            return -(ll_state + self.binarization_count_weight * ll_count)
+            if use_count_term:
+                mu = R_v @ w
+                mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+                ll_count_vec = log_likelihood_per_marker(k_v, n_v, mu, phi_v)
+                ll_count_per_read = ll_count_vec / np.maximum(n_v, 1.0)
+                ll_count = float(np.sum(w_obj * ll_count_per_read))
+                nll = -(ll_state + self.binarization_count_weight * ll_count)
+            else:
+                nll = -ll_state
+            if lam > 0.0:
+                nll += -lam * float(np.log(1.0 - w[-1] + eps_prior))
+            return nll
 
         def neg_grad(w: np.ndarray) -> np.ndarray:
             p_obs = coef_v @ w
             p_obs = np.clip(p_obs, 1e-15, 1.0)
             grad_state = (w_obj / p_obs) @ coef_v
-            if not use_count_term:
-                return -grad_state
-
-            mu = R_v @ w
-            mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
-            grad_count = gradient_w(
-                k_v,
-                n_v,
-                mu,
-                phi_v,
-                R_v,
-                weights=(w_obj / np.maximum(n_v, 1.0)),
-            )
-            return -(grad_state + self.binarization_count_weight * grad_count)
+            if use_count_term:
+                mu = R_v @ w
+                mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+                grad_count = gradient_w(
+                    k_v,
+                    n_v,
+                    mu,
+                    phi_v,
+                    R_v,
+                    weights=(w_obj / np.maximum(n_v, 1.0)),
+                )
+                g = -(grad_state + self.binarization_count_weight * grad_count)
+            else:
+                g = -grad_state
+            if lam > 0.0:
+                g[-1] += lam / (1.0 - w[-1] + eps_prior)
+            return g
 
         return self._run_slsqp(
             neg_ll, neg_grad, K_total, sample_id=model.sample_id
@@ -476,6 +520,9 @@ class MLEDeconvolver:
         cz_v = call_zone_prob[valid]
         w_obj = weights[valid]
 
+        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        eps_prior = 1e-9
+
         def neg_ll(w: np.ndarray) -> float:
             ll_vec = hierarchical_marker_log_likelihood(
                 w=w,
@@ -488,7 +535,10 @@ class MLEDeconvolver:
                 call_zone_prob=cz_v,
                 call_weight=call_weight,
             )
-            return -float(np.sum(w_obj * ll_vec))
+            nll = -float(np.sum(w_obj * ll_vec))
+            if lam > 0.0:
+                nll += -lam * float(np.log(1.0 - w[-1] + eps_prior))
+            return nll
 
         # Start with scipy's internal finite-difference Jacobian for the
         # hierarchical model; this is robust and keeps implementation simple.
@@ -581,6 +631,9 @@ class BayesianDeconvolver:
         binarization_count_weight: float = 1.0,
         binarization_model: str = "legacy",
         hierarchical_quadrature_points: int = 24,
+        unknown_prior_weight: float = 0.0,
+        unknown_prior_weight_auto: bool = False,
+        unknown_prior_weight_auto_alpha: float = 0.01,
     ):
         self.n_walkers = n_walkers
         self.n_steps = n_steps
@@ -592,6 +645,24 @@ class BayesianDeconvolver:
         self.hierarchical_quadrature_points = max(
             int(hierarchical_quadrature_points), 2
         )
+        # Unknown-prior regularization (same parameterization as MLE).
+        # Adds log-prior  +lambda * log(1 - w_u + eps) to the log-posterior,
+        # equivalent to a Beta(1, lambda+1) prior on the Unknown component.
+        self.unknown_prior_weight = max(float(unknown_prior_weight), 0.0)
+        self.unknown_prior_weight_auto = bool(unknown_prior_weight_auto)
+        self.unknown_prior_weight_auto_alpha = max(
+            float(unknown_prior_weight_auto_alpha), 0.0
+        )
+
+    def _effective_unknown_prior_weight(self, m_valid: int) -> float:
+        """Resolve the Unknown-prior lambda for a given valid-marker count.
+
+        Mirrors ``MLEDeconvolver._effective_unknown_prior_weight`` so the
+        MLE point estimate and the Bayesian posterior use a consistent prior.
+        """
+        if self.unknown_prior_weight_auto:
+            return self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
+        return self.unknown_prior_weight
 
     def _effective_n_walkers(self, k_free: int) -> int:
         """Return a sampler-safe walker count for the current dimensionality.
@@ -663,6 +734,8 @@ class BayesianDeconvolver:
         K_free = K_total - 1  # softmax-parameterized
 
         log_prior_const = -np.sum(np.log(np.maximum(self.prior_alpha, 1e-9))) * 0  # constant
+        lam_unk = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
             z_max = np.max(z)
@@ -686,6 +759,10 @@ class BayesianDeconvolver:
                 log_prior = float(
                     (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
                 )
+            # Unknown-component prior: lambda * log(1 - w_unknown + eps).
+            # Same parameterization as MLE; adds log-prior contribution.
+            if lam_unk > 0.0:
+                log_prior += lam_unk * float(np.log(1.0 - w[-1] + eps_prior))
             # Jacobian of softmax (log |det J|) — improper, but cancels for paired comparison
             return log_lik + log_prior
 
@@ -780,6 +857,8 @@ class BayesianDeconvolver:
 
         K_total = R_v.shape[1]
         K_free = K_total - 1
+        lam_unk = self._effective_unknown_prior_weight(int(R_v.shape[0]))
+        eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
             z_max = np.max(z)
@@ -807,6 +886,8 @@ class BayesianDeconvolver:
                 log_prior = float(
                     (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
                 )
+            if lam_unk > 0.0:
+                log_prior += lam_unk * float(np.log(1.0 - w[-1] + eps_prior))
             return log_lik + log_prior
 
         n_walkers = self._effective_n_walkers(K_free)
@@ -894,6 +975,8 @@ class BayesianDeconvolver:
 
         K_total = coef_v.shape[1]
         K_free = K_total - 1
+        lam_unk = self._effective_unknown_prior_weight(int(coef_v.shape[0]))
+        eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
             z_max = np.max(z)
@@ -923,6 +1006,8 @@ class BayesianDeconvolver:
                 log_prior = float(
                     (self.prior_alpha - 1.0) * np.sum(np.log(np.maximum(w, 1e-300)))
                 )
+            if lam_unk > 0.0:
+                log_prior += lam_unk * float(np.log(1.0 - w[-1] + eps_prior))
             return log_lik + log_prior
 
         n_walkers = self._effective_n_walkers(K_free)

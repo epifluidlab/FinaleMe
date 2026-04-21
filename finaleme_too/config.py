@@ -65,6 +65,24 @@ class ModelConfig:
     # Set to 0.0 to recover the pure state-only v3 objective.
     binarization_count_weight: float = 1.0
 
+    # Prior penalty on the "Unknown" component weight w_u.
+    # Objective adds:  -lambda * log(1 - w_u + eps)
+    # Interpretable as a Beta(1, lambda+1) prior on w_u, or equivalently
+    # "lambda pseudo-observations of 'not-Unknown' evidence."
+    # Default 0.0 preserves legacy behavior (no prior).
+    # Typical clinical cfDNA values: 10-50 (mild to strong bias against Unknown).
+    unknown_prior_weight: float = 0.0
+    # When True, lambda is auto-computed per sample as
+    #   lambda = unknown_prior_weight_auto_alpha * M_valid
+    # where M_valid is the number of usable markers for that sample.
+    # Scales the prior with evidence so the prior:likelihood balance stays
+    # stable across samples with different marker counts. Overrides the
+    # raw unknown_prior_weight when enabled.
+    unknown_prior_weight_auto: bool = False
+    # Alpha coefficient for unknown_prior_weight_auto; lambda = alpha * M.
+    # 0.005 = mild, 0.01 = moderate (recommended), 0.02 = strong.
+    unknown_prior_weight_auto_alpha: float = 0.01
+
 
 @dataclass
 class CoverageConfig:
