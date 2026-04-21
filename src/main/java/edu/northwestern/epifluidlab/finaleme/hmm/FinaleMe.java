@@ -224,8 +224,14 @@ public class FinaleMe {
 	@Option(name="-autoTuneSampleFragments",usage="[deprecated: kept for compatibility] number of random fragments to sample. No longer used. Default: 10000")
 	public int autoTuneSampleFragments = 10000;
 
-	@Option(name="-autoTuneScale",usage="scale factor for the linear mapping from emission shift to bayesianFactor: bayesianFactor = clip(0.9 - scale * shift, 0.05, 0.9). Larger scale -> more aggressive distrust of prior when emissions differ from reference. Default: 1.5")
+	@Option(name="-autoTuneScale",usage="[deprecated; use -autoTuneMidpoint/-autoTuneSteepness] legacy linear scale factor. Kept only for backward compatibility; ignored when -autoTuneMidpoint is non-zero. Default: 1.5")
 	public double autoTuneScale = 1.5;
+
+	@Option(name="-autoTuneMidpoint",usage="emission shift (in z-score sd) at which bayesianFactor is halfway between 0.05 and 0.9. The sigmoid transitions sharply around this value. Default: 0.55 (calibrated from observed healthy ~0.37 sd vs disease ~0.72 sd shifts)")
+	public double autoTuneMidpoint = 0.55;
+
+	@Option(name="-autoTuneSteepness",usage="sigmoid steepness: higher = sharper transition between trust-prior and distrust-prior regimes. Default: 15.0")
+	public double autoTuneSteepness = 15.0;
 
 	@Option(name="-h",usage="show option information")
 	public boolean help = false;
@@ -3192,7 +3198,7 @@ public class FinaleMe {
 		if (autoTuneBayesianFactor) {
 			// Compare against the pristine re-centered reference (before GMM
 			// re-init overwrote refHmmForAdapt's emissions).
-			double tunedFactor = computeAutoTunedBayesianFactor(refHmmPristine, adaptedHmm, klc, autoTuneScale);
+			double tunedFactor = computeAutoTunedBayesianFactor(refHmmPristine, adaptedHmm, klc, autoTuneMidpoint, autoTuneSteepness);
 			log.info("Auto-tuned bayesianFactor: " + String.format("%.4f", tunedFactor) +
 					 " (was " + bayesianFactor + ")");
 			this.bayesianFactor = tunedFactor;
@@ -3341,33 +3347,32 @@ public class FinaleMe {
 	 * are in a different coordinate system than the target data.
 	 */
 	/**
-	 * Auto-tune bayesianFactor based on emission-distribution shift between
-	 * the reference HMM (re-centered into target z-score space) and the
-	 * adapted HMM. Uses model parameters directly, not per-CpG posteriors,
-	 * which are noisy at sparse coverage.
+	 * Auto-tune bayesianFactor using a sigmoid on the emission shift between
+	 * the (re-centered) reference HMM and the adapted HMM. Shift is the max
+	 * over states of the L2 distance between the per-state emission means
+	 * in z-score feature space.
 	 *
-	 * Primary metric: max over states of ||adapted_mean[s] - ref_mean[s]||
-	 *   (L2 distance in feature space, in z-score units)
-	 *   Small shift -> sample looks like reference (healthy) -> trust prior
-	 *   Large shift -> sample differs from reference -> distrust prior
+	 * Mapping:
+	 *   sigmoidInput = (shift - midpoint) * steepness
+	 *   sigmoidOutput = 1 / (1 + exp(-sigmoidInput))     -- in [0, 1]
+	 *   bayesianFactor = clip(0.9 - 0.85 * sigmoidOutput, 0.05, 0.9)
 	 *
-	 * Mapping: bayesianFactor = clip(0.9 - autoTuneScale * shift, 0.05, 0.9)
-	 * With default autoTuneScale=1.5:
-	 *   shift = 0    -> 0.90 (full trust)
-	 *   shift = 0.1  -> 0.75
-	 *   shift = 0.3  -> 0.45
-	 *   shift = 0.5  -> 0.15
-	 *   shift >= 0.57 -> 0.05 (ignore prior)
+	 * Saturates near 0.9 for shift << midpoint (trust prior) and near 0.05
+	 * for shift >> midpoint (distrust prior), with a sharp transition
+	 * centered on `midpoint`. Steepness controls transition width.
+	 *
+	 * Defaults (midpoint=0.55, steepness=15) calibrated from observed data:
+	 *   healthy ~ shift 0.37  -> bayesianFactor ~ 0.85
+	 *   disease ~ shift 0.72  -> bayesianFactor ~ 0.11
 	 *
 	 * Secondary diagnostic: KL divergence between reference and adapted
-	 * HMMs on the target's own observation sequences. Not used for tuning;
-	 * logged for interpretation.
+	 * HMMs. Logged for interpretation; not used in tuning.
 	 */
 	private double computeAutoTunedBayesianFactor(
 			BayesianNhmmV5<ObservationVector> refHmm,
 			BayesianNhmmV5<ObservationVector> adaptedHmm,
 			KullbackLeiblerDistanceBayesianNhmmV5Calculator klc,
-			double scale) {
+			double midpoint, double steepness) {
 		int nStates = refHmm.nbStates();
 		double maxShift = 0.0;
 		double[] perStateShift = new double[nStates];
@@ -3393,7 +3398,13 @@ public class FinaleMe {
 			log.info("KL divergence computation failed (non-fatal): " + e.getMessage());
 		}
 
-		double tuned = 0.9 - scale * maxShift;
+		// Sigmoid mapping: sharp transition around midpoint.
+		double sigmoidInput = (maxShift - midpoint) * steepness;
+		double sigmoidOutput;
+		if (sigmoidInput > 20) sigmoidOutput = 1.0;
+		else if (sigmoidInput < -20) sigmoidOutput = 0.0;
+		else sigmoidOutput = 1.0 / (1.0 + Math.exp(-sigmoidInput));
+		double tuned = 0.9 - 0.85 * sigmoidOutput;
 		if (tuned < 0.05) tuned = 0.05;
 		if (tuned > 0.9) tuned = 0.9;
 
@@ -3407,16 +3418,17 @@ public class FinaleMe {
 		log.info("Auto-tune emission shift (adapted vs re-centered reference): " + shiftStr.toString());
 		log.info("Auto-tune max shift = " + String.format("%.4f", maxShift) +
 				 " sd, KL divergence = " + String.format("%.6f", klDist) +
-				 ", scale = " + scale +
-				 " -> bayesianFactor = clip(0.9 - " + scale + " * " + String.format("%.4f", maxShift) +
-				 ", 0.05, 0.9) = " + String.format("%.4f", tuned));
+				 ", midpoint = " + midpoint + ", steepness = " + steepness +
+				 " -> sigmoid((" + String.format("%.4f", maxShift) + " - " + midpoint + ") * " + steepness +
+				 ") = " + String.format("%.4f", sigmoidOutput) +
+				 " -> bayesianFactor = " + String.format("%.4f", tuned));
 
-		if (maxShift < 0.1) {
-			log.info("Adapted emissions ~= reference: sample appears SIMILAR to reference. " +
-					 "bayesianFactor tuned toward 0.9 (high prior trust).");
-		} else if (maxShift > 0.5) {
-			log.warn("Adapted emissions DIVERGED substantially from reference (shift > 0.5 sd): " +
-					 "sample differs from reference tissue type. bayesianFactor tuned toward 0.05 " +
+		if (maxShift < midpoint - 0.15) {
+			log.info("Adapted emissions close to reference (shift < midpoint - 0.15): sample appears " +
+					 "SIMILAR to reference tissue type. bayesianFactor saturates near 0.9 (high prior trust).");
+		} else if (maxShift > midpoint + 0.15) {
+			log.warn("Adapted emissions DIVERGED substantially from reference (shift > midpoint + 0.15): " +
+					 "sample differs from reference tissue type. bayesianFactor saturates near 0.05 " +
 					 "(low prior trust). Consider using a sample-appropriate -valueWigs track.");
 		}
 		return tuned;
