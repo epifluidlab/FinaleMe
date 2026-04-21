@@ -203,11 +203,11 @@ public class FinaleMe {
 	@Option(name="-autoAdaptLambdaN0",usage="characteristic fragment count for -autoAdaptLambda: at N=N0, lambda=0.5; at N >> N0, lambda->0; at N << N0, lambda->1. Default: 1000000 (~1M fragments for stable MLE of a 2-state 3-feature GMM with ~18 parameters)")
 	public long autoAdaptLambdaN0 = 1_000_000L;
 
-	@Option(name="-autoTuneProbeLambda",usage="fixed lambda used for the short 'signature probe' BW run that measures sample-vs-reference emission shift for -autoTuneBayesianFactor. Decouples the shift signal from -autoAdaptLambda's potentially-heavy decoding regularization. Default: 0.2 (moderate adaptation, preserves sample signature at any coverage). Set to a negative value to disable the probe (use the decoding-BW shift instead).")
-	public double autoTuneProbeLambda = 0.2;
+	@Option(name="-autoTuneProbeLambda",usage="fixed lambda used for the 'signature probe' BW run that measures sample-vs-reference emission shift for -autoTuneBayesianFactor. Default: 0.0 (unregularized MLE -- maximum sample signature sensitivity). Decouples the shift signal from -autoAdaptLambda's decoding regularization. Set to a negative value to disable the probe and reuse the decoding-BW shift directly.")
+	public double autoTuneProbeLambda = 0.0;
 
-	@Option(name="-autoTuneProbeMaxIter",usage="max iterations for the signature probe BW. Usually converges in 3-5 iter. Default: 10")
-	public int autoTuneProbeMaxIter = 10;
+	@Option(name="-autoTuneProbeMaxIter",usage="max iterations for the signature probe BW. Default: 20 (needs more at lambda=0 to fully converge the MLE). Usually converges in 5-10 iter.")
+	public int autoTuneProbeMaxIter = 20;
 
 	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 5")
 	public int adaptMaxIter = 5;
@@ -3244,7 +3244,12 @@ public class FinaleMe {
 		// regularized decoding model.
 		if (autoTuneBayesianFactor) {
 			BayesianNhmmV5<ObservationVector> shiftSourceHmm;
-			if (autoAdaptLambda && autoTuneProbeLambda >= 0 && autoTuneProbeLambda < adaptLambda) {
+			// Run unregularized probe BW whenever decoding BW is regularized
+			// (adaptLambda > 0) to measure the true sample signature. The
+			// probe's lambda (default 0) must be strictly less than adaptLambda
+			// to be informative. Set -autoTuneProbeLambda to a negative value
+			// to disable and reuse the adapted model's shift directly.
+			if (autoTuneProbeLambda >= 0 && autoTuneProbeLambda < adaptLambda) {
 				log.info("Running signature probe BW (lambda=" + autoTuneProbeLambda +
 						 ", maxIter=" + autoTuneProbeMaxIter +
 						 ") to decouple shift signal from decoding regularization (lambda=" +
