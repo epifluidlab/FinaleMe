@@ -3056,6 +3056,16 @@ public class FinaleMe {
 			log.info("No -loadNormStats; skipping re-centering (ref and target z-score spaces may differ)");
 		}
 
+		// Keep a pristine clone of the re-centered reference BEFORE any GMM
+		// re-init, so the delta/auto-tune metrics compare against the true
+		// reference rather than the GMM-init version.
+		BayesianNhmmV5<ObservationVector> refHmmPristine;
+		try {
+			refHmmPristine = refHmmForAdapt.clone();
+		} catch (CloneNotSupportedException e) {
+			throw new RuntimeException("Failed to clone re-centered reference HMM", e);
+		}
+
 		// Optional: re-initialize emissions via GMM on the target data.
 		// This escapes the reference-model's local optimum in EM. Transitions
 		// and pi stay frozen to the reference model; only the emission GMMs
@@ -3165,7 +3175,10 @@ public class FinaleMe {
 			}
 		}
 
-		logEmissionDelta("EMISSION DELTA (adapted - re-centered reference)", refHmmForAdapt, adaptedHmm);
+		// Use the pristine re-centered reference (not the GMM-init-overwritten
+		// refHmmForAdapt) so the delta reflects "how far from reference did
+		// BW end up" rather than "how far did BW move from the GMM init".
+		logEmissionDelta("EMISSION DELTA (adapted - re-centered reference)", refHmmPristine, adaptedHmm);
 
 		this.methylatedState = adaptedHmm.getMethyState(lowCoverage);
 		adaptedHmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgs : cpgNumClip);
@@ -3177,7 +3190,9 @@ public class FinaleMe {
 		// Large movement means the sample differs from healthy -> distrust the
 		// prior. Output is clipped to [0.05, 0.9].
 		if (autoTuneBayesianFactor) {
-			double tunedFactor = computeAutoTunedBayesianFactor(refHmmForAdapt, adaptedHmm, klc, autoTuneScale);
+			// Compare against the pristine re-centered reference (before GMM
+			// re-init overwrote refHmmForAdapt's emissions).
+			double tunedFactor = computeAutoTunedBayesianFactor(refHmmPristine, adaptedHmm, klc, autoTuneScale);
 			log.info("Auto-tuned bayesianFactor: " + String.format("%.4f", tunedFactor) +
 					 " (was " + bayesianFactor + ")");
 			this.bayesianFactor = tunedFactor;
