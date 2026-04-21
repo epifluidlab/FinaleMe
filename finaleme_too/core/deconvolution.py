@@ -190,18 +190,53 @@ class MLEDeconvolver:
         self.unknown_prior_weight_auto_alpha = max(
             float(unknown_prior_weight_auto_alpha), 0.0
         )
+        # Track which sample_ids we have already logged the effective
+        # Unknown-prior lambda for, so bootstrap's 100s of solve() calls
+        # do not flood the log.
+        self._logged_prior_samples: set[str] = set()
 
-    def _effective_unknown_prior_weight(self, m_valid: int) -> float:
+    def _effective_unknown_prior_weight(
+        self,
+        m_valid: int,
+        sample_id: str | None = None,
+    ) -> float:
         """Resolve the Unknown-prior lambda for a given valid-marker count.
 
         When ``unknown_prior_weight_auto`` is enabled, returns
         ``alpha * M_valid`` so the prior:likelihood balance stays stable as
         the number of usable markers varies between samples. Otherwise
         returns the raw ``unknown_prior_weight``.
+
+        Logs the resolved lambda the first time this method is called for
+        a given ``sample_id`` (subsequent calls, e.g. from bootstrap
+        resampling, are silenced to avoid log spam).
         """
         if self.unknown_prior_weight_auto:
-            return self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
-        return self.unknown_prior_weight
+            lam = self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
+        else:
+            lam = self.unknown_prior_weight
+        if (
+            lam > 0.0
+            and sample_id is not None
+            and sample_id not in self._logged_prior_samples
+        ):
+            if self.unknown_prior_weight_auto:
+                log.info(
+                    "[%s] Unknown prior (auto): M_valid=%d, alpha=%.4f -> lambda=%.3f",
+                    sample_id,
+                    int(m_valid),
+                    self.unknown_prior_weight_auto_alpha,
+                    lam,
+                )
+            else:
+                log.info(
+                    "[%s] Unknown prior (fixed): lambda=%.3f (M_valid=%d)",
+                    sample_id,
+                    lam,
+                    int(m_valid),
+                )
+            self._logged_prior_samples.add(sample_id)
+        return lam
 
     def solve(
         self,
@@ -276,7 +311,9 @@ class MLEDeconvolver:
         w_obj = weights[valid]
         K_total = R.shape[1]
 
-        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        lam = self._effective_unknown_prior_weight(
+            int(np.sum(valid)), sample_id=model.sample_id
+        )
         eps_prior = 1e-9
 
         # Objective: negative weighted log-likelihood + optional Unknown prior
@@ -409,7 +446,9 @@ class MLEDeconvolver:
             phi_v = phi[valid]
             R_v = R[valid]
 
-        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        lam = self._effective_unknown_prior_weight(
+            int(np.sum(valid)), sample_id=model.sample_id
+        )
         eps_prior = 1e-9
 
         def neg_ll(w: np.ndarray) -> float:
@@ -520,7 +559,9 @@ class MLEDeconvolver:
         cz_v = call_zone_prob[valid]
         w_obj = weights[valid]
 
-        lam = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        lam = self._effective_unknown_prior_weight(
+            int(np.sum(valid)), sample_id=model.sample_id
+        )
         eps_prior = 1e-9
 
         def neg_ll(w: np.ndarray) -> float:
@@ -653,16 +694,49 @@ class BayesianDeconvolver:
         self.unknown_prior_weight_auto_alpha = max(
             float(unknown_prior_weight_auto_alpha), 0.0
         )
+        # Suppress duplicate log lines when solve() is called repeatedly
+        # for the same sample (e.g. from uncertainty re-estimation paths).
+        self._logged_prior_samples: set[str] = set()
 
-    def _effective_unknown_prior_weight(self, m_valid: int) -> float:
+    def _effective_unknown_prior_weight(
+        self,
+        m_valid: int,
+        sample_id: str | None = None,
+    ) -> float:
         """Resolve the Unknown-prior lambda for a given valid-marker count.
 
         Mirrors ``MLEDeconvolver._effective_unknown_prior_weight`` so the
         MLE point estimate and the Bayesian posterior use a consistent prior.
+        Logs the resolved lambda once per ``sample_id``.
         """
         if self.unknown_prior_weight_auto:
-            return self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
-        return self.unknown_prior_weight
+            lam = self.unknown_prior_weight_auto_alpha * float(max(m_valid, 0))
+        else:
+            lam = self.unknown_prior_weight
+        if (
+            lam > 0.0
+            and sample_id is not None
+            and sample_id not in self._logged_prior_samples
+        ):
+            if self.unknown_prior_weight_auto:
+                log.info(
+                    "[%s] Unknown prior (auto, Bayesian): M_valid=%d, "
+                    "alpha=%.4f -> lambda=%.3f",
+                    sample_id,
+                    int(m_valid),
+                    self.unknown_prior_weight_auto_alpha,
+                    lam,
+                )
+            else:
+                log.info(
+                    "[%s] Unknown prior (fixed, Bayesian): lambda=%.3f "
+                    "(M_valid=%d)",
+                    sample_id,
+                    lam,
+                    int(m_valid),
+                )
+            self._logged_prior_samples.add(sample_id)
+        return lam
 
     def _effective_n_walkers(self, k_free: int) -> int:
         """Return a sampler-safe walker count for the current dimensionality.
@@ -734,7 +808,9 @@ class BayesianDeconvolver:
         K_free = K_total - 1  # softmax-parameterized
 
         log_prior_const = -np.sum(np.log(np.maximum(self.prior_alpha, 1e-9))) * 0  # constant
-        lam_unk = self._effective_unknown_prior_weight(int(np.sum(valid)))
+        lam_unk = self._effective_unknown_prior_weight(
+            int(np.sum(valid)), sample_id=model.sample_id
+        )
         eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
@@ -857,7 +933,9 @@ class BayesianDeconvolver:
 
         K_total = R_v.shape[1]
         K_free = K_total - 1
-        lam_unk = self._effective_unknown_prior_weight(int(R_v.shape[0]))
+        lam_unk = self._effective_unknown_prior_weight(
+            int(R_v.shape[0]), sample_id=getattr(model, "sample_id", None)
+        )
         eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
@@ -975,7 +1053,9 @@ class BayesianDeconvolver:
 
         K_total = coef_v.shape[1]
         K_free = K_total - 1
-        lam_unk = self._effective_unknown_prior_weight(int(coef_v.shape[0]))
+        lam_unk = self._effective_unknown_prior_weight(
+            int(coef_v.shape[0]), sample_id=getattr(model, "sample_id", None)
+        )
         eps_prior = 1e-9
 
         def softmax(z: np.ndarray) -> np.ndarray:
