@@ -851,10 +851,15 @@ class TOOPipeline:
         )
         # Coverage tier and reported mean_coverage should both be based on
         # the full marker panel for this sample (before per-marker filtering
-        # for likelihood/deconvolution), so qc_summary reflects cohort-wide
-        # sample depth rather than depth over only n_markers_used.
-        tier = self.tier_assigner.assign(obs)
-        mean_coverage_all_markers = effective_coverage_in_markers(obs)
+        # for likelihood/deconvolution), using the *pre-imputation* coverage
+        # when available. Imputation is a downstream statistical fill-in and
+        # must not inflate sequencing-depth QC.
+        if pre_impute_n is not None and pre_impute_n.size == obs.n_markers:
+            obs_for_coverage = obs.with_counts(obs.k, pre_impute_n)
+        else:
+            obs_for_coverage = obs
+        tier = self.tier_assigner.assign(obs_for_coverage)
+        mean_coverage_all_markers = effective_coverage_in_markers(obs_for_coverage)
 
         binarization_flag: str | None = None
         binarization_debug: dict | None = None
@@ -953,6 +958,7 @@ class TOOPipeline:
                 obs=obs,
                 reference=reference,
                 tier=tier,
+                mean_coverage=mean_coverage_all_markers,
                 binarization_flag=binarization_flag,
                 pre_impute_n=pre_impute_n,
                 out_dir=out_dir,
@@ -1339,6 +1345,7 @@ class TOOPipeline:
         obs: MarkerObservations,
         reference: ReferencePanel,
         tier: CoverageTier,
+        mean_coverage: float,
         binarization_flag: str | None,
         pre_impute_n: np.ndarray | None,
         out_dir: Path,
@@ -1365,10 +1372,7 @@ class TOOPipeline:
             coverage_tier=tier,
             qc_flags=["NO_MARKERS_PASS_TIER_FILTER"],
             mean_dispersion=np.zeros(K, dtype=np.float64),
-            # Same effective-coverage formula used everywhere else, so the
-            # NO_MARKERS_PASS_TIER_FILTER row in qc_summary still has a
-            # comparable mean_coverage value.
-            mean_coverage=effective_coverage_in_markers(obs),
+            mean_coverage=float(mean_coverage),
             n_markers_used=0,
             pct_imputed=0.0,
             binarization_flag=binarization_flag,
