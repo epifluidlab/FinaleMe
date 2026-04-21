@@ -203,6 +203,12 @@ public class FinaleMe {
 	@Option(name="-autoAdaptLambdaN0",usage="characteristic fragment count for -autoAdaptLambda: at N=N0, lambda=0.5; at N >> N0, lambda->0; at N << N0, lambda->1. Default: 1000000 (~1M fragments for stable MLE of a 2-state 3-feature GMM with ~18 parameters)")
 	public long autoAdaptLambdaN0 = 1_000_000L;
 
+	@Option(name="-autoTuneProbeLambda",usage="fixed lambda used for the short 'signature probe' BW run that measures sample-vs-reference emission shift for -autoTuneBayesianFactor. Decouples the shift signal from -autoAdaptLambda's potentially-heavy decoding regularization. Default: 0.2 (moderate adaptation, preserves sample signature at any coverage). Set to a negative value to disable the probe (use the decoding-BW shift instead).")
+	public double autoTuneProbeLambda = 0.2;
+
+	@Option(name="-autoTuneProbeMaxIter",usage="max iterations for the signature probe BW. Usually converges in 3-5 iter. Default: 10")
+	public int autoTuneProbeMaxIter = 10;
+
 	@Option(name="-adaptMaxIter",usage="max Baum-Welch iterations during emission adaptation. Default: 5")
 	public int adaptMaxIter = 5;
 
@@ -3224,14 +3230,58 @@ public class FinaleMe {
 		adaptedHmm.setMinCpgNum(1);
 
 		// Auto-tune bayesianFactor based on HOW MUCH the HMM emissions moved
-		// from the (re-centered) reference during adaptation. Small movement
-		// means this sample looks like healthy -> trust the healthy prior.
-		// Large movement means the sample differs from healthy -> distrust the
-		// prior. Output is clipped to [0.05, 0.9].
+		// from the (re-centered) reference.
+		//
+		// When -autoAdaptLambda is ON and lambda is high (low-cov), the
+		// decoding BW heavily regularizes toward the reference, so the
+		// adapted emissions look ~= reference regardless of sample type.
+		// This artificially hides the sample signature from the shift metric.
+		//
+		// Solution: run a short "signature probe" BW with a FIXED moderate
+		// lambda (autoTuneProbeLambda, default 0.2) to produce a probe model
+		// that preserves the sample signature while still filtering some
+		// MLE noise. Measure shift from the probe, not from the heavily-
+		// regularized decoding model.
 		if (autoTuneBayesianFactor) {
-			// Compare against the pristine re-centered reference (before GMM
-			// re-init overwrote refHmmForAdapt's emissions).
-			double tunedFactor = computeAutoTunedBayesianFactor(refHmmPristine, adaptedHmm, klc, autoTuneMidpoint, autoTuneSteepness);
+			BayesianNhmmV5<ObservationVector> shiftSourceHmm;
+			if (autoAdaptLambda && autoTuneProbeLambda >= 0 && autoTuneProbeLambda < adaptLambda) {
+				log.info("Running signature probe BW (lambda=" + autoTuneProbeLambda +
+						 ", maxIter=" + autoTuneProbeMaxIter +
+						 ") to decouple shift signal from decoding regularization (lambda=" +
+						 String.format("%.4f", adaptLambda) + ") ...");
+				BayesianNhmmV5<ObservationVector> probeHmm;
+				try {
+					probeHmm = refHmmForAdapt.clone();
+				} catch (CloneNotSupportedException e) {
+					throw new RuntimeException("Failed to clone for probe BW", e);
+				}
+				double probeDistance = Double.MAX_VALUE;
+				for (int iter = 0; iter < autoTuneProbeMaxIter; iter++) {
+					BayesianNhmmV5<ObservationVector> prev;
+					try {
+						prev = probeHmm.clone();
+					} catch (CloneNotSupportedException e) {
+						throw new RuntimeException("Failed to clone probe HMM", e);
+					}
+					probeHmm = adaptIteration(probeHmm, refHmmPristine, matrix, autoTuneProbeLambda);
+					probeDistance = klc.distance(prev, probeHmm, true);
+					if (Double.isNaN(probeDistance)) {
+						log.warn("Probe KL is NaN; aborting probe, will use adapted-model shift instead.");
+						probeHmm = adaptedHmm;
+						break;
+					}
+					if (Math.abs(probeDistance) < tol) {
+						log.info("Probe BW converged at iteration " + (iter + 1));
+						break;
+					}
+				}
+				logEmissionParams("SIGNATURE PROBE (lambda=" + autoTuneProbeLambda + ")", probeHmm);
+				shiftSourceHmm = probeHmm;
+			} else {
+				shiftSourceHmm = adaptedHmm;
+			}
+			// Compare against the pristine re-centered reference.
+			double tunedFactor = computeAutoTunedBayesianFactor(refHmmPristine, shiftSourceHmm, klc, autoTuneMidpoint, autoTuneSteepness);
 			log.info("Auto-tuned bayesianFactor: " + String.format("%.4f", tunedFactor) +
 					 " (was " + bayesianFactor + ")");
 			this.bayesianFactor = tunedFactor;
