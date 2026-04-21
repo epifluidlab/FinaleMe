@@ -141,6 +141,9 @@ class TOOPipeline:
             binarization_count_weight=config.model.binarization_count_weight,
             binarization_model=config.model.binarization_model,
             hierarchical_quadrature_points=config.model.hierarchical_quadrature_points,
+            unknown_prior_weight=config.model.unknown_prior_weight,
+            unknown_prior_weight_auto=config.model.unknown_prior_weight_auto,
+            unknown_prior_weight_auto_alpha=config.model.unknown_prior_weight_auto_alpha,
         )
         self.fragment_deconvolver = FragmentLevelDeconvolver()
         # v3 binarization observation-model builder. Cheap to construct
@@ -181,6 +184,9 @@ class TOOPipeline:
                 binarization_count_weight=config.model.binarization_count_weight,
                 binarization_model=config.model.binarization_model,
                 hierarchical_quadrature_points=config.model.hierarchical_quadrature_points,
+                unknown_prior_weight=config.model.unknown_prior_weight,
+                unknown_prior_weight_auto=config.model.unknown_prior_weight_auto,
+                unknown_prior_weight_auto_alpha=config.model.unknown_prior_weight_auto_alpha,
             )
             if needs_bayesian
             else None

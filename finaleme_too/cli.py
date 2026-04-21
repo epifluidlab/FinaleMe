@@ -126,6 +126,38 @@ def main() -> None:
     help="Number of quadrature points for hierarchical binarization "
     "likelihood integration (default from config: 24).",
 )
+@click.option(
+    "--unknown-prior-weight",
+    "unknown_prior_weight",
+    default=None,
+    type=float,
+    help="Strength of the prior pulling the 'Unknown' tissue fraction toward 0. "
+    "Adds -lambda * log(1 - w_unknown) to the negative log-likelihood, which is "
+    "equivalent to a Beta(1, lambda+1) prior on w_unknown marginally. "
+    "Lambda represents 'pseudo-observations of not-Unknown evidence.' "
+    "Practical values: 0 (default, no prior), 5-10 (mild bias), 20-50 "
+    "(strong bias; recommended for clinical cfDNA), 100+ (near-disables Unknown). "
+    "Ignored when --unknown-prior-weight-auto is set.",
+)
+@click.option(
+    "--unknown-prior-weight-auto",
+    "unknown_prior_weight_auto",
+    is_flag=True,
+    default=False,
+    help="Auto-scale Unknown prior strength per sample: "
+    "lambda = alpha * M_valid where M_valid is the number of usable markers. "
+    "This keeps the prior:likelihood balance stable across samples with "
+    "different marker counts. Overrides --unknown-prior-weight when set. "
+    "Alpha defaults to 0.01 (moderate); tune with --unknown-prior-weight-auto-alpha.",
+)
+@click.option(
+    "--unknown-prior-weight-auto-alpha",
+    "unknown_prior_weight_auto_alpha",
+    default=None,
+    type=float,
+    help="Alpha coefficient for --unknown-prior-weight-auto (lambda = alpha * M). "
+    "0.005 = mild, 0.01 = moderate (default), 0.02 = strong.",
+)
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Pre-computed CpG density / region class annotations TSV "
                    "(chrom, start, end, cpg_density, [region_class]).")
@@ -183,6 +215,9 @@ def run_cmd(
     binarization_model: str | None,
     hierarchical_call_weight: float | None,
     hierarchical_quadrature_points: int | None,
+    unknown_prior_weight: float | None,
+    unknown_prior_weight_auto: bool,
+    unknown_prior_weight_auto_alpha: float | None,
     region_annotation: str | None,
     strict_regions: str | None,
     n_markers_per_type: int | None,
@@ -267,6 +302,24 @@ def run_cmd(
                 param_hint="--hierarchical-quadrature-points",
             )
         config.model.hierarchical_quadrature_points = hq
+    if _was_provided("unknown_prior_weight"):
+        upw = float(unknown_prior_weight or 0.0)
+        if upw < 0.0:
+            raise click.BadParameter(
+                "--unknown-prior-weight must be >= 0",
+                param_hint="--unknown-prior-weight",
+            )
+        config.model.unknown_prior_weight = upw
+    if _was_provided("unknown_prior_weight_auto"):
+        config.model.unknown_prior_weight_auto = bool(unknown_prior_weight_auto)
+    if _was_provided("unknown_prior_weight_auto_alpha"):
+        upa = float(unknown_prior_weight_auto_alpha or 0.0)
+        if upa < 0.0:
+            raise click.BadParameter(
+                "--unknown-prior-weight-auto-alpha must be >= 0",
+                param_hint="--unknown-prior-weight-auto-alpha",
+            )
+        config.model.unknown_prior_weight_auto_alpha = upa
     if bayesian:  # is_flag — only True when explicitly set
         config.model.deconvolution = SolverMethod.BAYESIAN
         # --bayesian implies Bayesian uncertainty unless the user picked
@@ -343,6 +396,21 @@ def run_cmd(
     if _was_provided("marker_format"):
         config.markers.marker_format = marker_format
     effective_marker_format = config.markers.marker_format
+
+    # Log effective Unknown-prior configuration so users can confirm what
+    # regularization was applied (especially important for clinical cfDNA
+    # where Unknown collapse is a known failure mode).
+    if config.model.unknown_prior_weight_auto:
+        log.info(
+            "Unknown prior: auto mode "
+            "(lambda = %.4f * M_valid per sample)",
+            config.model.unknown_prior_weight_auto_alpha,
+        )
+    elif config.model.unknown_prior_weight > 0.0:
+        log.info(
+            "Unknown prior: lambda = %.3f (fixed)",
+            config.model.unknown_prior_weight,
+        )
 
     t0 = perf_counter()
     reference, markers, cpg_idx = build_reference_and_markers(
