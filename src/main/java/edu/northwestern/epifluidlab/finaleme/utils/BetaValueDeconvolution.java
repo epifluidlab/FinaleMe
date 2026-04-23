@@ -110,6 +110,28 @@ public class BetaValueDeconvolution {
             + "(q_value <= fdrAlpha -> significant=YES). Default: 0.05")
     public double fdrAlpha = 0.05;
 
+    @Option(name = "-bootstrapStratified", usage = "Stratified bootstrap: resample markers WITHIN each cell-type "
+            + "group (from the `target` column in the reference panel) rather than uniformly across all markers. "
+            + "Eliminates the inflated-variance bias for cell types with fewer markers. Falls back to uniform "
+            + "resampling if the reference panel has no `target` column. Default: false")
+    public boolean bootstrapStratified = false;
+
+    @Option(name = "-permutationTest", usage = "Column-permutation test: for each cell type c, shuffle the rows of "
+            + "the c-th reference column, re-run NNLS, and compute p_c = (k+1)/(B+1) where k = #{permuted w_c >= "
+            + "observed w_c}. Produces frequentist-calibrated p-values that can resolve below 1/(bootstrap B+1). "
+            + "BH-adjusted to q-values across cell types. When enabled, replaces the bootstrap-tail p in the "
+            + "output; bootstrap is still run (if enabled) for the CI. Default: false")
+    public boolean permutationTest = false;
+
+    @Option(name = "-nPermutations", usage = "Number of column permutations per cell type (default: 1000). Each "
+            + "cell type gets its own independent set of permutations, so total NNLS solves = K * nPermutations. "
+            + "Recommended: 1000 for routine use, 10000 when you want to resolve small p-values.")
+    public int nPermutations = 1000;
+
+    @Option(name = "-permutationSeed", usage = "RNG seed for permutation tests (default: -1 = fresh entropy). "
+            + "Set to a non-negative integer to fix the permutation order.")
+    public long permutationSeed = -1L;
+
     @Option(name = "-h", usage = "Show help")
     public boolean help = false;
 
@@ -216,6 +238,15 @@ public class BetaValueDeconvolution {
 
     // ========================= Main =========================
 
+    /**
+     * Per-marker primary cell-type label (the `target` column in the reference
+     * panel TSV). Populated by {@link #loadReferencePanel} and consumed by
+     * stratified bootstrap. Null / empty when the panel has no `target` column
+     * (in which case bootstrap falls back to uniform resampling).
+     * Aligned 1-to-1 with the rows of {@code refSelected} (post-binarization).
+     */
+    private List<String> markerTargets = new ArrayList<>();
+
     public static void main(String[] args) throws Exception {
         new BetaValueDeconvolution().doMain(args);
     }
@@ -280,6 +311,7 @@ public class BetaValueDeconvolution {
             selectedWindows = (List<Window>) panelData[0];
             double[][] refMatrix = (double[][]) panelData[1];
             cellTypes = (List<String>) panelData[2];
+            this.markerTargets = (List<String>) panelData[3];
             log.info("Reference panel: {} markers x {} cell types", selectedWindows.size(), cellTypes.size());
 
             // Binarize reference
@@ -317,6 +349,7 @@ public class BetaValueDeconvolution {
                     selectedWindows = (List<Window>) panelData[0];
                     refMatrix = (double[][]) panelData[1];
                     cellTypes = (List<String>) panelData[2];
+                    this.markerTargets = (List<String>) panelData[3];
                     if (cellTypes == null || cellTypes.isEmpty()) {
                         System.err.println("Error: -markerRegions file has no embedded cell-type value columns. "
                                 + "Provide -refBetas/-refGroups or a marker atlas with per-cell-type values.");
@@ -383,6 +416,7 @@ public class BetaValueDeconvolution {
         List<String> sampleNames = new ArrayList<>();
         List<double[]> allWeights = new ArrayList<>();
         List<BootstrapResult> allBoot = new ArrayList<>();  // one per sample when bootstrap enabled
+        List<PermutationResult> allPerm = new ArrayList<>();  // one per sample when permutation enabled
 
         for (String queryFile : queryFiles) {
             log.info("Processing query: {}", queryFile);
@@ -408,36 +442,64 @@ public class BetaValueDeconvolution {
             allWeights.add(weights);
 
             if (bootstrap) {
-                log.info("Running bootstrap ({} replicates, {} threads)...", nBootstrap, bootstrapThreads);
+                log.info("Running bootstrap ({} replicates, {} threads, stratified={})...",
+                        nBootstrap, bootstrapThreads, bootstrapStratified);
                 BootstrapResult br = runBootstrap(refSelected, queryValues, weights);
                 allBoot.add(br);
+            }
+            if (permutationTest) {
+                log.info("Running column-permutation test ({} permutations per cell type, {} threads)...",
+                        nPermutations, bootstrapThreads);
+                PermutationResult pr = runPermutationTest(refSelected, queryValues, weights);
+                allPerm.add(pr);
             }
         }
 
         // Step 8: Output — two schemas, chosen by whether bootstrap was run.
         PrintWriter out = outputFile != null ? new PrintWriter(new FileWriter(outputFile)) : new PrintWriter(System.out);
 
-        if (bootstrap) {
+        if (bootstrap || permutationTest) {
             // Long-form output: one row per (sample, cell_type) with stats.
+            //
+            // When both -bootstrap and -permutationTest are on:
+            //   - CI comes from bootstrap
+            //   - p-value / q-value / significant come from permutation
+            //     (permutation p has better resolution at small values)
+            // When only one is on, that source supplies all three.
             double alpha = 1.0 - ciLevel;
             double loPct = 100.0 * (alpha / 2.0);
             double hiPct = 100.0 * (1.0 - alpha / 2.0);
-            out.println("sample\tcell_type\tproportion\tCI_lower\tCI_upper\tp_value\tq_value\tsignificant\tn_bootstrap");
+            String pSource = permutationTest ? "permutation" : "bootstrap";
+            out.println("sample\tcell_type\tproportion\tCI_lower\tCI_upper\tp_value\tq_value\tsignificant\tp_source\tn_replicates");
             for (int s = 0; s < sampleNames.size(); s++) {
                 String sname = sampleNames.get(s);
                 double[] w = allWeights.get(s);
-                BootstrapResult br = allBoot.get(s);
+                BootstrapResult br = bootstrap ? allBoot.get(s) : null;
+                PermutationResult pr = permutationTest ? allPerm.get(s) : null;
                 for (int c = 0; c < cellTypes.size(); c++) {
                     double prop = w[c] < 0.001 ? 0.0 : w[c];
-                    String sig = (br.qValue[c] <= fdrAlpha) ? "YES" : "NO";
-                    out.printf(
-                            "%s\t%s\t%.4f\t%.4f\t%.4f\t%.4g\t%.4g\t%s\t%d%n",
-                            sname, cellTypes.get(c), prop,
-                            br.ciLower[c], br.ciUpper[c],
-                            br.pValue[c], br.qValue[c], sig, nBootstrap);
+                    double ciLo = (br != null) ? br.ciLower[c] : Double.NaN;
+                    double ciHi = (br != null) ? br.ciUpper[c] : Double.NaN;
+                    double p = (pr != null) ? pr.pValue[c] : br.pValue[c];
+                    double q = (pr != null) ? pr.qValue[c] : br.qValue[c];
+                    String sig = (q <= fdrAlpha) ? "YES" : "NO";
+                    int nRep = (pr != null) ? pr.nPermutations : nBootstrap;
+                    if (Double.isNaN(ciLo)) {
+                        out.printf(
+                                "%s\t%s\t%.4f\tNA\tNA\t%.4g\t%.4g\t%s\t%s\t%d%n",
+                                sname, cellTypes.get(c), prop,
+                                p, q, sig, pSource, nRep);
+                    } else {
+                        out.printf(
+                                "%s\t%s\t%.4f\t%.4f\t%.4f\t%.4g\t%.4g\t%s\t%s\t%d%n",
+                                sname, cellTypes.get(c), prop,
+                                ciLo, ciHi,
+                                p, q, sig, pSource, nRep);
+                    }
                 }
             }
-            log.info("Bootstrap output: percentile CI at [{}%, {}%], FDR threshold {}", loPct, hiPct, fdrAlpha);
+            log.info("Stats output: CI {} at [{}%, {}%], p-values from {}, FDR threshold {}",
+                    bootstrap ? "from bootstrap" : "(not computed)", loPct, hiPct, pSource, fdrAlpha);
         } else {
             // Wide-form output (legacy): cell_type | sample1 | sample2 | ...
             out.print("cell_type");
@@ -567,6 +629,8 @@ public class BetaValueDeconvolution {
         int startCpgCol = -1;
         int endCpgCol = -1;
         int firstValueCol = 3;
+        int targetCol = -1;
+        List<String> markerTargets = new ArrayList<>();
 
         try {
             String line;
@@ -598,6 +662,9 @@ public class BetaValueDeconvolution {
 
                         startCpgCol = findHeaderColumnIndex(parts, "startcpg", "start_cpg");
                         endCpgCol = findHeaderColumnIndex(parts, "endcpg", "end_cpg");
+                        // `target` column carries the primary cell-type label per marker
+                        // (used by stratified bootstrap to resample within cell types).
+                        targetCol = findHeaderColumnIndex(parts, "target");
                         int directionCol = findHeaderColumnIndex(parts, "direction");
                         if (directionCol >= 0 && directionCol + 1 < parts.length) {
                             firstValueCol = directionCol + 1;
@@ -675,6 +742,14 @@ public class BetaValueDeconvolution {
                 }
                 windows.add(new Window(chr, start, end, startCpgIdx, endCpgExclusive));
 
+                // Capture the `target` cell-type label for this marker row (or null if absent).
+                String targetLabel = null;
+                if (targetCol >= 0 && targetCol < parts.length) {
+                    targetLabel = parts[targetCol].trim();
+                    if (targetLabel.isEmpty()) targetLabel = null;
+                }
+                markerTargets.add(targetLabel);
+
                 int nCt = (cellTypes != null) ? cellTypes.size() : Math.max(0, parts.length - firstValueCol);
                 double[] vals = new double[nCt];
                 Arrays.fill(vals, Double.NaN);
@@ -732,8 +807,17 @@ public class BetaValueDeconvolution {
                         + "(skipped {} non-autosome, {} duplicate, {} no-CpG, {} coord-parse)",
                 parsedRows, nMarkers, skippedNonAutosome, skippedDuplicate, skippedNoCpg, coordParseErrors
         );
+        if (targetCol >= 0) {
+            long withTarget = markerTargets.stream().filter(Objects::nonNull).count();
+            long distinct = markerTargets.stream().filter(Objects::nonNull).distinct().count();
+            log.info("Reference panel `target` column: {} markers labeled, {} distinct cell types",
+                    withTarget, distinct);
+        } else {
+            log.info("Reference panel has no `target` column — stratified bootstrap will "
+                    + "fall back to uniform if requested.");
+        }
 
-        return new Object[]{windows, refMatrix, cellTypes};
+        return new Object[]{windows, refMatrix, cellTypes, markerTargets};
     }
 
     private List<Window> loadMarkerRegions(String path) throws IOException {
@@ -1492,10 +1576,50 @@ public class BetaValueDeconvolution {
         // consume a deterministic sequence regardless of completion order.
         long baseSeed = (bootstrapSeed >= 0) ? bootstrapSeed : System.nanoTime();
         Random idxRng = new Random(baseSeed);
-        final int[][] bootIdx = new int[B][M];
-        for (int b = 0; b < B; b++) {
+        final int[][] bootIdx;
+
+        // Decide uniform vs stratified. Stratified is active when the user
+        // set -bootstrapStratified AND the reference panel populated a
+        // usable `target` column (at least two distinct labels, enough
+        // markers per group to bootstrap meaningfully).
+        boolean useStratified = bootstrapStratified && canStratify(M);
+        if (bootstrapStratified && !useStratified) {
+            log.warn("  -bootstrapStratified requested but reference panel lacks usable "
+                    + "`target` column or too few per-group markers; falling back to uniform.");
+        }
+
+        if (useStratified) {
+            // Group marker indices by `target` label, then resample within each group.
+            LinkedHashMap<String, List<Integer>> groups = new LinkedHashMap<>();
             for (int i = 0; i < M; i++) {
-                bootIdx[b][i] = idxRng.nextInt(M);
+                String t = (i < markerTargets.size()) ? markerTargets.get(i) : null;
+                if (t == null) t = "__unlabeled__";
+                groups.computeIfAbsent(t, k -> new ArrayList<>()).add(i);
+            }
+            log.info("  stratified bootstrap: {} groups, group sizes: {}",
+                    groups.size(),
+                    groups.entrySet().stream()
+                            .map(e -> e.getKey() + "=" + e.getValue().size())
+                            .collect(Collectors.joining(", ")));
+
+            bootIdx = new int[B][M];
+            for (int b = 0; b < B; b++) {
+                int writeOffset = 0;
+                for (List<Integer> groupIndices : groups.values()) {
+                    int g = groupIndices.size();
+                    for (int k = 0; k < g; k++) {
+                        bootIdx[b][writeOffset + k] = groupIndices.get(idxRng.nextInt(g));
+                    }
+                    writeOffset += g;
+                }
+            }
+        } else {
+            // Uniform bootstrap over all markers.
+            bootIdx = new int[B][M];
+            for (int b = 0; b < B; b++) {
+                for (int i = 0; i < M; i++) {
+                    bootIdx[b][i] = idxRng.nextInt(M);
+                }
             }
         }
 
@@ -1562,6 +1686,167 @@ public class BetaValueDeconvolution {
         double[] qValue = benjaminiHochberg(pValue);
 
         return new BootstrapResult(ciLower, ciUpper, pValue, qValue, replicates);
+    }
+
+    /**
+     * True when stratified bootstrap can run: (a) markerTargets is populated
+     * and aligns with M, (b) at least 2 distinct non-null labels, (c) no group
+     * has fewer than 2 markers (single-marker groups give zero-variance
+     * bootstrap samples, which trivially inflate CI width elsewhere).
+     */
+    private boolean canStratify(int M) {
+        if (markerTargets == null || markerTargets.size() != M) return false;
+        LinkedHashMap<String, Integer> counts = new LinkedHashMap<>();
+        int labeled = 0;
+        for (String t : markerTargets) {
+            if (t == null || t.isEmpty()) continue;
+            labeled++;
+            counts.merge(t, 1, Integer::sum);
+        }
+        if (labeled < M) return false; // need every marker labeled to stratify cleanly
+        if (counts.size() < 2) return false;
+        for (int n : counts.values()) if (n < 2) return false;
+        return true;
+    }
+
+    /** Per-sample permutation-test result, parallel in shape to BootstrapResult. */
+    static class PermutationResult {
+        final double[] pValue;   // length K, from column-permutation test
+        final double[] qValue;   // length K, BH-adjusted
+        final int nPermutations;
+
+        PermutationResult(double[] pValue, double[] qValue, int nPermutations) {
+            this.pValue = pValue;
+            this.qValue = qValue;
+            this.nPermutations = nPermutations;
+        }
+    }
+
+    /**
+     * Column-permutation test for each cell type.
+     *
+     * For each c in 0..K-1:
+     *   1. Save the original column X[:, c].
+     *   2. For b = 1..P:
+     *      a. Shuffle the rows of X[:, c] into a new column X'[:, c].
+     *      b. Solve NNLS on (X', y), giving w_permuted.
+     *      c. Record w_permuted[c].
+     *   3. Restore the original column.
+     *   4. p_c = (#{b: w_permuted[c] >= w_observed[c]} + 1) / (P + 1)
+     *
+     * This tests whether the arrangement of the c-th reference column against
+     * the sample's binarized vector is significantly better than a random
+     * permutation of the same column values. Smaller p = stronger evidence
+     * that the signal in column c is specific to the sample.
+     *
+     * Parallelizes across permutations within each cell type (the c loop
+     * is sequential because it mutates the shared X column). Uses a seeded
+     * RNG to pre-generate all permutation orders for reproducibility.
+     */
+    private PermutationResult runPermutationTest(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
+            throws InterruptedException {
+        int M = refMatrix.length;
+        int K = refMatrix[0].length;
+        int P = nPermutations;
+
+        long baseSeed = (permutationSeed >= 0) ? permutationSeed : System.nanoTime();
+        Random permRng = new Random(baseSeed);
+
+        // Pre-generate K * P permutations: permOrders[c][b] is a length-M
+        // permutation of [0, M) that will re-order column c in replicate b.
+        int[][][] permOrders = new int[K][P][];
+        int[] identity = new int[M];
+        for (int i = 0; i < M; i++) identity[i] = i;
+        for (int c = 0; c < K; c++) {
+            for (int b = 0; b < P; b++) {
+                int[] order = identity.clone();
+                // Fisher-Yates shuffle
+                for (int i = M - 1; i > 0; i--) {
+                    int j = permRng.nextInt(i + 1);
+                    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                }
+                permOrders[c][b] = order;
+            }
+        }
+
+        double[] pValue = new double[K];
+        int nThreads = Math.max(1, bootstrapThreads);
+
+        for (int c = 0; c < K; c++) {
+            final int cc = c;
+            final double observed = pointEstimate[c];
+            double[] originalCol = new double[M];
+            for (int i = 0; i < M; i++) originalCol[i] = refMatrix[i][cc];
+
+            // Snapshot of the rest of the matrix is implicit: we only touch column cc.
+            // Use atomic counter for thread-safe tallying.
+            java.util.concurrent.atomic.AtomicInteger geCount = new java.util.concurrent.atomic.AtomicInteger(0);
+
+            Runnable onePermutation = () -> {};  // overwritten below
+
+            if (nThreads == 1) {
+                double[] wPerm = new double[K];
+                double[][] Xp = refMatrix;  // we mutate column cc in place then restore
+                for (int b = 0; b < P; b++) {
+                    int[] order = permOrders[cc][b];
+                    // Install permuted column
+                    double[] newCol = new double[M];
+                    for (int i = 0; i < M; i++) newCol[i] = originalCol[order[i]];
+                    for (int i = 0; i < M; i++) Xp[i][cc] = newCol[i];
+                    wPerm = solveNNLS(Xp, queryVector);
+                    if (wPerm[cc] >= observed) geCount.incrementAndGet();
+                    if ((b + 1) % Math.max(1, P / 10) == 0) {
+                        log.info("  permutation CT{}/{} replicate {}/{}", cc + 1, K, b + 1, P);
+                    }
+                }
+                // Restore original column
+                for (int i = 0; i < M; i++) Xp[i][cc] = originalCol[i];
+            } else {
+                // Parallel permutations: each thread gets its own deep-copied X
+                // so column mutations don't race. Deep copy is O(M*K) per task
+                // — acceptable because K is small and NNLS itself is O(M*K*iter).
+                java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newFixedThreadPool(nThreads);
+                java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>(P);
+                java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+                for (int b = 0; b < P; b++) {
+                    final int bb = b;
+                    futures.add(exec.submit(() -> {
+                        double[][] Xp = new double[M][K];
+                        for (int i = 0; i < M; i++) {
+                            System.arraycopy(refMatrix[i], 0, Xp[i], 0, K);
+                        }
+                        int[] order = permOrders[cc][bb];
+                        for (int i = 0; i < M; i++) Xp[i][cc] = originalCol[order[i]];
+                        double[] wPerm = solveNNLS(Xp, queryVector);
+                        if (wPerm[cc] >= observed) geCount.incrementAndGet();
+                        int d = done.incrementAndGet();
+                        if (d % Math.max(1, P / 10) == 0) {
+                            log.info("  permutation CT{}/{} replicate {}/{}", cc + 1, K, d, P);
+                        }
+                    }));
+                }
+                for (java.util.concurrent.Future<?> f : futures) {
+                    try {
+                        f.get();
+                    } catch (java.util.concurrent.ExecutionException ee) {
+                        exec.shutdown();
+                        throw new RuntimeException("Permutation replicate failed for cell type "
+                                + cellTypesForLog(cc), ee.getCause());
+                    }
+                }
+                exec.shutdown();
+            }
+
+            pValue[cc] = (geCount.get() + 1.0) / (P + 1.0);
+        }
+
+        double[] qValue = benjaminiHochberg(pValue);
+        return new PermutationResult(pValue, qValue, P);
+    }
+
+    /** Safe index-based cell-type label for error messages (avoids NPE when cellTypes is null). */
+    private String cellTypesForLog(int c) {
+        return "index " + c;
     }
 
     /** One NNLS replicate on a bootstrapped marker subsample. */
