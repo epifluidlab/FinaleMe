@@ -137,6 +137,13 @@ class TOOPipeline:
         self._region_annotation_lookup: pd.DataFrame | None = None
         self.group_comparison_spec = group_comparison_spec
         self.cpg_index = cpg_index
+        # Dispatch MLE vs NNLS via solver_method. Bayesian lives in a
+        # separate class and is handled below.
+        _solver_method = (
+            "nnls"
+            if config.model.deconvolution == SolverMethod.NNLS
+            else "mle"
+        )
         self.deconvolver = MLEDeconvolver(
             binarization_count_weight=config.model.binarization_count_weight,
             binarization_model=config.model.binarization_model,
@@ -144,6 +151,8 @@ class TOOPipeline:
             unknown_prior_weight=config.model.unknown_prior_weight,
             unknown_prior_weight_auto=config.model.unknown_prior_weight_auto,
             unknown_prior_weight_auto_alpha=config.model.unknown_prior_weight_auto_alpha,
+            solver_method=_solver_method,
+            disable_unknown=config.model.disable_unknown,
         )
         self.fragment_deconvolver = FragmentLevelDeconvolver()
         # v3 binarization observation-model builder. Cheap to construct
