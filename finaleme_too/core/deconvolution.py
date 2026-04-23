@@ -159,7 +159,27 @@ class DeconvolutionResult:
 
 
 class MLEDeconvolver:
-    """Constrained MLE deconvolution via SLSQP."""
+    """Constrained MLE / NNLS deconvolution.
+
+    Supports two solver modes:
+
+    * ``solver_method="mle"`` (default): SLSQP-based constrained MLE with
+      beta-binomial or binarization likelihood. Uses the distributional
+      assumptions encoded in the observation model.
+
+    * ``solver_method="nnls"``: Lawson-Hanson non-negative least squares
+      with a post-hoc sum=1 renormalization. Matches the behavior of the
+      Java ``BetaValueDeconvolution`` tool (L2 residual minimization over
+      per-marker predicted methylation). More robust than SLSQP when the
+      reference/sample signal has been degraded by hard binarization,
+      at the cost of dropping the likelihood-based uncertainty model.
+
+    The ``disable_unknown`` flag is orthogonal to the solver choice: when
+    True the 0.5 Unknown column is not appended to the reference, so all
+    weight is forced onto the K known cell types (matches Java default
+    behavior). The returned ŵ is always padded to length K+1 for
+    compatibility (with w[-1]=0 when disabled).
+    """
 
     def __init__(
         self,
@@ -171,6 +191,8 @@ class MLEDeconvolver:
         unknown_prior_weight: float = 0.0,
         unknown_prior_weight_auto: bool = False,
         unknown_prior_weight_auto_alpha: float = 0.01,
+        solver_method: str = "mle",
+        disable_unknown: bool = False,
     ):
         self.max_iter = max_iter
         self.tol = tol
@@ -182,6 +204,16 @@ class MLEDeconvolver:
         self.hierarchical_quadrature_points = max(
             int(hierarchical_quadrature_points), 2
         )
+        # Point-estimate solver: "mle" (SLSQP) or "nnls" (Lawson-Hanson).
+        sm = str(solver_method or "mle").lower()
+        if sm not in ("mle", "nnls"):
+            raise ValueError(
+                f"solver_method must be 'mle' or 'nnls', got {sm!r}"
+            )
+        self.solver_method = sm
+        # When True, skip appending the 0.5 Unknown column to the reference.
+        # Affects both MLE and NNLS paths.
+        self.disable_unknown = bool(disable_unknown)
         # Prior on the Unknown component w_u: adds -lambda * log(1 - w_u + eps)
         # to the negative log-likelihood, equivalent to a Beta(1, lambda+1)
         # prior marginally on w_u. See design §X.Y and docstring below.
@@ -244,19 +276,22 @@ class MLEDeconvolver:
         reference: "ReferencePanel",
         marker_subset: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Return ŵ of length K+1 (with unknown last).
+        """Return ŵ of length K+1 (with unknown last; 0 when disabled).
 
-        Dispatches on the observation model type:
+        Dispatches on the observation model type and solver method:
 
-        * ``ObservationModel`` (beta-binomial, WGBS or v2 FinaleMe path)
-          → ``_solve_betabinom`` with the per-marker counts + dispersion.
-        * ``BinarizationObservationModel`` (v3 FinaleMe path) →
-          ``_solve_binarization`` with the precomputed per-marker linear
-          coefficient matrix.
+        * ``solver_method="nnls"`` → ``_solve_nnls`` regardless of model type.
+          Uses k/n as the sample observation and solves constrained NNLS
+          (L2 residual minimization) over the reference methylation matrix.
+          Matches Java ``BetaValueDeconvolution`` when ``disable_unknown=True``.
+        * ``solver_method="mle"`` (default) with ``ObservationModel`` →
+          ``_solve_betabinom`` (beta-binomial MLE via SLSQP).
+        * ``solver_method="mle"`` with ``BinarizationObservationModel`` →
+          ``_solve_binarization`` or ``_solve_hierarchical_binarization``.
 
-        The simplex constraint, bounds, SLSQP options, failure-fallback
-        scaffolding, and result post-processing are mode-independent and
-        live in ``_run_slsqp`` so both branches share them.
+        When ``disable_unknown`` is True the solver works over K columns
+        only; the returned vector is padded to K+1 with 0 for Unknown so
+        downstream code can always index ``w[-1]``.
         """
         # Local import to avoid a top-level circular import (the
         # binarization module imports MarkerObservations from io which
@@ -266,12 +301,167 @@ class MLEDeconvolver:
             BinarizationObservationModel,
         )
 
+        if self.solver_method == "nnls":
+            return self._solve_nnls(model, reference, marker_subset)
+
         if isinstance(model, BinarizationObservationModel):
             obs_model = str(getattr(model, "binarization_model", "legacy")).lower()
             if self.binarization_model == "hierarchical" or obs_model == "hierarchical":
                 return self._solve_hierarchical_binarization(model, marker_subset)
             return self._solve_binarization(model, reference, marker_subset)
         return self._solve_betabinom(model, reference, marker_subset)
+
+    def _solve_nnls(
+        self,
+        model,
+        reference: "ReferencePanel",
+        marker_subset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Non-negative least squares (Lawson-Hanson).
+
+        Minimizes ``||y - X w||^2`` subject to ``w >= 0``, then
+        renormalizes so ``sum(w) = 1``. ``y`` is the per-marker predicted
+        methylation (k_i / n_i) from the sample, ``X`` is the reference
+        methylation matrix (augmented with the 0.5 Unknown column unless
+        ``disable_unknown`` is True).
+
+        Optional Tikhonov regularization on the Unknown weight via
+        ``unknown_prior_weight`` (or auto-scaled variant): adds a synthetic
+        penalty row ``[0, ..., 0, sqrt(lambda)]`` with target 0 so the
+        augmented-NNLS objective becomes ``||y - X w||^2 + lambda * w_u^2``.
+        Has no effect when ``disable_unknown`` is True (no Unknown column
+        to penalize).
+
+        Returns a weight vector of length K+1 (Unknown last). When
+        ``disable_unknown`` is True, w[-1] is always 0.0.
+        """
+        from scipy.optimize import nnls
+
+        # Import here to keep the top of the file clean; _solve_nnls is
+        # dispatched only when solver_method == "nnls".
+        from finaleme_too.core.observation_model_binarization import (
+            BinarizationObservationModel,
+        )
+
+        R_full = self._augmented_reference(
+            reference, disable_unknown=self.disable_unknown
+        )
+        K_tissues = int(reference.methylation.shape[1])
+        K_total = R_full.shape[1]  # K or K+1
+
+        # Build y (per-marker observed methylation) from the model.
+        # Both ObservationModel and BinarizationObservationModel expose
+        # k and n arrays aligned with the reference rows; use k/n for NNLS.
+        if isinstance(model, BinarizationObservationModel):
+            k_arr = (
+                np.asarray(model.k, dtype=np.float64)
+                if model.k is not None
+                else None
+            )
+            n_arr = (
+                np.asarray(model.n, dtype=np.float64)
+                if model.n is not None
+                else None
+            )
+            if k_arr is None or n_arr is None:
+                raise DeconvolutionFailedError(
+                    f"Sample {model.sample_id}: NNLS solver needs k and n "
+                    "per marker, but the binarization observation model is "
+                    "missing them. Provide --input-format that yields counts."
+                )
+            # The binarization observation model typically subsets to valid
+            # markers; rebuild y aligned to the FULL reference (all rows)
+            # and trust the pipeline's valid-mask logic to gate rows.
+            valid_mask = getattr(model, "valid_mask", None)
+            if valid_mask is not None and (
+                np.asarray(valid_mask).shape[0] == R_full.shape[0]
+            ):
+                y_full = np.full(R_full.shape[0], np.nan, dtype=np.float64)
+                vm = np.asarray(valid_mask, dtype=bool)
+                # k_arr/n_arr are length-valid; map back
+                y_valid = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
+                y_full[vm] = y_valid
+                weights_full = np.zeros(R_full.shape[0], dtype=np.float64)
+                weights_full[vm] = np.asarray(model.weights, dtype=np.float64)
+            else:
+                # No valid_mask — assume k_arr aligned to full reference
+                y_full = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
+                weights_full = np.asarray(model.weights, dtype=np.float64)
+        else:
+            # ObservationModel (WGBS/v2 FinaleMe path)
+            k_arr = np.asarray(model.k, dtype=np.float64)
+            n_arr = np.asarray(model.n, dtype=np.float64)
+            y_full = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
+            weights_full = np.asarray(model.weights, dtype=np.float64)
+
+        X = R_full
+        y = y_full
+        w_obj = weights_full
+
+        if marker_subset is not None:
+            X = X[marker_subset]
+            y = y[marker_subset]
+            w_obj = w_obj[marker_subset]
+
+        # Drop rows with NaN in reference or y
+        valid = (
+            np.isfinite(y)
+            & np.all(np.isfinite(X), axis=1)
+            & (w_obj > 0)
+        )
+        if int(np.sum(valid)) < K_total:
+            # Not enough markers to identify the simplex: fall back
+            # uniformly over K tissues (Unknown=0 when disabled, else
+            # all weight on Unknown).
+            uniform = np.zeros(K_tissues + 1, dtype=np.float64)
+            if self.disable_unknown:
+                uniform[:K_tissues] = 1.0 / K_tissues
+            else:
+                uniform[-1] = 1.0
+            return uniform
+
+        X_v = X[valid]
+        y_v = y[valid]
+        w_obj_v = w_obj[valid]
+
+        # Apply marker weights as a row-wise scaling: NNLS does not
+        # natively accept weights, but scaling rows by sqrt(w) yields
+        # an equivalent weighted least-squares objective.
+        sqrt_w = np.sqrt(np.maximum(w_obj_v, 0.0))
+        X_w = X_v * sqrt_w[:, None]
+        y_w = y_v * sqrt_w
+
+        # Optional Tikhonov penalty on Unknown weight: augment the system
+        # with a synthetic row that penalizes w_unknown.
+        # NOTE: only meaningful when Unknown column exists (not disabled).
+        if (not self.disable_unknown) and K_total > K_tissues:
+            lam = self._effective_unknown_prior_weight(
+                int(np.sum(valid)), sample_id=model.sample_id
+            )
+            if lam > 0.0:
+                pen_row = np.zeros((1, K_total), dtype=np.float64)
+                pen_row[0, -1] = float(np.sqrt(lam))
+                X_w = np.vstack([X_w, pen_row])
+                y_w = np.concatenate([y_w, np.array([0.0])])
+
+        try:
+            w_hat, _ = nnls(X_w, y_w, maxiter=max(self.max_iter, 3 * K_total))
+        except Exception as exc:  # noqa: BLE001
+            raise DeconvolutionFailedError(
+                f"NNLS failed for sample {model.sample_id}: {exc}"
+            ) from exc
+
+        # Renormalize to the simplex. NNLS is unconstrained in sum, so
+        # renormalize post-hoc (matches Java BetaValueDeconvolution).
+        w_hat = np.clip(w_hat, 0.0, None)
+        s = float(np.sum(w_hat))
+        if s <= 0:
+            # All-zero solution — fall back to uniform over active columns.
+            w_hat = np.full(K_total, 1.0 / K_total, dtype=np.float64)
+        else:
+            w_hat = w_hat / s
+
+        return self._pad_unknown(w_hat, K_tissues)
 
     def _solve_betabinom(
         self,
@@ -280,7 +470,10 @@ class MLEDeconvolver:
         marker_subset: np.ndarray | None = None,
     ) -> np.ndarray:
         """Beta-binomial MLE solver (WGBS mode and v2 FinaleMe fallback)."""
-        R_full = self._augmented_reference(reference)
+        R_full = self._augmented_reference(
+            reference, disable_unknown=self.disable_unknown
+        )
+        K_tissues = int(reference.methylation.shape[1])
         k_arr = model.k
         n_arr = model.n
         phi = model.dispersion
@@ -299,9 +492,14 @@ class MLEDeconvolver:
             & np.all(np.isfinite(R_full), axis=1)
         )
         if int(np.sum(valid)) < R_full.shape[1]:
-            # Insufficient markers — fall back to uniform with all weight on unknown
-            uniform = np.zeros(R_full.shape[1], dtype=np.float64)
-            uniform[-1] = 1.0
+            # Insufficient markers — fall back: all weight on Unknown
+            # (if available) or uniform over tissues.
+            if self.disable_unknown:
+                uniform = np.zeros(K_tissues + 1, dtype=np.float64)
+                uniform[:K_tissues] = 1.0 / K_tissues
+            else:
+                uniform = np.zeros(R_full.shape[1], dtype=np.float64)
+                uniform[-1] = 1.0
             return uniform
 
         R = R_full[valid]
@@ -311,8 +509,13 @@ class MLEDeconvolver:
         w_obj = weights[valid]
         K_total = R.shape[1]
 
-        lam = self._effective_unknown_prior_weight(
-            int(np.sum(valid)), sample_id=model.sample_id
+        # Unknown prior is only meaningful when the Unknown column exists.
+        lam = (
+            self._effective_unknown_prior_weight(
+                int(np.sum(valid)), sample_id=model.sample_id
+            )
+            if not self.disable_unknown
+            else 0.0
         )
         eps_prior = 1e-9
 
@@ -337,9 +540,10 @@ class MLEDeconvolver:
                 g[-1] += lam / (1.0 - w[-1] + eps_prior)
             return g
 
-        return self._run_slsqp(
+        w_hat = self._run_slsqp(
             neg_ll, neg_grad, K_total, sample_id=model.sample_id
         )
+        return self._pad_unknown(w_hat, K_tissues)
 
     def _solve_binarization(
         self,
@@ -368,6 +572,16 @@ class MLEDeconvolver:
         """
         coef = np.asarray(model.coef, dtype=np.float64)       # (M_valid, K+1)
         weights = np.asarray(model.weights, dtype=np.float64)  # (M_valid,)
+        K_tissues = int(reference.methylation.shape[1])
+        # When disable_unknown is set, drop the trailing Unknown column from
+        # the pre-computed coef matrix (built by BinarizationModel with K+1
+        # columns by default). Renormalize each row so sum(coef_row)=1 still
+        # holds over the K remaining columns (state-likelihood invariant).
+        if self.disable_unknown and coef.shape[1] == K_tissues + 1:
+            coef_wo = coef[:, :K_tissues]
+            row_sums = coef_wo.sum(axis=1, keepdims=True)
+            row_sums = np.where(row_sums > 1e-12, row_sums, 1.0)
+            coef = coef_wo / row_sums
         K_total = coef.shape[1]
 
         use_count_term = (
@@ -381,7 +595,9 @@ class MLEDeconvolver:
             k = np.asarray(model.k, dtype=np.float64)
             n = np.asarray(model.n, dtype=np.float64)
             phi = np.asarray(model.dispersion, dtype=np.float64)
-            R_full = self._augmented_reference(reference)
+            R_full = self._augmented_reference(
+                reference, disable_unknown=self.disable_unknown
+            )
             valid_mask = getattr(model, "valid_mask", None)
             if valid_mask is None:
                 # Defensive fallback for legacy in-memory models that may
@@ -434,8 +650,12 @@ class MLEDeconvolver:
             )
 
         if int(np.sum(valid)) < K_total:
-            uniform = np.zeros(K_total, dtype=np.float64)
-            uniform[-1] = 1.0
+            if self.disable_unknown:
+                uniform = np.zeros(K_tissues + 1, dtype=np.float64)
+                uniform[:K_tissues] = 1.0 / K_tissues
+            else:
+                uniform = np.zeros(K_total, dtype=np.float64)
+                uniform[-1] = 1.0
             return uniform
 
         coef_v = coef[valid]
@@ -446,8 +666,12 @@ class MLEDeconvolver:
             phi_v = phi[valid]
             R_v = R[valid]
 
-        lam = self._effective_unknown_prior_weight(
-            int(np.sum(valid)), sample_id=model.sample_id
+        lam = (
+            self._effective_unknown_prior_weight(
+                int(np.sum(valid)), sample_id=model.sample_id
+            )
+            if not self.disable_unknown
+            else 0.0
         )
         eps_prior = 1e-9
 
@@ -490,9 +714,10 @@ class MLEDeconvolver:
                 g[-1] += lam / (1.0 - w[-1] + eps_prior)
             return g
 
-        return self._run_slsqp(
+        w_hat = self._run_slsqp(
             neg_ll, neg_grad, K_total, sample_id=model.sample_id
         )
+        return self._pad_unknown(w_hat, K_tissues)
 
     def _solve_hierarchical_binarization(
         self,
@@ -524,6 +749,13 @@ class MLEDeconvolver:
         weights = np.asarray(model.weights, dtype=np.float64)
         call_weight = float(np.clip(getattr(model, "call_weight", 1.0), 0.0, 1.0))
 
+        # reference_continuous is (M, K+1) by construction; drop the trailing
+        # Unknown column when disable_unknown is True so the solver works
+        # over K tissues only. Output is padded back to K+1 before returning.
+        K_tissues = R.shape[1] - 1
+        if self.disable_unknown:
+            R = R[:, :K_tissues]
+
         if marker_subset is not None:
             R = R[marker_subset]
             k = k[marker_subset]
@@ -546,8 +778,12 @@ class MLEDeconvolver:
         )
         K_total = R.shape[1]
         if int(np.sum(valid)) < K_total:
-            uniform = np.zeros(K_total, dtype=np.float64)
-            uniform[-1] = 1.0
+            if self.disable_unknown:
+                uniform = np.zeros(K_tissues + 1, dtype=np.float64)
+                uniform[:K_tissues] = 1.0 / K_tissues
+            else:
+                uniform = np.zeros(K_total, dtype=np.float64)
+                uniform[-1] = 1.0
             return uniform
 
         R_v = R[valid]
@@ -559,8 +795,12 @@ class MLEDeconvolver:
         cz_v = call_zone_prob[valid]
         w_obj = weights[valid]
 
-        lam = self._effective_unknown_prior_weight(
-            int(np.sum(valid)), sample_id=model.sample_id
+        lam = (
+            self._effective_unknown_prior_weight(
+                int(np.sum(valid)), sample_id=model.sample_id
+            )
+            if not self.disable_unknown
+            else 0.0
         )
         eps_prior = 1e-9
 
@@ -583,9 +823,10 @@ class MLEDeconvolver:
 
         # Start with scipy's internal finite-difference Jacobian for the
         # hierarchical model; this is robust and keeps implementation simple.
-        return self._run_slsqp(
+        w_hat = self._run_slsqp(
             neg_ll, None, K_total, sample_id=model.sample_id
         )
+        return self._pad_unknown(w_hat, K_tissues)
 
     def _run_slsqp(
         self,
@@ -644,11 +885,43 @@ class MLEDeconvolver:
         return w_hat / s
 
     @staticmethod
-    def _augmented_reference(reference: "ReferencePanel") -> np.ndarray:
-        """Append a column of 0.5 for the always-on unknown component."""
+    def _augmented_reference(
+        reference: "ReferencePanel",
+        disable_unknown: bool = False,
+    ) -> np.ndarray:
+        """Append a column of 0.5 for the always-on unknown component.
+
+        When ``disable_unknown=True``, returns the raw reference methylation
+        matrix without appending the Unknown column; the solver then works
+        over K cell types only.
+        """
         ref = np.asarray(reference.methylation, dtype=np.float64)
+        if disable_unknown:
+            return ref.copy()
         unknown_col = np.full((ref.shape[0], 1), UNKNOWN_PROFILE, dtype=np.float64)
         return np.hstack([ref, unknown_col])
+
+    def _pad_unknown(self, w: np.ndarray, n_cell_types: int) -> np.ndarray:
+        """Pad a K-length weight vector to K+1 by appending 0 for Unknown.
+
+        When ``disable_unknown`` is True the solver returns a length-K
+        vector; callers expect K+1 (Unknown is the last slot). Pad with 0
+        so downstream code can always index ``w[-1]`` as the Unknown
+        fraction without branching.
+        """
+        if not self.disable_unknown:
+            return w
+        if w.shape[0] == n_cell_types + 1:
+            # Already K+1 — happens when callers pre-emptively padded.
+            return w
+        if w.shape[0] != n_cell_types:
+            raise ValueError(
+                f"expected weight vector of length {n_cell_types} or "
+                f"{n_cell_types + 1}, got {w.shape[0]}"
+            )
+        out = np.zeros(n_cell_types + 1, dtype=np.float64)
+        out[:n_cell_types] = w
+        return out
 
 
 class BayesianDeconvolver:

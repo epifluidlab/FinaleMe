@@ -30,6 +30,7 @@ class CoverageTier(str, Enum):
 
 class SolverMethod(str, Enum):
     MLE = "mle"
+    NNLS = "nnls"
     BAYESIAN = "bayesian"
 
 
@@ -82,6 +83,15 @@ class ModelConfig:
     # Alpha coefficient for unknown_prior_weight_auto; lambda = alpha * M.
     # 0.005 = mild, 0.01 = moderate (recommended), 0.02 = strong.
     unknown_prior_weight_auto_alpha: float = 0.01
+    # Disable the flat-0.5 Unknown component entirely. Matches Java
+    # BetaValueDeconvolution behavior where all weight is forced onto the
+    # K reference cell types. Useful when (a) the reference panel is
+    # comprehensive enough that Unknown is not needed, (b) binarization
+    # is causing Unknown to absorb signal that should go to a real tissue,
+    # or (c) you want direct parity with NNLS-based tools.
+    # When True, solver returns w of length K (tissues only); downstream
+    # code treats w[-1] as 0.0 for compatibility.
+    disable_unknown: bool = False
 
 
 @dataclass

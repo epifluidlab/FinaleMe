@@ -158,6 +158,35 @@ def main() -> None:
     help="Alpha coefficient for --unknown-prior-weight-auto (lambda = alpha * M). "
     "0.005 = mild, 0.01 = moderate (default), 0.02 = strong.",
 )
+@click.option(
+    "--solver",
+    "solver",
+    default=None,
+    type=click.Choice(["mle", "nnls"]),
+    help="Point-estimate solver. "
+    "`mle` (default) uses SLSQP on the beta-binomial or binarization "
+    "likelihood, appropriate when the observation model's distributional "
+    "assumptions hold. "
+    "`nnls` uses Lawson-Hanson non-negative least squares on the per-marker "
+    "predicted methylation (k/n), matching Java BetaValueDeconvolution. "
+    "NNLS is more robust when hard-binarization has degraded the signal "
+    "(common for low-coverage FinaleMe predictions) but discards the "
+    "likelihood-based uncertainty model. Combine with --disable-unknown for "
+    "exact Java parity.",
+)
+@click.option(
+    "--disable-unknown",
+    "disable_unknown",
+    is_flag=True,
+    default=False,
+    help="Disable the flat-0.5 'Unknown' component. All weight is forced "
+    "onto the K reference cell types (Unknown column is not appended to "
+    "the reference matrix). Matches Java BetaValueDeconvolution's default "
+    "behavior. Useful when (a) the reference panel is comprehensive, "
+    "(b) binarization is causing Unknown to absorb signal, or (c) you "
+    "want direct parity with NNLS-based tools. Works with both --solver "
+    "mle and --solver nnls.",
+)
 @click.option("--region-annotation", default=None, type=click.Path(),
               help="Pre-computed CpG density / region class annotations TSV "
                    "(chrom, start, end, cpg_density, [region_class]).")
@@ -218,6 +247,8 @@ def run_cmd(
     unknown_prior_weight: float | None,
     unknown_prior_weight_auto: bool,
     unknown_prior_weight_auto_alpha: float | None,
+    solver: str | None,
+    disable_unknown: bool,
     region_annotation: str | None,
     strict_regions: str | None,
     n_markers_per_type: int | None,
@@ -320,6 +351,19 @@ def run_cmd(
                 param_hint="--unknown-prior-weight-auto-alpha",
             )
         config.model.unknown_prior_weight_auto_alpha = upa
+    if _was_provided("solver"):
+        sol = str(solver or "mle").lower()
+        if sol == "nnls":
+            config.model.deconvolution = SolverMethod.NNLS
+        elif sol == "mle":
+            config.model.deconvolution = SolverMethod.MLE
+        else:
+            raise click.BadParameter(
+                f"--solver must be 'mle' or 'nnls', got {sol!r}",
+                param_hint="--solver",
+            )
+    if _was_provided("disable_unknown"):
+        config.model.disable_unknown = bool(disable_unknown)
     if bayesian:  # is_flag — only True when explicitly set
         config.model.deconvolution = SolverMethod.BAYESIAN
         # --bayesian implies Bayesian uncertainty unless the user picked
@@ -397,10 +441,28 @@ def run_cmd(
         config.markers.marker_format = marker_format
     effective_marker_format = config.markers.marker_format
 
+    # Log solver configuration so users can confirm what point-estimate
+    # method and Unknown-component setup will be used.
+    log.info(
+        "Deconvolver config: solver=%s, unknown_component=%s",
+        str(config.model.deconvolution.value),
+        "DISABLED" if config.model.disable_unknown else "ENABLED",
+    )
+
     # Log effective Unknown-prior configuration so users can confirm what
     # regularization was applied (especially important for clinical cfDNA
     # where Unknown collapse is a known failure mode).
-    if config.model.unknown_prior_weight_auto:
+    if config.model.disable_unknown:
+        # Prior is meaningless when Unknown column is disabled.
+        if (
+            config.model.unknown_prior_weight > 0.0
+            or config.model.unknown_prior_weight_auto
+        ):
+            log.warning(
+                "Unknown prior is set but --disable-unknown is active; "
+                "prior has no effect (no Unknown column to penalize)."
+            )
+    elif config.model.unknown_prior_weight_auto:
         log.info(
             "Unknown prior: auto mode "
             "(lambda = %.4f * M_valid per sample)",
