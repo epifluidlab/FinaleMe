@@ -1725,13 +1725,10 @@ public class BetaValueDeconvolution {
     /**
      * Column-permutation test for each cell type.
      *
-     * For each c in 0..K-1:
+     * For each c in 0..K-1 and b = 1..P:
      *   1. Save the original column X[:, c].
-     *   2. For b = 1..P:
-     *      a. Shuffle the rows of X[:, c] into a new column X'[:, c].
-     *      b. Solve NNLS on (X', y), giving w_permuted.
-     *      c. Record w_permuted[c].
-     *   3. Restore the original column.
+     *   2. Shuffle the rows of X[:, c] into a new column X'[:, c].
+     *   3. Solve NNLS on (X', y), giving w_permuted.
      *   4. p_c = (#{b: w_permuted[c] >= w_observed[c]} + 1) / (P + 1)
      *
      * This tests whether the arrangement of the c-th reference column against
@@ -1739,9 +1736,10 @@ public class BetaValueDeconvolution {
      * permutation of the same column values. Smaller p = stronger evidence
      * that the signal in column c is specific to the sample.
      *
-     * Parallelizes across permutations within each cell type (the c loop
-     * is sequential because it mutates the shared X column). Uses a seeded
-     * RNG to pre-generate all permutation orders for reproducibility.
+     * Parallelizes across ALL K*P tasks using a single thread pool so every
+     * worker stays busy for the entire run — no K-way serialization and no
+     * per-cell-type executor startup/teardown overhead. Uses a seeded RNG
+     * to pre-generate all permutation orders for reproducibility.
      */
     private PermutationResult runPermutationTest(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
             throws InterruptedException {
@@ -1769,85 +1767,110 @@ public class BetaValueDeconvolution {
             }
         }
 
-        double[] pValue = new double[K];
-        int nThreads = Math.max(1, bootstrapThreads);
-
+        // Pre-snapshot the K original columns so each permutation task can
+        // read them without mutating the shared refMatrix.
+        final double[][] originalCols = new double[K][M];
         for (int c = 0; c < K; c++) {
-            final int cc = c;
-            final double observed = pointEstimate[c];
-            double[] originalCol = new double[M];
-            for (int i = 0; i < M; i++) originalCol[i] = refMatrix[i][cc];
+            for (int i = 0; i < M; i++) originalCols[c][i] = refMatrix[i][c];
+        }
 
-            // Snapshot of the rest of the matrix is implicit: we only touch column cc.
-            // Use atomic counter for thread-safe tallying.
-            java.util.concurrent.atomic.AtomicInteger geCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        // One atomic counter per cell type for thread-safe tallying of
+        // "permuted w_c >= observed w_c".
+        final java.util.concurrent.atomic.AtomicInteger[] geCount =
+                new java.util.concurrent.atomic.AtomicInteger[K];
+        for (int c = 0; c < K; c++) geCount[c] = new java.util.concurrent.atomic.AtomicInteger(0);
 
-            Runnable onePermutation = () -> {};  // overwritten below
+        int nThreads = Math.max(1, bootstrapThreads);
+        long totalTasks = (long) K * P;
 
-            if (nThreads == 1) {
-                double[] wPerm = new double[K];
-                double[][] Xp = refMatrix;  // we mutate column cc in place then restore
+        Runnable buildAndRun = null; // placeholder
+
+        if (nThreads == 1) {
+            // Sequential: process all K*P tasks in order.
+            long done = 0;
+            long logEvery = Math.max(1L, totalTasks / 20L);
+            for (int c = 0; c < K; c++) {
+                double observed = pointEstimate[c];
                 for (int b = 0; b < P; b++) {
-                    int[] order = permOrders[cc][b];
-                    // Install permuted column
-                    double[] newCol = new double[M];
-                    for (int i = 0; i < M; i++) newCol[i] = originalCol[order[i]];
-                    for (int i = 0; i < M; i++) Xp[i][cc] = newCol[i];
-                    wPerm = solveNNLS(Xp, queryVector);
-                    if (wPerm[cc] >= observed) geCount.incrementAndGet();
-                    if ((b + 1) % Math.max(1, P / 10) == 0) {
-                        log.info("  permutation CT{}/{} replicate {}/{}", cc + 1, K, b + 1, P);
+                    runOnePermutation(refMatrix, queryVector, originalCols[c], permOrders[c][b], c, observed, geCount[c]);
+                    done++;
+                    if (done % logEvery == 0) {
+                        log.info("  permutation {}/{} ({} cell types x {} perms)", done, totalTasks, K, P);
                     }
                 }
-                // Restore original column
-                for (int i = 0; i < M; i++) Xp[i][cc] = originalCol[i];
-            } else {
-                // Parallel permutations: each thread gets its own deep-copied X
-                // so column mutations don't race. Deep copy is O(M*K) per task
-                // — acceptable because K is small and NNLS itself is O(M*K*iter).
-                java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newFixedThreadPool(nThreads);
-                java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>(P);
-                java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+            }
+        } else {
+            // Parallel: single pool drains all K*P tasks. Each task deep-copies
+            // refMatrix (O(M*K)) so column mutations don't race.
+            java.util.concurrent.ExecutorService exec =
+                    java.util.concurrent.Executors.newFixedThreadPool(nThreads);
+            java.util.List<java.util.concurrent.Future<?>> futures =
+                    new java.util.ArrayList<>((int) Math.min(totalTasks, Integer.MAX_VALUE));
+            java.util.concurrent.atomic.AtomicLong doneCount = new java.util.concurrent.atomic.AtomicLong(0);
+            long logEvery = Math.max(1L, totalTasks / 20L);
+
+            for (int c = 0; c < K; c++) {
+                final int cc = c;
+                final double observed = pointEstimate[c];
                 for (int b = 0; b < P; b++) {
                     final int bb = b;
                     futures.add(exec.submit(() -> {
-                        double[][] Xp = new double[M][K];
-                        for (int i = 0; i < M; i++) {
-                            System.arraycopy(refMatrix[i], 0, Xp[i], 0, K);
-                        }
-                        int[] order = permOrders[cc][bb];
-                        for (int i = 0; i < M; i++) Xp[i][cc] = originalCol[order[i]];
-                        double[] wPerm = solveNNLS(Xp, queryVector);
-                        if (wPerm[cc] >= observed) geCount.incrementAndGet();
-                        int d = done.incrementAndGet();
-                        if (d % Math.max(1, P / 10) == 0) {
-                            log.info("  permutation CT{}/{} replicate {}/{}", cc + 1, K, d, P);
+                        runOnePermutation(refMatrix, queryVector, originalCols[cc], permOrders[cc][bb], cc, observed, geCount[cc]);
+                        long d = doneCount.incrementAndGet();
+                        if (d % logEvery == 0) {
+                            log.info("  permutation {}/{} ({} cell types x {} perms, {} threads)",
+                                    d, totalTasks, K, P, nThreads);
                         }
                     }));
                 }
-                for (java.util.concurrent.Future<?> f : futures) {
-                    try {
-                        f.get();
-                    } catch (java.util.concurrent.ExecutionException ee) {
-                        exec.shutdown();
-                        throw new RuntimeException("Permutation replicate failed for cell type "
-                                + cellTypesForLog(cc), ee.getCause());
-                    }
-                }
-                exec.shutdown();
             }
-
-            pValue[cc] = (geCount.get() + 1.0) / (P + 1.0);
+            for (java.util.concurrent.Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (java.util.concurrent.ExecutionException ee) {
+                    exec.shutdownNow();
+                    throw new RuntimeException("Permutation replicate failed", ee.getCause());
+                }
+            }
+            exec.shutdown();
         }
 
+        double[] pValue = new double[K];
+        for (int c = 0; c < K; c++) {
+            pValue[c] = (geCount[c].get() + 1.0) / (P + 1.0);
+        }
         double[] qValue = benjaminiHochberg(pValue);
         return new PermutationResult(pValue, qValue, P);
     }
 
-    /** Safe index-based cell-type label for error messages (avoids NPE when cellTypes is null). */
-    private String cellTypesForLog(int c) {
-        return "index " + c;
+    /**
+     * Single permutation task: deep-copy the reference matrix, replace column
+     * {@code c} with the permuted version of its original values, solve NNLS,
+     * and tally whether the permuted w_c meets or exceeds the observed value.
+     * Safe to call concurrently from multiple threads because each call
+     * allocates its own Xp matrix.
+     */
+    private void runOnePermutation(
+            double[][] refMatrix,
+            double[] queryVector,
+            double[] originalCol,
+            int[] order,
+            int c,
+            double observed,
+            java.util.concurrent.atomic.AtomicInteger geCount) {
+        int M = refMatrix.length;
+        int K = refMatrix[0].length;
+        double[][] Xp = new double[M][K];
+        for (int i = 0; i < M; i++) {
+            System.arraycopy(refMatrix[i], 0, Xp[i], 0, K);
+        }
+        for (int i = 0; i < M; i++) {
+            Xp[i][c] = originalCol[order[i]];
+        }
+        double[] wPerm = solveNNLS(Xp, queryVector);
+        if (wPerm[c] >= observed) geCount.incrementAndGet();
     }
+
 
     /** One NNLS replicate on a bootstrapped marker subsample. */
     private double[] runOneBootstrapReplicate(double[][] refMatrix, double[] queryVector, int[] idx, int K) {
