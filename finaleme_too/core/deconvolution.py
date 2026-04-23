@@ -320,83 +320,118 @@ class MLEDeconvolver:
         """Non-negative least squares (Lawson-Hanson).
 
         Minimizes ``||y - X w||^2`` subject to ``w >= 0``, then
-        renormalizes so ``sum(w) = 1``. ``y`` is the per-marker predicted
-        methylation (k_i / n_i) from the sample, ``X`` is the reference
-        methylation matrix (augmented with the 0.5 Unknown column unless
-        ``disable_unknown`` is True).
+        renormalizes so ``sum(w) = 1``. Matches Java
+        ``BetaValueDeconvolution`` when combined with ``--disable-unknown``.
+
+        Two input paths, chosen from the observation model:
+
+        1. ``BinarizationObservationModel`` with ``hard_threshold`` set
+           (``--binarizeThreshold`` active): uses the SAME binarized inputs
+           as Java — ``y = called_state`` (0 or 1 per marker) and ``X =
+           reference_binary`` (0/1 after hard threshold; with 0.5 Unknown
+           column when enabled). This is the exact-parity path.
+
+        2. Otherwise (continuous / no hard threshold): uses ``y = k/n``
+           (continuous observed methylation) and ``X = raw reference
+           methylation``. This is the beta-binomial-MLE analogue.
 
         Optional Tikhonov regularization on the Unknown weight via
         ``unknown_prior_weight`` (or auto-scaled variant): adds a synthetic
         penalty row ``[0, ..., 0, sqrt(lambda)]`` with target 0 so the
         augmented-NNLS objective becomes ``||y - X w||^2 + lambda * w_u^2``.
-        Has no effect when ``disable_unknown`` is True (no Unknown column
-        to penalize).
+        Has no effect when ``disable_unknown`` is True.
 
         Returns a weight vector of length K+1 (Unknown last). When
         ``disable_unknown`` is True, w[-1] is always 0.0.
         """
         from scipy.optimize import nnls
 
-        # Import here to keep the top of the file clean; _solve_nnls is
-        # dispatched only when solver_method == "nnls".
         from finaleme_too.core.observation_model_binarization import (
             BinarizationObservationModel,
         )
 
-        R_full = self._augmented_reference(
-            reference, disable_unknown=self.disable_unknown
-        )
         K_tissues = int(reference.methylation.shape[1])
-        K_total = R_full.shape[1]  # K or K+1
 
-        # Build y (per-marker observed methylation) from the model.
-        # Both ObservationModel and BinarizationObservationModel expose
-        # k and n arrays aligned with the reference rows; use k/n for NNLS.
-        if isinstance(model, BinarizationObservationModel):
-            k_arr = (
-                np.asarray(model.k, dtype=np.float64)
-                if model.k is not None
-                else None
-            )
-            n_arr = (
-                np.asarray(model.n, dtype=np.float64)
-                if model.n is not None
-                else None
-            )
-            if k_arr is None or n_arr is None:
-                raise DeconvolutionFailedError(
-                    f"Sample {model.sample_id}: NNLS solver needs k and n "
-                    "per marker, but the binarization observation model is "
-                    "missing them. Provide --input-format that yields counts."
-                )
-            # The binarization observation model typically subsets to valid
-            # markers; rebuild y aligned to the FULL reference (all rows)
-            # and trust the pipeline's valid-mask logic to gate rows.
-            valid_mask = getattr(model, "valid_mask", None)
-            if valid_mask is not None and (
-                np.asarray(valid_mask).shape[0] == R_full.shape[0]
-            ):
-                y_full = np.full(R_full.shape[0], np.nan, dtype=np.float64)
-                vm = np.asarray(valid_mask, dtype=bool)
-                # k_arr/n_arr are length-valid; map back
-                y_valid = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
-                y_full[vm] = y_valid
-                weights_full = np.zeros(R_full.shape[0], dtype=np.float64)
-                weights_full[vm] = np.asarray(model.weights, dtype=np.float64)
-            else:
-                # No valid_mask — assume k_arr aligned to full reference
-                y_full = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
-                weights_full = np.asarray(model.weights, dtype=np.float64)
+        # Path selection: binarized inputs (Java-parity) vs continuous.
+        use_binarized = (
+            isinstance(model, BinarizationObservationModel)
+            and getattr(model, "hard_threshold", None) is not None
+            and getattr(model, "reference_binary", None) is not None
+            and getattr(model, "called_state", None) is not None
+        )
+
+        if use_binarized:
+            # Java-parity path: y = called_state (0/1), X = reference_binary.
+            # called_state and reference_binary are already subsetted to
+            # valid markers (M_valid rows); no need for valid_mask gymnastics.
+            called_state = np.asarray(model.called_state, dtype=np.float64)
+            ref_bin = np.asarray(model.reference_binary, dtype=np.float64)
+
+            # reference_binary has shape (M_valid, K+1) with Unknown as last
+            # column. Drop it when disable_unknown is set.
+            if self.disable_unknown and ref_bin.shape[1] == K_tissues + 1:
+                ref_bin = ref_bin[:, :K_tissues]
+
+            # Java NNLS applies uniform per-marker weights (no coverage-aware
+            # weighting). Use uniform weights here to preserve exact parity.
+            # Users can run with --solver mle --unknown-prior-weight if they
+            # want the coverage-weighted likelihood objective instead.
+            X = ref_bin
+            y = called_state
+            w_obj = np.ones(ref_bin.shape[0], dtype=np.float64)
         else:
-            # ObservationModel (WGBS/v2 FinaleMe path)
-            k_arr = np.asarray(model.k, dtype=np.float64)
-            n_arr = np.asarray(model.n, dtype=np.float64)
-            y_full = np.where(n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan)
-            weights_full = np.asarray(model.weights, dtype=np.float64)
+            # Continuous / non-binarized path: use k/n and raw reference.
+            R_full = self._augmented_reference(
+                reference, disable_unknown=self.disable_unknown
+            )
 
-        X = R_full
-        y = y_full
-        w_obj = weights_full
+            if isinstance(model, BinarizationObservationModel):
+                k_arr = (
+                    np.asarray(model.k, dtype=np.float64)
+                    if model.k is not None
+                    else None
+                )
+                n_arr = (
+                    np.asarray(model.n, dtype=np.float64)
+                    if model.n is not None
+                    else None
+                )
+                if k_arr is None or n_arr is None:
+                    raise DeconvolutionFailedError(
+                        f"Sample {model.sample_id}: NNLS (continuous path) "
+                        "needs k and n per marker, but the binarization "
+                        "observation model is missing them."
+                    )
+                valid_mask = getattr(model, "valid_mask", None)
+                if valid_mask is not None and (
+                    np.asarray(valid_mask).shape[0] == R_full.shape[0]
+                ):
+                    y_full = np.full(R_full.shape[0], np.nan, dtype=np.float64)
+                    vm = np.asarray(valid_mask, dtype=bool)
+                    y_valid = np.where(
+                        n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+                    )
+                    y_full[vm] = y_valid
+                    weights_full = np.zeros(R_full.shape[0], dtype=np.float64)
+                    weights_full[vm] = np.asarray(model.weights, dtype=np.float64)
+                else:
+                    y_full = np.where(
+                        n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+                    )
+                    weights_full = np.asarray(model.weights, dtype=np.float64)
+            else:
+                k_arr = np.asarray(model.k, dtype=np.float64)
+                n_arr = np.asarray(model.n, dtype=np.float64)
+                y_full = np.where(
+                    n_arr > 0, k_arr / np.maximum(n_arr, 1), np.nan
+                )
+                weights_full = np.asarray(model.weights, dtype=np.float64)
+
+            X = R_full
+            y = y_full
+            w_obj = weights_full
+
+        K_total = X.shape[1]
 
         if marker_subset is not None:
             X = X[marker_subset]
@@ -410,9 +445,6 @@ class MLEDeconvolver:
             & (w_obj > 0)
         )
         if int(np.sum(valid)) < K_total:
-            # Not enough markers to identify the simplex: fall back
-            # uniformly over K tissues (Unknown=0 when disabled, else
-            # all weight on Unknown).
             uniform = np.zeros(K_tissues + 1, dtype=np.float64)
             if self.disable_unknown:
                 uniform[:K_tissues] = 1.0 / K_tissues
