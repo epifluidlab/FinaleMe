@@ -83,6 +83,33 @@ public class BetaValueDeconvolution {
     @Option(name = "-output", usage = "Output TSV file (default: stdout)")
     public String outputFile = null;
 
+    // ========================= Bootstrap / Inference Options =========================
+
+    @Option(name = "-bootstrap", usage = "Enable bootstrap: resample markers with replacement B times, re-run NNLS "
+            + "per replicate, produce CI, p-value (for H0: w_k = 0), and BH-adjusted q-value per cell type. "
+            + "When enabled the output format switches from wide (one column per sample) to long with "
+            + "additional columns (CI_lower, CI_upper, p_value, q_value). Default: false")
+    public boolean bootstrap = false;
+
+    @Option(name = "-nBootstrap", usage = "Bootstrap replicates (default: 200). Recommended >=200 for stable CIs "
+            + "and >=1000 for stable small p-values.")
+    public int nBootstrap = 200;
+
+    @Option(name = "-ciLevel", usage = "Two-sided CI level for bootstrap (default: 0.95 -> percentile CI [2.5, 97.5])")
+    public double ciLevel = 0.95;
+
+    @Option(name = "-bootstrapThreads", usage = "Parallelism for bootstrap replicates (default: 1). "
+            + "Each replicate runs NNLS independently; bootstrap is embarrassingly parallel.")
+    public int bootstrapThreads = 1;
+
+    @Option(name = "-bootstrapSeed", usage = "RNG seed for bootstrap resampling for reproducibility (default: -1, "
+            + "meaning use fresh entropy). Set to a non-negative integer to fix the resampling order.")
+    public long bootstrapSeed = -1L;
+
+    @Option(name = "-fdrAlpha", usage = "FDR threshold for the 'significant' flag in the per-cell-type output "
+            + "(q_value <= fdrAlpha -> significant=YES). Default: 0.05")
+    public double fdrAlpha = 0.05;
+
     @Option(name = "-h", usage = "Show help")
     public boolean help = false;
 
@@ -355,6 +382,7 @@ public class BetaValueDeconvolution {
         // Step 6 & 7: Process each query sample
         List<String> sampleNames = new ArrayList<>();
         List<double[]> allWeights = new ArrayList<>();
+        List<BootstrapResult> allBoot = new ArrayList<>();  // one per sample when bootstrap enabled
 
         for (String queryFile : queryFiles) {
             log.info("Processing query: {}", queryFile);
@@ -378,26 +406,53 @@ public class BetaValueDeconvolution {
 
             sampleNames.add(new File(queryFile).getName());
             allWeights.add(weights);
+
+            if (bootstrap) {
+                log.info("Running bootstrap ({} replicates, {} threads)...", nBootstrap, bootstrapThreads);
+                BootstrapResult br = runBootstrap(refSelected, queryValues, weights);
+                allBoot.add(br);
+            }
         }
 
-        // Step 8: Output — rows = cell types, columns = samples
+        // Step 8: Output — two schemas, chosen by whether bootstrap was run.
         PrintWriter out = outputFile != null ? new PrintWriter(new FileWriter(outputFile)) : new PrintWriter(System.out);
 
-        // Header: cell_type \t sample1 \t sample2 \t ...
-        out.print("cell_type");
-        for (String name : sampleNames) {
-            out.print("\t" + name);
-        }
-        out.println();
-
-        // One row per cell type
-        for (int c = 0; c < cellTypes.size(); c++) {
-            out.print(cellTypes.get(c));
-            for (double[] weights : allWeights) {
-                double w = weights[c];
-                out.printf("\t%.4f", w < 0.001 ? 0.0 : w);
+        if (bootstrap) {
+            // Long-form output: one row per (sample, cell_type) with stats.
+            double alpha = 1.0 - ciLevel;
+            double loPct = 100.0 * (alpha / 2.0);
+            double hiPct = 100.0 * (1.0 - alpha / 2.0);
+            out.println("sample\tcell_type\tproportion\tCI_lower\tCI_upper\tp_value\tq_value\tsignificant\tn_bootstrap");
+            for (int s = 0; s < sampleNames.size(); s++) {
+                String sname = sampleNames.get(s);
+                double[] w = allWeights.get(s);
+                BootstrapResult br = allBoot.get(s);
+                for (int c = 0; c < cellTypes.size(); c++) {
+                    double prop = w[c] < 0.001 ? 0.0 : w[c];
+                    String sig = (br.qValue[c] <= fdrAlpha) ? "YES" : "NO";
+                    out.printf(
+                            "%s\t%s\t%.4f\t%.4f\t%.4f\t%.4g\t%.4g\t%s\t%d%n",
+                            sname, cellTypes.get(c), prop,
+                            br.ciLower[c], br.ciUpper[c],
+                            br.pValue[c], br.qValue[c], sig, nBootstrap);
+                }
+            }
+            log.info("Bootstrap output: percentile CI at [{}%, {}%], FDR threshold {}", loPct, hiPct, fdrAlpha);
+        } else {
+            // Wide-form output (legacy): cell_type | sample1 | sample2 | ...
+            out.print("cell_type");
+            for (String name : sampleNames) {
+                out.print("\t" + name);
             }
             out.println();
+            for (int c = 0; c < cellTypes.size(); c++) {
+                out.print(cellTypes.get(c));
+                for (double[] weights : allWeights) {
+                    double w = weights[c];
+                    out.printf("\t%.4f", w < 0.001 ? 0.0 : w);
+                }
+                out.println();
+            }
         }
 
         out.flush();
@@ -1390,6 +1445,174 @@ public class BetaValueDeconvolution {
     }
 
     // ========================= NNLS Solver (Lawson-Hanson) =========================
+
+    // ========================= Bootstrap / CI / p-value / q-value =========================
+
+    /**
+     * Per-sample bootstrap output: proportion CI, p-value, and BH q-value per cell type.
+     * p_value for cell type c is Pr(w_c <= epsilon | bootstrap), i.e. the bootstrap
+     * tail probability against H0: w_c = 0. Small p -> the fraction was reliably
+     * non-zero across replicates -> more trust in the cell-type contribution.
+     * q_value is the Benjamini-Hochberg FDR-adjusted p-value across cell types.
+     */
+    static class BootstrapResult {
+        final double[] ciLower;  // length K
+        final double[] ciUpper;  // length K
+        final double[] pValue;   // length K
+        final double[] qValue;   // length K
+        final double[][] replicates; // (B, K) — kept for optional inspection
+
+        BootstrapResult(double[] ciLower, double[] ciUpper, double[] pValue, double[] qValue, double[][] replicates) {
+            this.ciLower = ciLower;
+            this.ciUpper = ciUpper;
+            this.pValue = pValue;
+            this.qValue = qValue;
+            this.replicates = replicates;
+        }
+    }
+
+    /**
+     * Run B bootstrap replicates by resampling marker rows of the NNLS system
+     * with replacement and re-solving. Computes per-cell-type percentile CI,
+     * bootstrap p-value (H0: w_c = 0), and BH-adjusted q-value.
+     *
+     * Parallelizes over replicates if {@code bootstrapThreads > 1}. Each thread
+     * gets a deterministic sub-seed derived from {@link #bootstrapSeed} so the
+     * total resampling order is reproducible independent of completion order.
+     */
+    private BootstrapResult runBootstrap(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
+            throws InterruptedException {
+        int M = refMatrix.length;
+        int K = refMatrix[0].length;
+        int B = nBootstrap;
+
+        double[][] replicates = new double[B][K];
+
+        // Pre-generate per-replicate resampling indices so parallel workers
+        // consume a deterministic sequence regardless of completion order.
+        long baseSeed = (bootstrapSeed >= 0) ? bootstrapSeed : System.nanoTime();
+        Random idxRng = new Random(baseSeed);
+        final int[][] bootIdx = new int[B][M];
+        for (int b = 0; b < B; b++) {
+            for (int i = 0; i < M; i++) {
+                bootIdx[b][i] = idxRng.nextInt(M);
+            }
+        }
+
+        Runnable logProgress = () -> {}; // no-op; keeps call sites simple
+        int nThreads = Math.max(1, bootstrapThreads);
+
+        if (nThreads == 1) {
+            for (int b = 0; b < B; b++) {
+                replicates[b] = runOneBootstrapReplicate(refMatrix, queryVector, bootIdx[b], K);
+                if ((b + 1) % Math.max(1, B / 10) == 0) {
+                    log.info("  bootstrap replicate {}/{}", b + 1, B);
+                }
+            }
+        } else {
+            java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newFixedThreadPool(nThreads);
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>(B);
+            java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+            for (int b = 0; b < B; b++) {
+                final int bb = b;
+                futures.add(exec.submit(() -> {
+                    replicates[bb] = runOneBootstrapReplicate(refMatrix, queryVector, bootIdx[bb], K);
+                    int d = done.incrementAndGet();
+                    if (d % Math.max(1, B / 10) == 0) {
+                        log.info("  bootstrap replicate {}/{}", d, B);
+                    }
+                }));
+            }
+            for (java.util.concurrent.Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (java.util.concurrent.ExecutionException ee) {
+                    throw new RuntimeException("Bootstrap replicate failed", ee.getCause());
+                }
+            }
+            exec.shutdown();
+        }
+
+        // Compute percentile CI
+        double alpha = 1.0 - ciLevel;
+        double loPct = alpha / 2.0;
+        double hiPct = 1.0 - alpha / 2.0;
+        double[] ciLower = new double[K];
+        double[] ciUpper = new double[K];
+        double[] column = new double[B];
+        for (int c = 0; c < K; c++) {
+            for (int b = 0; b < B; b++) column[b] = replicates[b][c];
+            double[] sorted = column.clone();
+            Arrays.sort(sorted);
+            ciLower[c] = percentileSorted(sorted, loPct);
+            ciUpper[c] = percentileSorted(sorted, hiPct);
+        }
+
+        // Bootstrap p-value: Pr(w_c <= epsilon | bootstrap).
+        // Treat "essentially zero" as w_c <= 1e-6 to absorb tiny NNLS noise.
+        double eps = 1e-6;
+        double[] pValue = new double[K];
+        for (int c = 0; c < K; c++) {
+            int nZero = 0;
+            for (int b = 0; b < B; b++) if (replicates[b][c] <= eps) nZero++;
+            // Add-one smoothing so p is never exactly 0 (analogous to (k+1)/(B+1)).
+            pValue[c] = (nZero + 1.0) / (B + 1.0);
+        }
+
+        double[] qValue = benjaminiHochberg(pValue);
+
+        return new BootstrapResult(ciLower, ciUpper, pValue, qValue, replicates);
+    }
+
+    /** One NNLS replicate on a bootstrapped marker subsample. */
+    private double[] runOneBootstrapReplicate(double[][] refMatrix, double[] queryVector, int[] idx, int K) {
+        int M = idx.length;
+        double[][] Xb = new double[M][K];
+        double[] Yb = new double[M];
+        for (int i = 0; i < M; i++) {
+            int r = idx[i];
+            Yb[i] = queryVector[r];
+            // System.arraycopy avoids per-element copy overhead
+            System.arraycopy(refMatrix[r], 0, Xb[i], 0, K);
+        }
+        // Use NNLS (same as the point estimate) regardless of the -solver option:
+        // QP with equality-constraints adds no stochastic structure, and NNLS
+        // matches what most deconvolution papers use for bootstrap.
+        return solveNNLS(Xb, Yb);
+    }
+
+    /** Linear-interpolation percentile on a pre-sorted array. {@code q} is in [0, 1]. */
+    private static double percentileSorted(double[] sorted, double q) {
+        if (sorted.length == 0) return Double.NaN;
+        if (sorted.length == 1) return sorted[0];
+        double idx = q * (sorted.length - 1);
+        int lo = (int) Math.floor(idx);
+        int hi = (int) Math.ceil(idx);
+        if (lo == hi) return sorted[lo];
+        double frac = idx - lo;
+        return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+    }
+
+    /**
+     * Benjamini-Hochberg FDR adjustment: for sorted p-values p_(1) <= ... <= p_(K),
+     * q_(i) = min_{j >= i} p_(j) * K / j, then map back to the original order.
+     */
+    private static double[] benjaminiHochberg(double[] pvals) {
+        int K = pvals.length;
+        Integer[] order = new Integer[K];
+        for (int i = 0; i < K; i++) order[i] = i;
+        Arrays.sort(order, Comparator.comparingDouble(i -> pvals[i]));
+        double[] qSorted = new double[K];
+        double minSoFar = 1.0;
+        for (int r = K - 1; r >= 0; r--) {
+            double raw = pvals[order[r]] * (double) K / (double) (r + 1);
+            if (raw < minSoFar) minSoFar = raw;
+            qSorted[r] = Math.min(minSoFar, 1.0);
+        }
+        double[] q = new double[K];
+        for (int r = 0; r < K; r++) q[order[r]] = qSorted[r];
+        return q;
+    }
 
     /**
      * Solve NNLS: minimize ||Y - X*w||^2 subject to w >= 0, then normalize sum(w)=1.
