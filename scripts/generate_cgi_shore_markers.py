@@ -71,10 +71,33 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
-def run_cmd(cmd, verbose=False, check=True):
-    """Run a shell command and return stdout."""
+def run_cmd(cmd, verbose=False, check=True, show_output=False):
+    """Run a shell command and return stdout.
+
+    Parameters
+    ----------
+    verbose : bool
+        If True, print the command before executing.
+    check : bool
+        If True, raise on non-zero exit.
+    show_output : bool
+        If True, stream stdout/stderr to the parent process so the
+        user can see what the subcommand is doing. Useful for external
+        tools (e.g. wgbstools) that can silently exit 0 without
+        producing the expected output file — without streaming, their
+        warnings are invisible. When False (legacy), stdout/stderr are
+        captured and only printed on failure.
+    """
     if verbose:
         eprint(f'[CMD] {cmd}')
+    if show_output:
+        # Stream subprocess output directly; we do not return stdout
+        # because the caller usually only wants to verify exit status
+        # and check the expected output file exists.
+        result = subprocess.run(cmd, shell=True, text=True)
+        if check and result.returncode != 0:
+            raise RuntimeError(f'Command failed with exit code {result.returncode}: {cmd}')
+        return ''
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if check and result.returncode != 0:
         eprint(f'Command failed: {cmd}')
@@ -316,18 +339,41 @@ def stage2_generate_blocks(args, cgi_shore_bed):
             cmd = f'{wgbstools} segment --betas {beta_files} -o {blocks_path}'
             if args.threads:
                 cmd += f' -@ {args.threads}'
-            run_cmd(cmd, verbose=args.verbose)
+            # Stream wgbstools stdout/stderr directly — if the tool exits 0
+            # without producing output (e.g. missing init_genome, incompatible
+            # beta files, writing to stdout instead of -o), users need to
+            # see the warnings/errors that normally get swallowed by
+            # capture_output=True.
+            run_cmd(cmd, verbose=args.verbose, show_output=True)
         else:
             eprint(f'  Segments exist: {blocks_path}')
 
-        # Fail loudly if the segmenter produced nothing usable, so the
-        # downstream empty-intersect error isn't blamed on bedtools.
-        if not op.isfile(blocks_path) or op.getsize(blocks_path) == 0:
+        # Fail loudly if the segmenter did not create the expected file or
+        # produced an empty file. Provide actionable diagnostic hints.
+        if not op.isfile(blocks_path):
             raise RuntimeError(
-                f'wgbstools segment produced an empty file at {blocks_path}. '
-                f'Check that the first 10 beta files are valid for the genome '
-                f'(wgbstools init_genome {args.genome}) and that your wgbstools '
-                f'installation can segment those files.')
+                f'wgbstools segment exited successfully but did NOT create '
+                f'the expected output file: {blocks_path}\n'
+                f'Common causes:\n'
+                f'  1. wgbstools genome not initialized for {args.genome}. Run:\n'
+                f'       wgbstools init_genome {args.genome}\n'
+                f'     (or with --wgbstools-path ... / --name {args.genome})\n'
+                f'  2. wgbstools version writes to stdout by default, ignoring '
+                f'-o. Check output of:\n'
+                f'       {wgbstools} segment --help\n'
+                f'     and redirect stdout manually if needed.\n'
+                f'  3. The first 10 .beta files were skipped because of a '
+                f'genome-mismatch. Verify with:\n'
+                f'       {wgbstools} view {args.betas[0]} | head\n'
+                f'Re-run with -v to see wgbstools stderr/stdout from the '
+                f'command above.')
+        if op.getsize(blocks_path) == 0:
+            raise RuntimeError(
+                f'wgbstools segment produced an empty file at {blocks_path}.\n'
+                f'See the streamed wgbstools output above for any warnings. '
+                f'Verify with:\n'
+                f'  {wgbstools} view {args.betas[0]} | head\n'
+                f'that the beta files are readable and match the expected genome.')
         n_segments = sum(1 for _ in open(blocks_path))
         eprint(f'  Segments produced: {n_segments:,}')
 
