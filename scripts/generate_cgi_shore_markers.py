@@ -383,13 +383,12 @@ def stage2_generate_blocks(args, cgi_shore_bed):
         raise RuntimeError('bedtools not found. Please install bedtools.')
 
     intersect_path = op.join(args.out_dir, f'cgi_shore_blocks_raw.{args.genome}.bed')
-    # -f 0.1 (default) is a gentle filter — require at least 10% of each
-    # segment to fall inside a CGI+shore region. The old default of 0.5
-    # was too strict: wgbstools often produces multi-kb segments that
-    # straddle CGI boundaries, and a 50% coverage requirement dropped
-    # biologically-useful blocks entirely. Users can tighten via
-    # --intersect-min-overlap.
-    min_overlap = float(getattr(args, 'intersect_min_overlap', 0.1))
+    # Default -f 0.5 preserves the original behavior: require at least 50%
+    # of each segment to fall inside a CGI+shore region. Users who observe
+    # that many blocks are dropped (e.g. wgbstools produced very large
+    # segments that straddle CGI boundaries) can loosen via
+    # --intersect-min-overlap 0.1 (or 0.0 for any overlap).
+    min_overlap = float(getattr(args, 'intersect_min_overlap', 0.5))
     cmd = (f'bedtools intersect -a {blocks_path} -b {cgi_shore_bed} '
            f'-wa -f {min_overlap} | sort -k1,1 -k2,2n | uniq > {intersect_path}')
     run_cmd(cmd, verbose=args.verbose)
@@ -1349,16 +1348,15 @@ def parse_args():
     # Block generation
     parser.add_argument('--blocks',
                         help='Pre-existing blocks file (skip segmentation)')
-    parser.add_argument('--intersect-min-overlap', type=float, default=0.1,
+    parser.add_argument('--intersect-min-overlap', type=float, default=0.5,
                         help='Minimum fractional overlap required for a segment '
                              'to be retained after the CGI+shore intersect '
-                             '(bedtools -f). wgbstools often produces multi-kb '
-                             'segments that straddle CGI boundaries; the old '
-                             '0.5 default dropped many biologically-useful '
-                             'blocks. 0.1 (default) keeps a segment if at '
-                             'least 10%% of its length lies inside CGI+shore. '
-                             'Set to 0.0 to keep any overlap; 0.5 restores '
-                             'the legacy strict filter.')
+                             '(bedtools -f). Default: 0.5 (segment must have '
+                             '>=50%% of its length inside a CGI+shore region). '
+                             'Lower (e.g. 0.1) if you observe that many '
+                             'biologically-useful blocks are being dropped '
+                             'because wgbstools produced segments that '
+                             'straddle CGI boundaries; 0.0 keeps any overlap.')
 
     # Marker selection
     parser.add_argument('--num-markers', type=int, default=250,
