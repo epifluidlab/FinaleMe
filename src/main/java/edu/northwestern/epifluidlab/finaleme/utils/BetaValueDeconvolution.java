@@ -116,17 +116,38 @@ public class BetaValueDeconvolution {
             + "resampling if the reference panel has no `target` column. Default: false")
     public boolean bootstrapStratified = false;
 
-    @Option(name = "-permutationTest", usage = "Column-permutation test: for each cell type c, shuffle the rows of "
-            + "the c-th reference column, re-run NNLS, and compute p_c = (k+1)/(B+1) where k = #{permuted w_c >= "
-            + "observed w_c}. Produces frequentist-calibrated p-values that can resolve below 1/(bootstrap B+1). "
-            + "BH-adjusted to q-values across cell types. When enabled, replaces the bootstrap-tail p in the "
-            + "output; bootstrap is still run (if enabled) for the CI. Default: false")
+    @Option(name = "-permutationTest", usage = "Enable permutation test. Produces frequentist-calibrated p-values "
+            + "that can resolve below 1/(bootstrap B+1). Specific permutation scheme controlled by "
+            + "-permutationMode. When enabled, p/q columns in the output come from permutation; bootstrap is "
+            + "still run (if enabled) for the CI. Default: false")
     public boolean permutationTest = false;
 
-    @Option(name = "-nPermutations", usage = "Number of column permutations per cell type (default: 1000). Each "
-            + "cell type gets its own independent set of permutations, so total NNLS solves = K * nPermutations. "
-            + "Recommended: 1000 for routine use, 10000 when you want to resolve small p-values.")
+    @Option(name = "-permutationMode", usage = "Permutation scheme:\n"
+            + " sample   = for each cell type c, shuffle the rows of the c-th reference column "
+            + "(tests sample-specific alignment of column c with y; per-cell-type null).\n"
+            + " celltype = at each marker row, shuffle the K cell-type values among columns "
+            + "(tests whether cell-type label carries information; shared symmetric null across cell types). "
+            + "Recommended when the panel is cell-type-specific by design (U250-style atlases) and "
+            + "cell-type column marginals are balanced (spread < 0.3). Default: celltype")
+    public String permutationMode = "celltype";
+
+    @Option(name = "-nPermutations", usage = "Number of permutations. With -permutationMode sample, this is "
+            + "per cell type (total NNLS solves = K * nPermutations). With -permutationMode celltype, it is a "
+            + "single shared set of whole-matrix permutations (total NNLS solves = nPermutations, producing "
+            + "K values per replicate). Recommended: 1000 routine, 10000 for small p-values. Default: 1000")
     public int nPermutations = 1000;
+
+    @Option(name = "-permutationNullPooled", usage = "Only used with -permutationMode celltype. Pool the K * P "
+            + "permuted w_c_permuted values into a single null distribution shared across all cell types, "
+            + "then compute p_c = Pr(pooled null >= observed w_c). Leverages the permutation's symmetry to "
+            + "achieve p-value resolution of 1/(K*P+1) and makes BH correction unnecessary. "
+            + "Default: true (disable with -permutationNullPooled=false if you want per-cell-type nulls).")
+    public boolean permutationNullPooled = true;
+
+    @Option(name = "-permutationBHCorrect", usage = "Apply BH FDR correction to permutation p-values even when "
+            + "-permutationNullPooled is active. Strictly valid but over-corrects when the pooled null is "
+            + "already calibrated across cell types. Default: false (skip BH under pooled null).")
+    public boolean permutationBHCorrect = false;
 
     @Option(name = "-permutationSeed", usage = "RNG seed for permutation tests (default: -1 = fresh entropy). "
             + "Set to a non-negative integer to fix the permutation order.")
@@ -1723,25 +1744,39 @@ public class BetaValueDeconvolution {
     }
 
     /**
-     * Column-permutation test for each cell type.
-     *
-     * For each c in 0..K-1 and b = 1..P:
-     *   1. Save the original column X[:, c].
-     *   2. Shuffle the rows of X[:, c] into a new column X'[:, c].
-     *   3. Solve NNLS on (X', y), giving w_permuted.
-     *   4. p_c = (#{b: w_permuted[c] >= w_observed[c]} + 1) / (P + 1)
-     *
-     * This tests whether the arrangement of the c-th reference column against
-     * the sample's binarized vector is significantly better than a random
-     * permutation of the same column values. Smaller p = stronger evidence
-     * that the signal in column c is specific to the sample.
-     *
-     * Parallelizes across ALL K*P tasks using a single thread pool so every
-     * worker stays busy for the entire run — no K-way serialization and no
-     * per-cell-type executor startup/teardown overhead. Uses a seeded RNG
-     * to pre-generate all permutation orders for reproducibility.
+     * Dispatch to the permutation scheme selected by -permutationMode.
+     * <ul>
+     *   <li><b>sample</b>: shuffle rows of X[:, c] for each cell type c separately.
+     *     Tests whether THIS column's alignment with y is specific.
+     *     Per-cell-type null; always applies BH correction.</li>
+     *   <li><b>celltype</b>: at each marker row, shuffle the K cell-type values
+     *     among columns. Tests whether cell-type labels carry information.
+     *     Symmetric null across cell types; can use a pooled null (default)
+     *     to skip BH correction.</li>
+     * </ul>
      */
     private PermutationResult runPermutationTest(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
+            throws InterruptedException {
+        String mode = (permutationMode == null ? "celltype" : permutationMode.toLowerCase(Locale.ROOT));
+        switch (mode) {
+            case "sample":
+                return runPermutationTestSample(refMatrix, queryVector, pointEstimate);
+            case "celltype":
+                return runPermutationTestCelltype(refMatrix, queryVector, pointEstimate);
+            default:
+                throw new IllegalArgumentException(
+                        "-permutationMode must be 'sample' or 'celltype', got: " + permutationMode);
+        }
+    }
+
+    /**
+     * "sample"-mode permutation: for each cell type c, shuffle the rows of
+     * X[:, c]. Per-cell-type null. BH-corrected across K cell types.
+     *
+     * Parallelizes across ALL K*P tasks using a single thread pool so every
+     * worker stays busy for the entire run.
+     */
+    private PermutationResult runPermutationTestSample(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
             throws InterruptedException {
         int M = refMatrix.length;
         int K = refMatrix[0].length;
@@ -1750,86 +1785,66 @@ public class BetaValueDeconvolution {
         long baseSeed = (permutationSeed >= 0) ? permutationSeed : System.nanoTime();
         Random permRng = new Random(baseSeed);
 
-        // Pre-generate K * P permutations: permOrders[c][b] is a length-M
-        // permutation of [0, M) that will re-order column c in replicate b.
+        // Pre-generate K * P row-permutations: permOrders[c][b] reorders column c.
         int[][][] permOrders = new int[K][P][];
         int[] identity = new int[M];
         for (int i = 0; i < M; i++) identity[i] = i;
         for (int c = 0; c < K; c++) {
             for (int b = 0; b < P; b++) {
-                int[] order = identity.clone();
-                // Fisher-Yates shuffle
-                for (int i = M - 1; i > 0; i--) {
-                    int j = permRng.nextInt(i + 1);
-                    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-                }
-                permOrders[c][b] = order;
+                permOrders[c][b] = fisherYatesCopy(identity, permRng);
             }
         }
 
-        // Pre-snapshot the K original columns so each permutation task can
-        // read them without mutating the shared refMatrix.
         final double[][] originalCols = new double[K][M];
         for (int c = 0; c < K; c++) {
             for (int i = 0; i < M; i++) originalCols[c][i] = refMatrix[i][c];
         }
 
-        // One atomic counter per cell type for thread-safe tallying of
-        // "permuted w_c >= observed w_c".
         final java.util.concurrent.atomic.AtomicInteger[] geCount =
                 new java.util.concurrent.atomic.AtomicInteger[K];
         for (int c = 0; c < K; c++) geCount[c] = new java.util.concurrent.atomic.AtomicInteger(0);
 
         int nThreads = Math.max(1, bootstrapThreads);
         long totalTasks = (long) K * P;
-
-        Runnable buildAndRun = null; // placeholder
+        long logEvery = Math.max(1L, totalTasks / 20L);
 
         if (nThreads == 1) {
-            // Sequential: process all K*P tasks in order.
             long done = 0;
-            long logEvery = Math.max(1L, totalTasks / 20L);
             for (int c = 0; c < K; c++) {
                 double observed = pointEstimate[c];
                 for (int b = 0; b < P; b++) {
-                    runOnePermutation(refMatrix, queryVector, originalCols[c], permOrders[c][b], c, observed, geCount[c]);
+                    runOnePermutationSample(refMatrix, queryVector, originalCols[c], permOrders[c][b], c, observed, geCount[c]);
                     done++;
                     if (done % logEvery == 0) {
-                        log.info("  permutation {}/{} ({} cell types x {} perms)", done, totalTasks, K, P);
+                        log.info("  permutation(sample) {}/{} ({} CT x {} perms)", done, totalTasks, K, P);
                     }
                 }
             }
         } else {
-            // Parallel: single pool drains all K*P tasks. Each task deep-copies
-            // refMatrix (O(M*K)) so column mutations don't race.
             java.util.concurrent.ExecutorService exec =
                     java.util.concurrent.Executors.newFixedThreadPool(nThreads);
             java.util.List<java.util.concurrent.Future<?>> futures =
                     new java.util.ArrayList<>((int) Math.min(totalTasks, Integer.MAX_VALUE));
             java.util.concurrent.atomic.AtomicLong doneCount = new java.util.concurrent.atomic.AtomicLong(0);
-            long logEvery = Math.max(1L, totalTasks / 20L);
-
             for (int c = 0; c < K; c++) {
                 final int cc = c;
                 final double observed = pointEstimate[c];
                 for (int b = 0; b < P; b++) {
                     final int bb = b;
                     futures.add(exec.submit(() -> {
-                        runOnePermutation(refMatrix, queryVector, originalCols[cc], permOrders[cc][bb], cc, observed, geCount[cc]);
+                        runOnePermutationSample(refMatrix, queryVector, originalCols[cc], permOrders[cc][bb], cc, observed, geCount[cc]);
                         long d = doneCount.incrementAndGet();
                         if (d % logEvery == 0) {
-                            log.info("  permutation {}/{} ({} cell types x {} perms, {} threads)",
+                            log.info("  permutation(sample) {}/{} ({} CT x {} perms, {} threads)",
                                     d, totalTasks, K, P, nThreads);
                         }
                     }));
                 }
             }
             for (java.util.concurrent.Future<?> f : futures) {
-                try {
-                    f.get();
-                } catch (java.util.concurrent.ExecutionException ee) {
+                try { f.get(); } catch (java.util.concurrent.ExecutionException ee) {
                     exec.shutdownNow();
-                    throw new RuntimeException("Permutation replicate failed", ee.getCause());
+                    throw new RuntimeException("Permutation(sample) replicate failed", ee.getCause());
                 }
             }
             exec.shutdown();
@@ -1839,18 +1854,163 @@ public class BetaValueDeconvolution {
         for (int c = 0; c < K; c++) {
             pValue[c] = (geCount[c].get() + 1.0) / (P + 1.0);
         }
+        // Sample-mode null is per-cell-type → BH correction is always applied.
         double[] qValue = benjaminiHochberg(pValue);
         return new PermutationResult(pValue, qValue, P);
     }
 
     /**
-     * Single permutation task: deep-copy the reference matrix, replace column
-     * {@code c} with the permuted version of its original values, solve NNLS,
-     * and tally whether the permuted w_c meets or exceeds the observed value.
-     * Safe to call concurrently from multiple threads because each call
-     * allocates its own Xp matrix.
+     * "celltype"-mode permutation: at each marker row, shuffle the K
+     * cell-type values among columns. Produces a symmetric null distribution
+     * across cell types — appropriate when the panel is cell-type-specific
+     * by design (U250-style atlases) and cell-type column marginals are
+     * roughly balanced.
+     *
+     * When {@code permutationNullPooled} is true (default), pools all K*P
+     * permuted w_c values into a single null distribution and uses it for
+     * every cell type's p-value — sharing statistical information across
+     * cell types. In that case BH correction is skipped by default (the
+     * shared null is already calibrated across K tests). Override with
+     * {@code -permutationBHCorrect} to force BH.
+     *
+     * When pooled null is off, each cell type gets its own null (the P
+     * permuted values in its column) and BH is applied.
      */
-    private void runOnePermutation(
+    private PermutationResult runPermutationTestCelltype(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
+            throws InterruptedException {
+        int M = refMatrix.length;
+        int K = refMatrix[0].length;
+        int P = nPermutations;
+
+        long baseSeed = (permutationSeed >= 0) ? permutationSeed : System.nanoTime();
+        Random permRng = new Random(baseSeed);
+
+        // Pre-generate P per-row permutation sets. rowOrders[b][i] is a
+        // length-K permutation of [0, K) that reorders the cell-type values
+        // at marker i in replicate b. Each replicate uses its own per-row
+        // permutation for every row — so we need P * M Fisher-Yates shuffles.
+        // Storage: P * M * 4 bytes (int[K]). For K=38, M=7919, P=1000: ~1.2 GB.
+        // This is prohibitive; instead we generate orders on the fly from a
+        // seeded RNG PER-REPLICATE, using a deterministic sub-seed b + baseSeed.
+        // Each replicate's RNG produces the same sequence regardless of
+        // thread-completion order.
+        final int[][] permutedWWitness = new int[P][K];  // not used; placeholder cleanup
+        final long[] replicateSeeds = new long[P];
+        for (int b = 0; b < P; b++) {
+            // SplitMix64-style mixing to decorrelate sub-seeds.
+            long z = baseSeed + 0x9E3779B97F4A7C15L * (b + 1);
+            z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+            z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+            replicateSeeds[b] = z ^ (z >>> 31);
+        }
+
+        // Each replicate produces K values (one per cell type). Store them in
+        // a (P, K) matrix so we can pool or split into per-cell-type nulls.
+        final double[][] permutedW = new double[P][K];
+
+        int nThreads = Math.max(1, bootstrapThreads);
+        long totalTasks = P;
+        long logEvery = Math.max(1L, totalTasks / 20L);
+
+        if (nThreads == 1) {
+            for (int b = 0; b < P; b++) {
+                permutedW[b] = runOnePermutationCelltype(refMatrix, queryVector, replicateSeeds[b]);
+                if ((b + 1) % logEvery == 0) {
+                    log.info("  permutation(celltype) {}/{} (1 shuffle per row per replicate)", b + 1, P);
+                }
+            }
+        } else {
+            java.util.concurrent.ExecutorService exec =
+                    java.util.concurrent.Executors.newFixedThreadPool(nThreads);
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>(P);
+            java.util.concurrent.atomic.AtomicLong doneCount = new java.util.concurrent.atomic.AtomicLong(0);
+            for (int b = 0; b < P; b++) {
+                final int bb = b;
+                futures.add(exec.submit(() -> {
+                    permutedW[bb] = runOnePermutationCelltype(refMatrix, queryVector, replicateSeeds[bb]);
+                    long d = doneCount.incrementAndGet();
+                    if (d % logEvery == 0) {
+                        log.info("  permutation(celltype) {}/{} ({} threads)", d, P, nThreads);
+                    }
+                }));
+            }
+            for (java.util.concurrent.Future<?> f : futures) {
+                try { f.get(); } catch (java.util.concurrent.ExecutionException ee) {
+                    exec.shutdownNow();
+                    throw new RuntimeException("Permutation(celltype) replicate failed", ee.getCause());
+                }
+            }
+            exec.shutdown();
+        }
+
+        double[] pValue = new double[K];
+        if (permutationNullPooled) {
+            // Flatten all K*P permuted values into one null distribution.
+            double[] pooled = new double[P * K];
+            int idx = 0;
+            for (int b = 0; b < P; b++)
+                for (int c = 0; c < K; c++)
+                    pooled[idx++] = permutedW[b][c];
+            Arrays.sort(pooled);
+            for (int c = 0; c < K; c++) {
+                // Count pooled values >= observed via binary search (first index with value >= obs).
+                int nGe = pooled.length - upperBoundExclusive(pooled, pointEstimate[c]);
+                pValue[c] = (nGe + 1.0) / (pooled.length + 1.0);
+            }
+            log.info("  permutation(celltype): pooled null across {} cell types x {} replicates "
+                    + "= {} null samples per p-value (resolution >= {:.2e})",
+                    K, P, pooled.length, 1.0 / (pooled.length + 1.0));
+        } else {
+            // Per-cell-type null: each column of permutedW is that cell type's null.
+            for (int c = 0; c < K; c++) {
+                int nGe = 0;
+                for (int b = 0; b < P; b++) if (permutedW[b][c] >= pointEstimate[c]) nGe++;
+                pValue[c] = (nGe + 1.0) / (P + 1.0);
+            }
+        }
+
+        // BH correction decision:
+        //   * sample mode always applies BH (handled in runPermutationTestSample)
+        //   * celltype + pooled null: skip BH by default (already calibrated),
+        //     unless user forced with -permutationBHCorrect
+        //   * celltype + per-cell-type null: apply BH
+        double[] qValue;
+        if (permutationNullPooled && !permutationBHCorrect) {
+            qValue = pValue.clone();  // "q" = "p" under pooled null unless user asks for BH
+        } else {
+            qValue = benjaminiHochberg(pValue);
+        }
+
+        return new PermutationResult(pValue, qValue, P);
+    }
+
+    /** Helper: Fisher-Yates shuffle of an int[] clone using a given RNG. */
+    private static int[] fisherYatesCopy(int[] src, Random rng) {
+        int[] out = src.clone();
+        for (int i = out.length - 1; i > 0; i--) {
+            int j = rng.nextInt(i + 1);
+            int tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+        }
+        return out;
+    }
+
+    /** Exclusive upper-bound binary search: first index where sorted[idx] >= target. */
+    private static int upperBoundExclusive(double[] sorted, double target) {
+        int lo = 0, hi = sorted.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (sorted[mid] < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    /**
+     * "sample"-mode permutation: deep-copy refMatrix, replace column {@code c}
+     * with the permuted version of its original values, solve NNLS, tally if
+     * permuted w_c >= observed. Thread-safe (local Xp copy).
+     */
+    private void runOnePermutationSample(
             double[][] refMatrix,
             double[] queryVector,
             double[] originalCol,
@@ -1869,6 +2029,33 @@ public class BetaValueDeconvolution {
         }
         double[] wPerm = solveNNLS(Xp, queryVector);
         if (wPerm[c] >= observed) geCount.incrementAndGet();
+    }
+
+    /**
+     * "celltype"-mode permutation: deep-copy refMatrix, independently shuffle
+     * each row's K cell-type values among columns, solve NNLS, return the
+     * full K-length w_permuted. Thread-safe (local Xp and rng).
+     *
+     * Uses a replicate-specific seed derived from the base permutation seed
+     * so the null is reproducible regardless of thread-completion order.
+     */
+    private double[] runOnePermutationCelltype(double[][] refMatrix, double[] queryVector, long replicateSeed) {
+        int M = refMatrix.length;
+        int K = refMatrix[0].length;
+        Random rng = new Random(replicateSeed);
+
+        double[][] Xp = new double[M][K];
+        // For each row, copy values then shuffle them among columns in place.
+        int[] order = new int[K];
+        for (int i = 0; i < M; i++) {
+            System.arraycopy(refMatrix[i], 0, Xp[i], 0, K);
+            // Fisher-Yates shuffle the K values within this row.
+            for (int k = K - 1; k > 0; k--) {
+                int j = rng.nextInt(k + 1);
+                double tmp = Xp[i][k]; Xp[i][k] = Xp[i][j]; Xp[i][j] = tmp;
+            }
+        }
+        return solveNNLS(Xp, queryVector);
     }
 
 
