@@ -4,8 +4,17 @@ This tutorial explains how to build your own reference methylation atlas restric
 CpG Island (CGI) and CGI shore regions, and how to use it for tissues-of-origin
 deconvolution with FinaleMe-predicted methylation data using `BetaValueDeconvolution`.
 
-This is an optional advanced tutorial. The default FinaleMe run workflow does not require
-`wgbstools` or `UXM_deconv`.
+> **You usually don't need this.** Pre-built CGI+shore atlases for both hg19 and hg38 are
+> downloaded automatically by `./scripts/setup_references.sh` into `data/`:
+>
+> - `data/Atlas.CGI_shore.U250.l3.hg19.tsv`
+> - `data/Atlas.CGI_shore.U250.l3.hg38.tsv`
+> - `data/Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv`
+>
+> Use this tutorial only when you need custom cell types (e.g. tumor subtypes, disease-
+> specific cell populations) not covered by the standard 38-cell-type panel, or when you
+> want to tune marker selection for a specific cohort. The default Steps 1-6 workflow in
+> [tutorial.md](tutorial.md) does not require `wgbstools` or `UXM_deconv`.
 
 ## Table of Contents
 
@@ -392,7 +401,7 @@ Once you have the atlas, you can deconvolve any FinaleMe-predicted cfDNA sample.
 First, run FinaleMe decode to produce `*.prediction.bed.gz`:
 
 ```bash
-JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
@@ -402,44 +411,63 @@ java -Xmx20G -cp "$JAR" \
   -decodeModeOnly
 ```
 
-### 6.2 Run `BetaValueDeconvolution` with the CGI+shore atlas
+### 6.2 Run `BetaValueDeconvolution` with the custom atlas
 
-Use the tested preset:
+The atlas TSV produced by `generate_cgi_shore_markers.py` has embedded per-cell-type
+values, so you can pass it directly with `-refPanel` (no separate `-refBetas`/`-refGroups`
+needed). With v0.62 defaults, this also runs stratified bootstrap + permutation:
 
 ```bash
-JAR="target/FinaleMe-0.61-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
-  -binarizeThreshold 0.1 \
-  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
-  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
-  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -refPanel results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
   -cpgIndex data/CpG_index.hg19.bed.gz \
-  -solver NNLS \
   -output results/sample.deconv.beta.tsv \
   results/sample.decode.prediction.bed.gz
 ```
 
-Make `beta_list.txt` if needed:
+If you want the legacy two-file mode (separate marker BED + reference betas):
+
+```bash
+java -Xmx20G -cp "$JAR" \
+  edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
+  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
+  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
+  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -cpgIndex data/CpG_index.hg19.bed.gz \
+  -output results/sample.deconv.beta.tsv \
+  results/sample.decode.prediction.bed.gz
+```
+
+Make `beta_list.txt` for that mode:
 
 ```bash
 ls reference_wgbs/betas/*.beta > results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt
 ```
 
+For the full set of `BetaValueDeconvolution` options (bootstrap, permutation, FDR), see
+[tutorial.md §8](tutorial.md).
+
 ### 6.3 Interpret results
 
-The output TSV is a tissue-fraction matrix (rows = cell types, columns = samples). For example:
+With v0.62 defaults the output is long format, one row per `(sample, cell_type)`:
 
 ```
-cell_type	sample.decode.prediction.bed.gz
-Blood-B	0.0230
-Blood-T	0.1560
-Liver-Hep	0.0890
+sample   cell_type   proportion   CI_lower   CI_upper   p_value   q_value   significant   p_source      n_replicates
+sample1  Blood-T     0.156        0.142      0.171      5.3e-05   5.3e-05   YES           permutation   10000
+sample1  Liver-Hep   0.089        0.071      0.104      1.2e-03   1.5e-03   YES           permutation   10000
+sample1  Blood-B     0.023        0.000      0.041      0.213     0.213     NO            permutation   10000
+...
 ```
 
-Values represent the estimated fraction of cfDNA originating from each cell type.
-They sum approximately to 1.0 (minor deviations are normal due to the NNLS solver).
+`proportion` values represent the estimated fraction of cfDNA originating from each cell
+type and sum approximately to 1.0 across cell types within a sample (minor deviations are
+normal due to NNLS renormalization).
+
+For cohort-level differential analysis (e.g. Disease vs Control with covariates), feed
+this output to `scripts/too_diff_analysis.py` — see [tutorial.md §9](tutorial.md).
 
 
 ---

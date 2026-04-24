@@ -1,6 +1,6 @@
 # FinaleMe
 
-FinaleMe (FragmentatIoN AnaLysis of cEll-free DNA Methylation) predicts CpG methylation from cfDNA WGS fragment features using an HMM pipeline.
+FinaleMe (FragmentatIoN AnaLysis of cEll-free DNA Methylation) predicts CpG methylation from cfDNA WGS fragment features using an HMM pipeline, then deconvolves the predictions into tissue-of-origin (TOO) cell-type fractions.
 
 ## Citation
 
@@ -9,10 +9,11 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 ## System requirements
 
 - Java 21 or later (Oracle JDK 21 recommended): https://www.oracle.com/java/technologies/downloads/#java21
-- Apache Maven 3.8+: 
+- Apache Maven 3.8+:
 https://maven.apache.org/install.html (or use the build .jar file from release)
 - Optional for bigWig conversion speed/compatibility: `bedGraphToBigWig` (UCSC tools from here: https://hgdownload.soe.ucsc.edu/admin/exe/ and modify $PATH to allow the direct usage). If missing, FinaleMe falls back to built-in Java BigWig writing.
-- Optional only for custom tissue reference-map generation: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv). They are not required for the default Steps 1-4 below.
+- Optional for Step 5 (differential TOO analysis): Python 3.9+ with `pandas`, `numpy`, `statsmodels`.
+- Optional only for custom tissue reference-map generation: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv). They are not required for the default Steps 1-5 below.
 
 ## Quick install
 
@@ -25,7 +26,7 @@ mvn clean package
 
 ## Quick setup
 
-Run one command to build FinaleMe and download required hg19/hg38 reference files into `data/`:
+Run one command to build FinaleMe and download required hg19/hg38 reference files (including the pre-built TOO reference panels) into `data/`:
 
 ```bash
 ./scripts/setup_references.sh
@@ -46,7 +47,7 @@ curl -L "https://zenodo.org/records/6914806/files/BH01.chr22.bam.bai?download=1"
 Set a jar variable once:
 
 ```bash
-JAR="target/FinaleMe-0.61-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
 ```
 
 ### Step 1: Build CpG feature matrix
@@ -67,7 +68,7 @@ java -Xmx20G -cp "$JAR" \
   -t 4
 ```
 
-Output: `results/BH01.cpg_features.hg19.bed.gz`. 
+Output: `results/BH01.cpg_features.hg19.bed.gz`.
 
 It will cost ~25 min for the test dataset.
 
@@ -82,7 +83,7 @@ java -Xmx20G -cp "$JAR" \
   -miniDataPoints 7 -gmm -covOutlier 3 -t 4
 ```
 
-Outputs: model `results/BH01.FinaleMe.model` and training prediction file.  
+Outputs: model `results/BH01.FinaleMe.model` and training prediction file.
 
 It will cost < 1 min for the test dataset.
 
@@ -97,35 +98,58 @@ java -Xmx20G -cp "$JAR" \
   -decodeModeOnly \
   -t 4 \
   -bwOutput \
-  -chromSizeFile data/hg19.chrom.sizes \
+  -chromSizeFile data/hg19.chrom.sizes
 ```
 
 Outputs:
 - `results/BH01.decode.prediction.bed.gz`
 - `results/BH01.decode.prediction.methy.bw`
 - `results/BH01.decode.prediction.cov.bw`
-- `results/BH01.decode.prediction.methy_count.bw`. 
+- `results/BH01.decode.prediction.methy_count.bw`.
 
 It will cost < 1 min for the test dataset.
 
-### Step 4: Tissues-of-origin analysis
+### Step 4: Tissues-of-origin deconvolution
 
-Using FinaleMe's beta-value deconvolution (`BetaValueDeconvolution`, recommended):
+Use the pre-built atlas from `data/` (downloaded by `setup_references.sh`). With its production defaults, `BetaValueDeconvolution` automatically runs stratified bootstrap (95% CI) plus a column-permutation test (10000 reps, pooled null) to give a per-cell-type p-value, BH q-value, and a `significant` flag for each sample:
 
 ```bash
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
-  -binarizeThreshold 0.1 \
-  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
-  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
-  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -refPanel data/Atlas.CGI_shore.U250.l3.hg19.tsv \
   -cpgIndex data/CpG_index.hg19.bed.gz \
-  -solver NNLS \
   -output results/BH01.deconv.beta.tsv \
   results/BH01.decode.prediction.bed.gz
 ```
 
-Use [tutorial/tutorial_ref_maps.md](tutorial/tutorial_ref_maps.md) to generate the marker atlas (`-markerRegions`) and reference panel files (`-refBetas`, `-refGroups`).
+Output (long format, one row per `(sample, cell_type)`):
+
+```
+sample   cell_type   proportion   CI_lower   CI_upper   p_value   q_value   significant   p_source      n_replicates
+BH01     Blood-T     0.156        0.142      0.171      5.3e-05   5.3e-05   YES           permutation   10000
+...
+```
+
+Use `data/Atlas.CGI_shore.U250.l3.hg38.tsv` (or `.pluse_microglia_astrocyte.hg38.tsv`) for hg38 inputs. To build a custom atlas instead, see [tutorial/tutorial_ref_maps.md](tutorial/tutorial_ref_maps.md).
+
+### Step 5: Differential TOO analysis (cohort comparison)
+
+Once you have per-sample deconvolution outputs from Step 4, compare cell-type fractions across groups (e.g., Disease vs Control), adjusting for clinical and technical covariates:
+
+```bash
+python scripts/too_diff_analysis.py \
+  --deconv-files results/cohort/*.deconv.beta.tsv \
+  --metadata samples.tsv \
+  --group-col disease_status \
+  --reference-group Control \
+  --covariates age,sex,library_batch \
+  --output results/diff_celltypes.tsv \
+  --verbose
+```
+
+`samples.tsv` needs columns `sample`, `disease_status`, plus any covariates. Output: one row per cell type with `effect_clr`, `p_value`, BH `q_value`, and `significant` flag.
+
+Why not just compare per-sample `significant` flags? See the rationale in [tutorial/tutorial.md §9](tutorial/tutorial.md).
 
 ## Full tutorial
 

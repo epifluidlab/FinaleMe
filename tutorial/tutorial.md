@@ -1,25 +1,27 @@
 # FinaleMe Tutorial
 
-This tutorial contains the full, detailed usage guide for FinaleMe v0.60.
+This tutorial contains the full, detailed usage guide for FinaleMe v0.62.
 
 If you want the shortest path to run the pipeline, start from [README.md](../README.md).
 
 ## 1. What FinaleMe does
 
-FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/CRAM or tabix-indexed fragment files. The standard workflow has five steps:
+FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/CRAM or tabix-indexed fragment files, then deconvolves the predictions into tissue-of-origin (TOO) cell-type fractions. The standard workflow has six steps:
 
 1. Build feature matrix (`CpgFeatureMatrixBuilder`)
 2. Train HMM model (`FinaleMe`)
 3. Decode methylation (`FinaleMe`)
 4. Optional legacy conversion to bigWig (Perl helper)
-5. Tissues-of-origin deconvolution (`BetaValueDeconvolution` recommended; UXM compatibility optional)
+5. Tissues-of-origin deconvolution per sample (`BetaValueDeconvolution` recommended; UXM compatibility optional)
+6. Cohort-level differential cell-type analysis (`scripts/too_diff_analysis.py`)
 
 ## 2. Installation and reference setup
 
 Default pipeline requirement summary:
 
-- Steps 1-4 in this tutorial require only FinaleMe (Java + jar build).
-- `wgbstools` and `UXM_deconv` are only needed for optional custom atlas generation in Step 5.2.
+- Steps 1-5 in this tutorial require only FinaleMe (Java + jar build) and the pre-built reference panels downloaded by `setup_references.sh`.
+- Step 6 (differential analysis) requires Python 3.9+ with `pandas`, `numpy`, `statsmodels`.
+- `wgbstools` and `UXM_deconv` are only needed for the optional custom atlas generation workflow (see [tutorial/tutorial_ref_maps.md](tutorial_ref_maps.md)).
 
 ## 2.1 Install source
 
@@ -37,8 +39,8 @@ cd FinaleMe
 This command:
 
 - checks dependencies
-- builds `target/FinaleMe-0.60-jar-with-dependencies.jar` (if missing)
-- downloads hg19/hg38 reference data into `data/`
+- builds `target/FinaleMe-0.62-jar-with-dependencies.jar` (if missing)
+- downloads hg19/hg38 reference data into `data/`, including the pre-built TOO reference panels for Step 5
 
 Use a custom data directory with:
 
@@ -57,6 +59,7 @@ Useful subcommands:
 ./scripts/setup_references.sh cpg
 ./scripts/setup_references.sh darkregions
 ./scripts/setup_references.sh methylation
+./scripts/setup_references.sh atlas         # TOO deconvolution reference panels (hg19/hg38)
 ./scripts/setup_references.sh summary
 ```
 
@@ -68,6 +71,9 @@ Useful subcommands:
 - `data/wgEncodeDukeMapabilityRegionsExcludable_wgEncodeDacMapabilityConsensusExcludable.hg19.bed`
 - `data/wgbs_buffyCoat_jensen2015GB.methy.hg19.bw`
 - `data/CpG_index.hg19.bed.gz`
+- `data/Atlas.CGI_shore.U250.l3.hg19.tsv` (TOO reference panel for Step 5; hg38 also provided)
+- `data/Atlas.CGI_shore.U250.l3.hg38.tsv`
+- `data/Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv` (hg38 panel + microglia/astrocyte)
 
 ## 2.4 Small test BAM
 
@@ -107,7 +113,7 @@ For tabix fragment BED/TSV, the file must include at least `chr`, `start`, `end`
 ## 4.1 Standard BAM command
 
 ```bash
-JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.CpgFeatureMatrixBuilder \
@@ -359,70 +365,143 @@ perl src/perl/bedpredict2bw.b37.pl results/BH01 results/BH01.decode.prediction.b
 
 This is optional when Step 3 already runs with `-bwOutput`.
 
-## 8. Step 5: Tissues-of-origin analysis
+## 8. Step 5: Tissues-of-origin deconvolution (per sample)
 
-## 8.1 Recommended: `BetaValueDeconvolution` (atlas mode)
+## 8.1 Recommended: `BetaValueDeconvolution` with the pre-built atlas
 
-Run deconvolution with the tested default preset:
+The simplest workflow uses the atlas downloaded by `setup_references.sh`:
 
 ```bash
-JAR="target/FinaleMe-0.60-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
-  -binarizeThreshold 0.1 \
-  -markerRegions results/cgi_shore_atlas/Atlas.CGI_shore.U250.l3.hg19.tsv \
-  -refBetas results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt \
-  -refGroups results/cgi_shore_atlas/groups_fixed.csv \
+  -refPanel data/Atlas.CGI_shore.U250.l3.hg19.tsv \
   -cpgIndex data/CpG_index.hg19.bed.gz \
-  -solver NNLS \
   -output results/BH01.deconv.beta.tsv \
   results/BH01.decode.prediction.bed.gz
 ```
 
-Notes:
+For hg38 inputs, use `data/Atlas.CGI_shore.U250.l3.hg38.tsv` (or the extended `Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv` which adds microglia and astrocyte cell types).
 
-- `-markerRegions` accepts atlas TSV/BED with `startCpG/endCpG` columns (the CGI+shore atlas from marker generation pipeline works directly).
-- `-refBetas` can be a comma-separated list or a text file with one `.beta` path per line.
-- Query input can be `*.prediction.bed.gz` (as above) or `*.beta`.
-- Output format is a matrix: rows are cell types and columns are samples.
-- This default deconvolution command does not require `wgbstools` or `UXM_deconv`.
+### What the defaults do
 
-## 8.2 Optional: Build marker atlas with the tested preset (requires `wgbstools` + `UXM_deconv`)
+With the v0.62 production defaults, the command above automatically:
 
-```bash
-python scripts/generate_cgi_shore_markers.py \
-  --genome hg19 \
-  --betas /path/to/reference_wgbs/betas/*.beta \
-  --pats /path/to/reference_wgbs/pats/*.pat.gz \
-  --groups /path/to/groups_pat_ref.hg19.csv \
-  --blocks /path/to/GSE186458_blocks.s205.bed.gz \
-  --cgi-bed /path/to/UCSC.cpgIsland.20190503.hg19.bed \
-  --shore-size 2000 \
-  --chrom-sizes data/hg19.chrom.sizes \
-  --num-markers 250 \
-  --delta-means 0.4 \
-  --unmeth-mean-thresh 0.1 \
-  --meth-mean-thresh 0.5 \
-  --min-cpg 1 \
-  --max-cpg 1000 \
-  --min-bp 50 \
-  --max-bp 5000 \
-  --rlen 3 \
-  --threads 10 \
-  --out-dir results/cgi_shore_atlas/ \
-  --force \
-  --wgbstools-path /path/to/wgbs_tools \
-  --uxm-path /path/to/UXM_deconv
+- Binarizes both reference and sample at `-binarizeThreshold 0.1`.
+- Solves the deconvolution with `-solver NNLS` (Lawson-Hanson + sum=1 normalization; matches the original method).
+- Runs `-bootstrap` (1000 stratified replicates by `target` cell type) for 95% percentile confidence intervals on each cell-type fraction.
+- Runs `-permutationTest` (10000 column-shuffles per cell type, `-permutationMode celltype` with pooled null) for frequentist-calibrated p-values.
+- Applies `-fdrAlpha 0.05` to flag significant cell types.
+- Uses fixed seeds (`-bootstrapSeed 42 -permutationSeed 42`) and 10 threads (`-bootstrapThreads 10`) so reruns are bit-identical and reasonably fast.
+
+Output (long format, one row per `(sample, cell_type)`):
+
+```
+sample   cell_type   proportion   CI_lower   CI_upper   p_value   q_value   significant   p_source      n_replicates
+BH01     Blood-T     0.156        0.142      0.171      5.3e-05   5.3e-05   YES           permutation   10000
+BH01     Adipocyte   0.012        0.000      0.025      0.213     0.213     NO            permutation   10000
+...
 ```
 
-Make a beta list file for `-refBetas`:
+### Multiple samples
+
+Pass several query files in one invocation; they are processed in parallel and emit a single combined long-format TSV:
 
 ```bash
-ls /path/to/reference_wgbs/betas/*.beta > results/cgi_shore_atlas/reference_wgbs/betas/beta_list.txt
+java -Xmx20G -cp "$JAR" \
+  edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
+  -refPanel data/Atlas.CGI_shore.U250.l3.hg19.tsv \
+  -cpgIndex data/CpG_index.hg19.bed.gz \
+  -output results/cohort.deconv.beta.tsv \
+  results/SAMPLE_01.decode.prediction.bed.gz \
+  results/SAMPLE_02.decode.prediction.bed.gz \
+  results/SAMPLE_03.decode.prediction.bed.gz
 ```
 
-## 8.3 Optional legacy mode: UXM deconvolution
+Or run one job per sample (e.g. on a cluster) and concatenate later. Step 6 (`too_diff_analysis.py`) accepts either layout.
+
+## 8.2 Step 5 options (`BetaValueDeconvolution`)
+
+### Reference panel
+
+| Option | Description |
+|---|---|
+| `-refPanel` | Pre-aggregated atlas TSV with embedded per-cell-type values (recommended; use `data/Atlas.CGI_shore.U250.l3.{hg19,hg38}.tsv` or `data/Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv`). |
+| `-markerRegions` | Atlas/marker BED with `startCpG/endCpG` columns. Used when the atlas does not embed per-cell-type values, in combination with `-refBetas`/`-refGroups`. |
+| `-refBetas` | Comma-separated reference `.beta` files, or a text file listing one path per line. Required only when `-refPanel` is not used. |
+| `-refGroups` | CSV mapping sample names to cell-type groups. Required only with `-refBetas`. |
+| `-cpgIndex` | Required CpG index BED for marker coordinate -> CpG mapping. Use `data/CpG_index.{hg19,hg38}.bed.gz`. |
+| `-cgiShoreRegions` | Legacy mode: CGI+shore BED file used together with `-refBetas`/`-refGroups` to tile windows on the fly. Not needed when `-refPanel` or `-markerRegions` is provided. |
+| `-windowSize` | Window size (bp) for legacy CGI+shore tiling. Default: 1000. |
+| `-minCoverage` | Minimum total Cs+Ts per window across reference samples. Default: 10. |
+| `-topVariablePercent` | Fraction of most-variable windows kept in legacy mode. Default: 0.01. |
+| `-replicateMode` | How to combine replicates: `aggregate` (sum counts, default) or `average` (mean of ratios). |
+
+### Solver and binarization
+
+| Option | Description |
+|---|---|
+| `-solver` | `NNLS` (Lawson-Hanson + simplex renormalization, default) or `QP` (Goldfarb-Idnani quadratic programming). |
+| `-binarizeThreshold` | Methylation density threshold for binarizing both reference and sample before NNLS. Default: 0.1. |
+
+### Bootstrap (CI on the point estimates)
+
+| Option | Description |
+|---|---|
+| `-bootstrap` | Enable bootstrap CI + per-cell-type stats. **Default: true.** |
+| `-nBootstrap` | Bootstrap replicates. Default: 1000. Use >=1000 for tight small p-values. |
+| `-ciLevel` | Two-sided CI level. Default: 0.95 (-> percentile CI [2.5%, 97.5%]). |
+| `-bootstrapStratified` | Stratify resampling by the `target` cell-type column in the reference panel. Eliminates the inflated-CI bias for cell types with fewer markers. **Default: true.** |
+| `-bootstrapThreads` | Parallel workers for bootstrap and permutation. Default: 10. |
+| `-bootstrapSeed` | RNG seed for bootstrap. Default: 42. Use `-1` for fresh entropy per run. |
+
+### Permutation (frequentist p-values, BH q-values)
+
+| Option | Description |
+|---|---|
+| `-permutationTest` | Enable permutation test in addition to bootstrap. **Default: true.** |
+| `-permutationMode` | `celltype` (default; at each marker row, shuffle the K cell-type values among columns -- symmetric null suitable for cell-type-specific atlases like U250) or `marker` (per cell type, shuffle the rows of that cell type's reference column). |
+| `-nPermutations` | Permutation replicates. Default: 10000. |
+| `-permutationSeed` | RNG seed for permutations. Default: 42. |
+| `-permutationNullPooled` | Under `-permutationMode celltype`, pool all K x P permuted values into a single null shared across cell types. Achieves p-value resolution of `1/(K*P+1)`. **Default: true.** |
+| `-permutationBHCorrect` | Apply BH FDR correction even when the pooled null is in use. Default: false (the pooled null is already calibrated across cell types). |
+| `-fdrAlpha` | q-value threshold for the `significant` flag. Default: 0.05. |
+
+### Output
+
+| Option | Description |
+|---|---|
+| `-output` | Output TSV path. With bootstrap on (the default), long format: one row per `(sample, cell_type)`. With bootstrap off, wide format: one row per cell type, one column per sample. |
+
+Two practical choices that tune sensitivity vs. cost:
+
+- For routine cohort runs, the defaults (B=1000, P=10000, 10 threads) need ~5-30 minutes per sample on a typical 38-cell-type panel.
+- To dial things back for a quick scan: `-nBootstrap 200 -nPermutations 1000`. To go more sensitive: `-nPermutations 50000` or `-permutationBHCorrect`.
+
+## 8.3 Output schema
+
+Long-format columns (when bootstrap or permutation is on, which is the default):
+
+| Column | Meaning |
+|---|---|
+| `sample` | Query file basename. |
+| `cell_type` | One of the K cell types in the reference panel. |
+| `proportion` | Point estimate from the full-data NNLS solve, normalized to sum to 1.0 across cell types. |
+| `CI_lower`, `CI_upper` | Percentile bootstrap CI at `-ciLevel`. |
+| `p_value` | Permutation p (default) or bootstrap-tail p if `-permutationTest=false`. |
+| `q_value` | BH-adjusted p (or = p when `-permutationNullPooled=true` and `-permutationBHCorrect=false`). |
+| `significant` | `YES` if `q_value <= fdrAlpha`, else `NO`. |
+| `p_source` | `permutation` or `bootstrap` -- which procedure produced the p-value. |
+| `n_replicates` | B (bootstrap) or P (permutation) actually run. |
+
+Wide format (legacy; emitted when `-bootstrap=false`): rows are cell types, columns are samples, values are point estimates.
+
+## 8.4 Optional: build a custom atlas
+
+The pre-built atlas in `data/` covers 38 standard cell types from the Loyfer et al. reference. To build a custom atlas (different cell types, different shore size, etc.), see [tutorial/tutorial_ref_maps.md](tutorial_ref_maps.md). This requires `wgbstools` + `UXM_deconv` and is an advanced workflow.
+
+## 8.5 Optional legacy mode: UXM deconvolution
 
 This requires running Step 3 with `-patOutput`.
 
@@ -432,31 +511,173 @@ uxm deconv results/BH01.decode.prediction.pat.gz \
   -a /path/to/UXM_deconv/supplemental/Atlas.U25.l4.hg19.tsv
 ```
 
-Reference atlas-building details: [tutorial/tutorial_ref_maps.md](tutorial_ref_maps.md)
+UXM does not produce CIs, p-values, or q-values; for those, use `BetaValueDeconvolution` instead.
 
-## 9. Troubleshooting
+## 9. Step 6: Differential TOO analysis (cohort comparison)
 
-## 9.1 `ClassNotFoundException` on old model files
+The per-sample `significant` flag from Step 5 tests `H0: w_c = 0` *in that sample* -- it is a QC diagnostic for individual samples, **not** a group comparison test. To find cell types that differ between groups (e.g., Disease vs Control), use `scripts/too_diff_analysis.py`, which:
 
-If you decode an old model trained before package migration, use the current v0.60 jar. Backward-compatible class-name remapping is implemented for legacy serialized model class names.
+1. Pivots per-sample point estimates into a samples x cell_types matrix.
+2. Optionally refines NNLS-floored zeros using the bootstrap `CI_upper`.
+3. Applies the centered log-ratio (CLR) transform to handle the simplex constraint.
+4. Fits a linear model per cell type: `clr(w_c) ~ group + clinical_covariates + technical_covariates`.
+5. Applies BH FDR correction across cell types.
 
-## 9.2 No `bedGraphToBigWig` in PATH
+## 9.1 Why not just count "YES" flags across samples?
 
-FinaleMe now auto-falls back to Java BigWig writing when this executable is missing.  
+| Pitfall of per-sample YES counting | Why it matters |
+|---|---|
+| Significance != presence | A 5% true cell-type fraction may fail q<0.05 in a low-coverage sample purely from power loss; counting "YES" loses this. |
+| Loss of magnitude | "Prostate at 8%" and "Prostate at 35%" both register as YES; biologically very different. |
+| Wrong null hypothesis | Per-sample q tests "is this fraction non-zero in this sample?", not "do groups differ?". |
+| Threshold flicker | Borderline cell types switch YES/NO at q=0.05 due to noise; this generates spurious between-group differences. |
+
+The CLR + linear model approach uses point-estimate **magnitudes** as the data, models between-sample variance correctly, and lets you adjust for confounders like batch and coverage tier.
+
+## 9.2 Inputs
+
+You can feed `too_diff_analysis.py` either:
+
+- A single combined long-format TSV produced by running `BetaValueDeconvolution` on multiple query files in one invocation (`--deconv-tsv results/cohort.deconv.beta.tsv`), or
+- Per-sample TSVs from independent invocations (`--deconv-files results/cohort/*.deconv.beta.tsv`); the script auto-concatenates them and infers the `sample` field from the filename if needed.
+
+You also need a metadata TSV with at minimum a `sample` column matching the deconv outputs and a column with the group label:
+
+```
+sample      disease_status   age   sex   library_batch
+14230_1     Disease          67    M     B1
+14230_2     Disease          71    F     B2
+HD_45       Control          62    M     B1
+HD_46       Control          59    F     B2
+...
+```
+
+## 9.3 Recommended command
+
+```bash
+python scripts/too_diff_analysis.py \
+  --deconv-tsv results/cohort.deconv.beta.tsv \
+  --metadata samples.tsv \
+  --group-col disease_status \
+  --reference-group Control \
+  --covariates age,sex,library_batch \
+  --test omnibus \
+  --refine-zeros-with-ci \
+  --output results/diff_celltypes.tsv \
+  --verbose
+```
+
+For two groups (Disease vs Control), `omnibus` is equivalent to a t-test on the group factor. For 3+ groups, `omnibus` performs an F-test (any group differs); use `--test pairwise` with `--reference-group <name>` to get one row per non-reference group.
+
+## 9.4 Step 6 options (`too_diff_analysis.py`)
+
+### Input
+
+| Option | Description |
+|---|---|
+| `--deconv-tsv` | Single combined long-format TSV from `BetaValueDeconvolution -bootstrap`. |
+| `--deconv-files` | Per-sample TSVs (multiple paths or a glob pattern). Use this when each sample was a separate Step 5 job. |
+| `--metadata` | Sample metadata TSV with at minimum `sample` and the `--group-col` column. |
+
+### Group definition
+
+| Option | Description |
+|---|---|
+| `--group-col` | Metadata column holding the group label. Default: `group`. |
+| `--reference-group` | Group level to use as the reference for pairwise comparisons. If omitted, the alphabetically first level is used. Required for `--test pairwise`. |
+| `--covariates` | Comma-separated metadata columns to adjust for, e.g. `age,sex,library_batch,coverage_tier`. Categorical columns are auto-detected by dtype. |
+| `--test` | `omnibus` (default; F-test on the group factor, any group differs) or `pairwise` (each non-reference group vs the reference, one row per `(cell_type, level)`). |
+
+### Compositional preprocessing
+
+| Option | Description |
+|---|---|
+| `--exclude-cell-types` | Comma-separated cell types to skip (e.g. `Unknown` if the input came from `finaleme-too`; `BetaValueDeconvolution` does not estimate Unknown). |
+| `--refine-zeros-with-ci` | Replace exact-zero point estimates with `CI_upper/2` where `CI_upper > --refine-zeros-ci-min`. NNLS sometimes drives small genuine fractions to 0 because of the non-negative constraint; the bootstrap CI can detect "below detection" rather than "absent". |
+| `--refine-zeros-ci-min` | Threshold above which a zero point estimate is treated as below-detection. Default: 1e-4. |
+| `--clr-eps` | Pseudocount added to zero proportions before log. Default: 1e-6. |
+| `--weighted` | Inverse-variance weight samples by mean CI width across cell types. Down-weights low-quality samples. Requires CI columns. |
+
+### Output
+
+| Option | Description |
+|---|---|
+| `--fdr-alpha` | q-value threshold for the `significant` flag. Default: 0.05. |
+| `--output` | Output TSV path. |
+| `--verbose` | Print group sizes, drop counts, and a top-significant summary table. |
+
+## 9.5 Output schema
+
+Per-cell-type results, sorted by q-value ascending:
+
+| Column | Meaning |
+|---|---|
+| `cell_type` | Cell type from the reference panel. |
+| `n_samples` | Number of samples that contributed to this cell type's fit (after dropping rows with NaN in group/covariates). |
+| `r_squared` | Fraction of CLR variance explained by `group + covariates`. |
+| `F_stat` | (omnibus only) F statistic for the group factor. |
+| `p_value` | omnibus: F-test p-value. pairwise: t-test p-value for the level vs reference. |
+| `q_value` | Benjamini-Hochberg-adjusted p-value across cell types. |
+| `significant` | `True` if `q_value <= --fdr-alpha`. |
+| `max_effect_clr` | (omnibus only) Maximum-magnitude per-level coefficient in CLR space; positive = elevated in that group vs reference. |
+| `max_effect_level` | (omnibus only) Group level corresponding to `max_effect_clr`. |
+| `level`, `effect_clr`, `std_err` | (pairwise only) Per-level CLR-space effect and standard error. |
+
+CLR-space effects are interpretable as multiplicative log-ratios: `effect_clr = +1.0` means the cell type's geometric-mean fraction in that group is `e^1 ≈ 2.7x` higher than in the reference, after accounting for covariates and the simplex constraint.
+
+## 9.6 Worked example
+
+```
+$ python scripts/too_diff_analysis.py \
+    --deconv-tsv results/cohort.deconv.beta.tsv \
+    --metadata samples.tsv \
+    --group-col disease_status \
+    --reference-group Control \
+    --covariates age,sex,library_batch \
+    --output results/diff_celltypes.tsv --verbose
+
+Samples in deconv: 30; in metadata: 30; intersection used: 30
+Group sizes:
+disease_status
+Control    15
+Disease    15
+Cell types: 38
+Wrote results/diff_celltypes.tsv: 38 row(s), 5 significant at q<=0.05.
+
+Top significant cell types:
+   cell_type  max_effect_clr max_effect_level   p_value   q_value  n_samples
+    Prostate-Ep        +2.55          Disease  5.4e-15   2.7e-14         30
+        Blood-T        -0.98          Disease  2.4e-11   6.0e-11         30
+      Liver-Hep        -1.24          Disease  5.5e-06   9.1e-06         30
+       Endothel        -0.50          Disease  9.3e-03   1.2e-02         30
+   Lung-Ep-Bron        -0.31          Disease  3.5e-02   4.3e-02         30
+```
+
+In this example the disease cohort has a strong elevation of Prostate-Ep (+2.55 CLR -> ~12x geometric-mean increase) accompanied by drops in blood and liver fractions, all robust to age/sex/library_batch.
+
+## 10. Troubleshooting
+
+## 10.1 `ClassNotFoundException` on old model files
+
+If you decode an old model trained before package migration, use the current v0.62 jar. Backward-compatible class-name remapping is implemented for legacy serialized model class names.
+
+## 10.2 No `bedGraphToBigWig` in PATH
+
+FinaleMe now auto-falls back to Java BigWig writing when this executable is missing.
 Install UCSC `bedGraphToBigWig` if you still prefer/require the UCSC binary path.
 
-## 9.3 Missing CpG index for `-patOutput`
+## 10.3 Missing CpG index for `-patOutput` or `-cpgIndex`
 
 Use setup-provided files:
 
 - hg19: `data/CpG_index.hg19.bed.gz`
 - hg38: `data/CpG_index.hg38.bed.gz`
 
-## 9.4 Memory usage in high coverage WGS data
+## 10.4 Memory usage in high coverage WGS data
 
 Try different `-Xmx` and appropriate `-t`. We tested with `-Xmx20G` and `-t 5` for HD_46 dataset (~16X depth), but may need `-Xmx80G` and `-t 5` for 14230_1 dataset (~39X depth) in the paper.
 
-## 9.5 Chromosome naming mismatch in bigWig
+## 10.5 Chromosome naming mismatch in bigWig
 
 Use:
 
@@ -465,19 +686,47 @@ Use:
 
 as needed for your chrom-size naming convention.
 
-## 10. Performance and reproducibility notes
+## 10.6 BetaValueDeconvolution defaults are too slow
+
+The v0.62 defaults run 1000 bootstrap replicates and 10000 permutations per cell type. For a quick scan use:
+
+```bash
+-nBootstrap 200 -nPermutations 1000
+```
+
+For a one-off run without inference (legacy wide-format output, fastest):
+
+```bash
+-bootstrap=false -permutationTest=false
+```
+
+## 10.7 Step 6 differential analysis: "no overlap between deconv and metadata"
+
+`too_diff_analysis.py` matches samples by exact string equality on the `sample` column. If your deconv files have basenames like `BH01.decode.prediction.bed.gz` but your metadata uses `BH01`, either:
+
+- Strip the suffix from the deconv `sample` column, or
+- Update the metadata `sample` column to match the deconv basenames exactly.
+
+## 10.8 Step 6 reports "fit failed" for some cell types
+
+This usually means too few non-zero observations to fit the linear model. Check the `n_samples` column. If a cell type is zero in nearly every sample (common for very rare tissues at low coverage), exclude it via `--exclude-cell-types CT1,CT2`.
+
+## 11. Performance and reproducibility notes
 
 - Step 1 is parallelized by 5Mb genomic bins (`-t` controls worker count).
 - Training and decode are parallelized in FinaleMe (`-t` controls worker count).
-- Use fixed `-seed` for reproducible randomized operations.
+- Step 5 bootstrap and permutation are parallelized via `-bootstrapThreads`.
+- All randomness in Step 5 is seeded by default (`-bootstrapSeed 42 -permutationSeed 42`); reruns at any thread count produce bit-identical output. Set `-1` for fresh entropy.
+- Use fixed `-seed` for reproducible randomized operations in Steps 2-3.
 
-## 11. Backward-compatible command alias
+## 12. Backward-compatible command alias
 
 `edu.northwestern.epifluidlab.finaleme.utils.CpgMultiMetricsStats` is kept as a deprecated alias to `CpgFeatureMatrixBuilder` for script compatibility.
 
-## 12. References
+## 13. References
 
 - FinaleMe paper: https://doi.org/10.1038/s41467-024-47196-6
 - Reference data (Zenodo): https://doi.org/10.5281/zenodo.19392525
+- TOO reference panels (Zenodo): https://doi.org/10.5281/zenodo.19742408
 - wgbstools: https://github.com/nloyfer/wgbs_tools
 - UXM_deconv: https://github.com/nloyfer/UXM_deconv
