@@ -20,7 +20,7 @@ https://maven.apache.org/install.html (or use the build .jar file from release)
 ```bash
 git clone https://github.com/epifluidlab/FinaleMe.git
 cd FinaleMe
-./scripts/sync-vendored-repo.sh
+bash ./scripts/sync-vendored-repo.sh
 mvn clean package
 ```
 
@@ -29,7 +29,7 @@ mvn clean package
 Run one command to build FinaleMe and download required hg19/hg38 reference files (including the pre-built TOO reference panels) into `data/`:
 
 ```bash
-./scripts/setup_references.sh
+bash ./scripts/setup_references.sh
 ```
 
 ## Test dataset
