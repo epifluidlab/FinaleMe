@@ -401,7 +401,7 @@ Once you have the atlas, you can deconvolve any FinaleMe-predicted cfDNA sample.
 First, run FinaleMe decode to produce `*.prediction.bed.gz`:
 
 ```bash
-JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.hmm.FinaleMe \
@@ -415,10 +415,10 @@ java -Xmx20G -cp "$JAR" \
 
 The atlas TSV produced by `generate_cgi_shore_markers.py` has embedded per-cell-type
 values, so you can pass it directly with `-refPanel` (no separate `-refBetas`/`-refGroups`
-needed). With v0.62 defaults, this also runs stratified bootstrap + permutation:
+needed). With v0.63 defaults, this also runs stratified bootstrap + permutation:
 
 ```bash
-JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
@@ -452,7 +452,7 @@ For the full set of `BetaValueDeconvolution` options (bootstrap, permutation, FD
 
 ### 6.3 Interpret results
 
-With v0.62 defaults the output is long format, one row per `(sample, cell_type)`:
+With v0.63 defaults the output is long format, one row per `(sample, cell_type)`:
 
 ```
 sample   cell_type   proportion   CI_lower   CI_upper   p_value   q_value   significant   p_source      n_replicates

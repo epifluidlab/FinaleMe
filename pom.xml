@@ -48,7 +48,7 @@
   <modelVersion>4.0.0</modelVersion>
   <name>FinaleMe</name>
   <packaging>jar</packaging>
-  <version>0.62</version>
+  <version>0.63</version>
 	<properties>
 		<maven.compiler.source>21</maven.compiler.source>
 		<maven.compiler.target>21</maven.compiler.target>

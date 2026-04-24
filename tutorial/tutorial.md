@@ -1,6 +1,6 @@
 # FinaleMe Tutorial
 
-This tutorial contains the full, detailed usage guide for FinaleMe v0.62.
+This tutorial contains the full, detailed usage guide for FinaleMe v0.63.
 
 If you want the shortest path to run the pipeline, start from [README.md](../README.md).
 
@@ -39,7 +39,7 @@ cd FinaleMe
 This command:
 
 - checks dependencies
-- builds `target/FinaleMe-0.62-jar-with-dependencies.jar` (if missing)
+- builds `target/FinaleMe-0.63-jar-with-dependencies.jar` (if missing)
 - downloads hg19/hg38 reference data into `data/`, including the pre-built TOO reference panels for Step 5
 
 Use a custom data directory with:
@@ -113,7 +113,7 @@ For tabix fragment BED/TSV, the file must include at least `chr`, `start`, `end`
 ## 4.1 Standard BAM command
 
 ```bash
-JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.CpgFeatureMatrixBuilder \
@@ -372,7 +372,7 @@ This is optional when Step 3 already runs with `-bwOutput`.
 The simplest workflow uses the atlas downloaded by `setup_references.sh`:
 
 ```bash
-JAR="target/FinaleMe-0.62-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \
@@ -386,7 +386,7 @@ For hg38 inputs, use `data/Atlas.CGI_shore.U250.l3.hg38.tsv` (or the extended `A
 
 ### What the defaults do
 
-With the v0.62 production defaults, the command above automatically:
+With the v0.63 production defaults, the command above automatically:
 
 - Binarizes both reference and sample at `-binarizeThreshold 0.1`.
 - Solves the deconvolution with `-solver NNLS` (Lawson-Hanson + sum=1 normalization; matches the original method).
@@ -659,7 +659,7 @@ In this example the disease cohort has a strong elevation of Prostate-Ep (+2.55 
 
 ## 10.1 `ClassNotFoundException` on old model files
 
-If you decode an old model trained before package migration, use the current v0.62 jar. Backward-compatible class-name remapping is implemented for legacy serialized model class names.
+If you decode an old model trained before package migration, use the current v0.63 jar. Backward-compatible class-name remapping is implemented for legacy serialized model class names.
 
 ## 10.2 No `bedGraphToBigWig` in PATH
 
