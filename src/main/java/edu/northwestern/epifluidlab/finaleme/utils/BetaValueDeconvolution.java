@@ -86,56 +86,57 @@ public class BetaValueDeconvolution {
     // ========================= Bootstrap / Inference Options =========================
 
     @Option(name = "-bootstrap", usage = "Enable bootstrap: resample markers with replacement B times, re-run NNLS "
-            + "per replicate, produce CI, p-value (for H0: w_k = 0), and BH-adjusted q-value per cell type. "
-            + "When enabled the output format switches from wide (one column per sample) to long with "
-            + "additional columns (CI_lower, CI_upper, p_value, q_value). Default: false")
-    public boolean bootstrap = false;
+            + "per replicate, produce CI and per-cell-type statistics. When enabled the output switches from "
+            + "wide (one column per sample) to long with additional columns (CI_lower, CI_upper, p_value, "
+            + "q_value, significant). Default: true")
+    public boolean bootstrap = true;
 
-    @Option(name = "-nBootstrap", usage = "Bootstrap replicates (default: 200). Recommended >=200 for stable CIs "
-            + "and >=1000 for stable small p-values.")
-    public int nBootstrap = 200;
+    @Option(name = "-nBootstrap", usage = "Bootstrap replicates. Recommended >=200 for stable CIs and >=1000 for "
+            + "stable small p-values. Default: 1000")
+    public int nBootstrap = 1000;
 
     @Option(name = "-ciLevel", usage = "Two-sided CI level for bootstrap (default: 0.95 -> percentile CI [2.5, 97.5])")
     public double ciLevel = 0.95;
 
-    @Option(name = "-bootstrapThreads", usage = "Parallelism for bootstrap replicates (default: 1). "
-            + "Each replicate runs NNLS independently; bootstrap is embarrassingly parallel.")
-    public int bootstrapThreads = 1;
+    @Option(name = "-bootstrapThreads", usage = "Parallelism for bootstrap and permutation tasks. Each replicate "
+            + "runs NNLS independently; both procedures are embarrassingly parallel. Default: 10")
+    public int bootstrapThreads = 10;
 
-    @Option(name = "-bootstrapSeed", usage = "RNG seed for bootstrap resampling for reproducibility (default: -1, "
-            + "meaning use fresh entropy). Set to a non-negative integer to fix the resampling order.")
-    public long bootstrapSeed = -1L;
+    @Option(name = "-bootstrapSeed", usage = "RNG seed for bootstrap resampling. Set to -1 for fresh entropy per "
+            + "run. Default: 42 (fixed for reproducibility)")
+    public long bootstrapSeed = 42L;
 
-    @Option(name = "-fdrAlpha", usage = "FDR threshold for the 'significant' flag in the per-cell-type output "
-            + "(q_value <= fdrAlpha -> significant=YES). Default: 0.05")
+    @Option(name = "-fdrAlpha", usage = "FDR / significance threshold for the 'significant' flag in the "
+            + "per-cell-type output (q_value <= fdrAlpha -> significant=YES). Default: 0.05")
     public double fdrAlpha = 0.05;
 
     @Option(name = "-bootstrapStratified", usage = "Stratified bootstrap: resample markers WITHIN each cell-type "
             + "group (from the `target` column in the reference panel) rather than uniformly across all markers. "
             + "Eliminates the inflated-variance bias for cell types with fewer markers. Falls back to uniform "
-            + "resampling if the reference panel has no `target` column. Default: false")
-    public boolean bootstrapStratified = false;
+            + "resampling if the reference panel has no `target` column. Default: true")
+    public boolean bootstrapStratified = true;
 
     @Option(name = "-permutationTest", usage = "Enable permutation test. Produces frequentist-calibrated p-values "
             + "that can resolve below 1/(bootstrap B+1). Specific permutation scheme controlled by "
             + "-permutationMode. When enabled, p/q columns in the output come from permutation; bootstrap is "
-            + "still run (if enabled) for the CI. Default: false")
-    public boolean permutationTest = false;
+            + "still run (if enabled) for the CI. Default: true")
+    public boolean permutationTest = true;
 
     @Option(name = "-permutationMode", usage = "Permutation scheme:\n"
-            + " sample   = for each cell type c, shuffle the rows of the c-th reference column "
-            + "(tests sample-specific alignment of column c with y; per-cell-type null).\n"
+            + " marker   = for each cell type c, shuffle the marker-row assignment of column X[:, c] "
+            + "(tests whether the specific marker-to-column alignment is better than a random rearrangement; "
+            + "per-cell-type null).\n"
             + " celltype = at each marker row, shuffle the K cell-type values among columns "
-            + "(tests whether cell-type label carries information; shared symmetric null across cell types). "
-            + "Recommended when the panel is cell-type-specific by design (U250-style atlases) and "
-            + "cell-type column marginals are balanced (spread < 0.3). Default: celltype")
+            + "(tests whether the cell-type label at each marker carries information; shared symmetric null "
+            + "across cell types). Recommended when the panel is cell-type-specific by design (U250-style "
+            + "atlases) and cell-type column marginals are balanced (spread < 0.3). Default: celltype")
     public String permutationMode = "celltype";
 
-    @Option(name = "-nPermutations", usage = "Number of permutations. With -permutationMode sample, this is "
+    @Option(name = "-nPermutations", usage = "Number of permutations. With -permutationMode marker, this is "
             + "per cell type (total NNLS solves = K * nPermutations). With -permutationMode celltype, it is a "
             + "single shared set of whole-matrix permutations (total NNLS solves = nPermutations, producing "
-            + "K values per replicate). Recommended: 1000 routine, 10000 for small p-values. Default: 1000")
-    public int nPermutations = 1000;
+            + "K values per replicate). Recommended: 1000 routine, 10000 for small p-values. Default: 10000")
+    public int nPermutations = 10000;
 
     @Option(name = "-permutationNullPooled", usage = "Only used with -permutationMode celltype. Pool the K * P "
             + "permuted w_c_permuted values into a single null distribution shared across all cell types, "
@@ -149,9 +150,9 @@ public class BetaValueDeconvolution {
             + "already calibrated across cell types. Default: false (skip BH under pooled null).")
     public boolean permutationBHCorrect = false;
 
-    @Option(name = "-permutationSeed", usage = "RNG seed for permutation tests (default: -1 = fresh entropy). "
-            + "Set to a non-negative integer to fix the permutation order.")
-    public long permutationSeed = -1L;
+    @Option(name = "-permutationSeed", usage = "RNG seed for permutation tests. Set to -1 for fresh entropy per "
+            + "run. Default: 42 (fixed for reproducibility)")
+    public long permutationSeed = 42L;
 
     @Option(name = "-h", usage = "Show help")
     public boolean help = false;
@@ -1746,37 +1747,38 @@ public class BetaValueDeconvolution {
     /**
      * Dispatch to the permutation scheme selected by -permutationMode.
      * <ul>
-     *   <li><b>sample</b>: shuffle rows of X[:, c] for each cell type c separately.
-     *     Tests whether THIS column's alignment with y is specific.
+     *   <li><b>marker</b>: shuffle rows (markers) of X[:, c] for each cell type c
+     *     separately. Tests whether the c-th column's specific marker-to-value
+     *     alignment is better than a random rearrangement of the same values.
      *     Per-cell-type null; always applies BH correction.</li>
      *   <li><b>celltype</b>: at each marker row, shuffle the K cell-type values
-     *     among columns. Tests whether cell-type labels carry information.
-     *     Symmetric null across cell types; can use a pooled null (default)
-     *     to skip BH correction.</li>
+     *     among columns. Tests whether the cell-type label at each marker carries
+     *     information. Symmetric null across cell types; can use a pooled null
+     *     (default) to skip BH correction.</li>
      * </ul>
      */
     private PermutationResult runPermutationTest(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
             throws InterruptedException {
         String mode = (permutationMode == null ? "celltype" : permutationMode.toLowerCase(Locale.ROOT));
         switch (mode) {
-            case "sample":
-                return runPermutationTestSample(refMatrix, queryVector, pointEstimate);
+            case "marker":
+                return runPermutationTestMarker(refMatrix, queryVector, pointEstimate);
             case "celltype":
                 return runPermutationTestCelltype(refMatrix, queryVector, pointEstimate);
             default:
                 throw new IllegalArgumentException(
-                        "-permutationMode must be 'sample' or 'celltype', got: " + permutationMode);
+                        "-permutationMode must be 'marker' or 'celltype', got: " + permutationMode);
         }
     }
 
     /**
-     * "sample"-mode permutation: for each cell type c, shuffle the rows of
+     * "marker"-mode permutation: for each cell type c, shuffle the rows of
      * X[:, c]. Per-cell-type null. BH-corrected across K cell types.
      *
      * Parallelizes across ALL K*P tasks using a single thread pool so every
      * worker stays busy for the entire run.
      */
-    private PermutationResult runPermutationTestSample(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
+    private PermutationResult runPermutationTestMarker(double[][] refMatrix, double[] queryVector, double[] pointEstimate)
             throws InterruptedException {
         int M = refMatrix.length;
         int K = refMatrix[0].length;
@@ -1813,10 +1815,10 @@ public class BetaValueDeconvolution {
             for (int c = 0; c < K; c++) {
                 double observed = pointEstimate[c];
                 for (int b = 0; b < P; b++) {
-                    runOnePermutationSample(refMatrix, queryVector, originalCols[c], permOrders[c][b], c, observed, geCount[c]);
+                    runOnePermutationMarker(refMatrix, queryVector, originalCols[c], permOrders[c][b], c, observed, geCount[c]);
                     done++;
                     if (done % logEvery == 0) {
-                        log.info("  permutation(sample) {}/{} ({} CT x {} perms)", done, totalTasks, K, P);
+                        log.info("  permutation(marker) {}/{} ({} CT x {} perms)", done, totalTasks, K, P);
                     }
                 }
             }
@@ -1832,10 +1834,10 @@ public class BetaValueDeconvolution {
                 for (int b = 0; b < P; b++) {
                     final int bb = b;
                     futures.add(exec.submit(() -> {
-                        runOnePermutationSample(refMatrix, queryVector, originalCols[cc], permOrders[cc][bb], cc, observed, geCount[cc]);
+                        runOnePermutationMarker(refMatrix, queryVector, originalCols[cc], permOrders[cc][bb], cc, observed, geCount[cc]);
                         long d = doneCount.incrementAndGet();
                         if (d % logEvery == 0) {
-                            log.info("  permutation(sample) {}/{} ({} CT x {} perms, {} threads)",
+                            log.info("  permutation(marker) {}/{} ({} CT x {} perms, {} threads)",
                                     d, totalTasks, K, P, nThreads);
                         }
                     }));
@@ -1970,7 +1972,7 @@ public class BetaValueDeconvolution {
         }
 
         // BH correction decision:
-        //   * sample mode always applies BH (handled in runPermutationTestSample)
+        //   * marker mode always applies BH (handled in runPermutationTestMarker)
         //   * celltype + pooled null: skip BH by default (already calibrated),
         //     unless user forced with -permutationBHCorrect
         //   * celltype + per-cell-type null: apply BH
@@ -2006,11 +2008,11 @@ public class BetaValueDeconvolution {
     }
 
     /**
-     * "sample"-mode permutation: deep-copy refMatrix, replace column {@code c}
+     * "marker"-mode permutation: deep-copy refMatrix, replace column {@code c}
      * with the permuted version of its original values, solve NNLS, tally if
      * permuted w_c >= observed. Thread-safe (local Xp copy).
      */
-    private void runOnePermutationSample(
+    private void runOnePermutationMarker(
             double[][] refMatrix,
             double[] queryVector,
             double[] originalCol,
