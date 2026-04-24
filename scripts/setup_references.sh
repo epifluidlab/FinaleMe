@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${FINALEME_DATA_DIR:-${ROOT_DIR}/data}"
 ZENODO_URL="https://zenodo.org/records/19392525/files"
+# Reference panels for tissue-of-origin deconvolution (BetaValueDeconvolution -refPanel).
+# DOI: 10.5281/zenodo.19742408
+ATLAS_ZENODO_URL="https://zenodo.org/records/19742408/files"
 JAR_PATH="${ROOT_DIR}/target/FinaleMe-0.61-jar-with-dependencies.jar"
 
 OS=""
@@ -270,6 +273,21 @@ setup_methylation_prior() {
   download_file "${ZENODO_URL}/wgbs_buffyCoat_jensen2015GB.methy.hg38.bw?download=1" "${DATA_DIR}/wgbs_buffyCoat_jensen2015GB.methy.hg38.bw"
 }
 
+setup_atlas_panels() {
+  log "Downloading TOO deconvolution reference panels (Atlas) from Zenodo (DOI: 10.5281/zenodo.19742408)"
+  # Used by BetaValueDeconvolution -refPanel and finaleme-too --reference-panel.
+  # Three pre-aggregated atlases:
+  #   * hg19 base panel (38 cell types)
+  #   * hg38 base panel (38 cell types)
+  #   * hg38 panel extended with microglia + astrocyte targets
+  download_file "${ATLAS_ZENODO_URL}/Atlas.CGI_shore.U250.l3.hg19.tsv?download=1" \
+    "${DATA_DIR}/Atlas.CGI_shore.U250.l3.hg19.tsv"
+  download_file "${ATLAS_ZENODO_URL}/Atlas.CGI_shore.U250.l3.hg38.tsv?download=1" \
+    "${DATA_DIR}/Atlas.CGI_shore.U250.l3.hg38.tsv"
+  download_file "${ATLAS_ZENODO_URL}/Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv?download=1" \
+    "${DATA_DIR}/Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv"
+}
+
 print_summary() {
   log "Reference data directory: ${DATA_DIR}"
 
@@ -288,6 +306,9 @@ print_summary() {
     "hg38-blacklist.v2.bed|dark regions for hg38"
     "wgbs_buffyCoat_jensen2015GB.methy.hg19.bw|methylation prior (hg19)"
     "wgbs_buffyCoat_jensen2015GB.methy.hg38.bw|methylation prior (hg38)"
+    "Atlas.CGI_shore.U250.l3.hg19.tsv|TOO deconvolution reference panel (hg19)"
+    "Atlas.CGI_shore.U250.l3.hg38.tsv|TOO deconvolution reference panel (hg38)"
+    "Atlas.pluse_microglia_astrocyte.CGI_shore.U250.l3.hg38.tsv|TOO panel + microglia/astrocyte (hg38)"
   )
 
   local missing=0
@@ -330,6 +351,7 @@ Commands:
   cpg         Download CpG motif + index files
   darkregions Download dark-region BED files
   methylation Download methylation prior bigWig files
+  atlas       Download TOO deconvolution reference panels (hg19/hg38)
   summary     Print reference file summary
 USAGE
 }
@@ -343,6 +365,7 @@ run_all() {
   setup_cpg_files
   setup_dark_regions
   setup_methylation_prior
+  setup_atlas_panels
   print_summary
 }
 
@@ -381,6 +404,10 @@ main() {
     methylation)
       detect_platform
       setup_methylation_prior
+      ;;
+    atlas)
+      detect_platform
+      setup_atlas_panels
       ;;
     summary)
       detect_platform
