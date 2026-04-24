@@ -336,7 +336,12 @@ def stage2_generate_blocks(args, cgi_shore_bed):
 
         if not op.isfile(blocks_path) or args.force:
             beta_files = ' '.join(args.betas[:10])  # Use subset for segmentation
-            cmd = f'{wgbstools} segment --betas {beta_files} -o {blocks_path}'
+            # Pass --genome explicitly so wgbstools uses the right reference
+            # regardless of its set_default_ref / most-recent init_genome
+            # state — otherwise it falls back to whatever was initialized
+            # last (often hg19) and errors on genome-mismatched beta files.
+            cmd = (f'{wgbstools} segment --genome {args.genome} '
+                   f'--betas {beta_files} -o {blocks_path}')
             if args.threads:
                 cmd += f' -@ {args.threads}'
             # Stream wgbstools stdout/stderr directly — if the tool exits 0
@@ -449,7 +454,8 @@ def stage2_generate_blocks(args, cgi_shore_bed):
                      [f'col{i}' for i in range(5, df.shape[1])]
     else:
         # Need to add CpG indices via wgbstools
-        cmd = f'{wgbstools} convert --add_cpg_count -L {intersect_path}'
+        cmd = (f'{wgbstools} convert --genome {args.genome} '
+               f'--add_cpg_count -L {intersect_path}')
         result = run_cmd(cmd, verbose=args.verbose)
         # Parse output
         lines = result.strip().split('\n')
@@ -516,7 +522,7 @@ def stage2_generate_blocks(args, cgi_shore_bed):
 ###############################################################################
 
 def run_find_markers(wgbstools, blocks_path, groups_file, betas, out_dir,
-                     delta_means, top, threads, verbose):
+                     delta_means, top, threads, verbose, genome=None):
     """Run wgbstools find_markers with specified parameters."""
     ensure_dir(out_dir)
     beta_str = ' '.join(betas)
@@ -533,6 +539,14 @@ def run_find_markers(wgbstools, blocks_path, groups_file, betas, out_dir,
            f'--sort_by delta_means '
            f'--out_dir {out_dir} '
            f'--pval 0.05')
+    if genome:
+        # Force the correct genome reference on wgbstools; without this, it
+        # falls back to whatever was set via set_default_ref / last
+        # init_genome, which may not match the input .beta files.
+        cmd = cmd.replace(
+            f'{wgbstools} find_markers ',
+            f'{wgbstools} find_markers --genome {genome} ',
+        )
     if top:
         cmd += f' --top {top}'
     if threads:
@@ -896,7 +910,7 @@ def stage3_find_markers(args, blocks_path):
         target_flag = f'--targets {targets_str}' if targets_str else ''
 
         beta_str = ' '.join(abs_betas)
-        cmd = (f'{wgbstools} find_markers '
+        cmd = (f'{wgbstools} find_markers --genome {args.genome} '
                f'--blocks_path {abs_blocks} '
                f'--groups_file {abs_groups} '
                f'--betas {beta_str} '
