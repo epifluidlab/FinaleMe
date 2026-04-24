@@ -522,8 +522,16 @@ def stage2_generate_blocks(args, cgi_shore_bed):
 ###############################################################################
 
 def run_find_markers(wgbstools, blocks_path, groups_file, betas, out_dir,
-                     delta_means, top, threads, verbose, genome=None):
-    """Run wgbstools find_markers with specified parameters."""
+                     delta_means, top, threads, verbose):
+    """Run wgbstools find_markers with specified parameters.
+
+    Note: wgbstools ``find_markers`` does NOT accept ``--genome``. It reads
+    .beta files as raw row-indexed byte arrays and inherits the genome
+    context from the blocks file's CpG indices (which were produced by
+    upstream ``wgbstools segment`` / ``convert`` calls that DO take
+    ``--genome``). The block file + beta files must be genome-consistent;
+    the script ensures this via the stage-2 ``--genome`` flags.
+    """
     ensure_dir(out_dir)
     beta_str = ' '.join(betas)
 
@@ -539,14 +547,6 @@ def run_find_markers(wgbstools, blocks_path, groups_file, betas, out_dir,
            f'--sort_by delta_means '
            f'--out_dir {out_dir} '
            f'--pval 0.05')
-    if genome:
-        # Force the correct genome reference on wgbstools; without this, it
-        # falls back to whatever was set via set_default_ref / last
-        # init_genome, which may not match the input .beta files.
-        cmd = cmd.replace(
-            f'{wgbstools} find_markers ',
-            f'{wgbstools} find_markers --genome {genome} ',
-        )
     if top:
         cmd += f' --top {top}'
     if threads:
@@ -910,7 +910,12 @@ def stage3_find_markers(args, blocks_path):
         target_flag = f'--targets {targets_str}' if targets_str else ''
 
         beta_str = ' '.join(abs_betas)
-        cmd = (f'{wgbstools} find_markers --genome {args.genome} '
+        # NOTE: wgbstools find_markers does NOT accept --genome; it reads
+        # .beta files as raw row-indexed byte arrays and trusts that the
+        # blocks_path was generated with matching genome (via our
+        # --genome hg38 pass to `wgbstools segment` / `wgbstools convert`
+        # in stage 2). Adding --genome here errors out.
+        cmd = (f'{wgbstools} find_markers '
                f'--blocks_path {abs_blocks} '
                f'--groups_file {abs_groups} '
                f'--betas {beta_str} '
