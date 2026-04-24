@@ -70,7 +70,7 @@ java -Xmx20G -cp "$JAR" \
 
 Output: `results/BH01.cpg_features.hg19.bed.gz`.
 
-It will cost ~25 min for the test dataset.
+It will cost ~25 min for the test dataset. You can also start with frag.gz files downloaded from FinaleDB or other bed.gz files if you don't have the bam files. 
 
 ### Step 2: Train HMM model
 
@@ -111,7 +111,7 @@ It will cost < 1 min for the test dataset.
 
 ### Step 4: Tissues-of-origin deconvolution
 
-Use the pre-built atlas from `data/` (downloaded by `setup_references.sh`). With its production defaults, `BetaValueDeconvolution` automatically runs stratified bootstrap (95% CI) plus a column-permutation test (10000 reps, pooled null) to give a per-cell-type p-value, BH q-value, and a `significant` flag for each sample:
+Use the pre-built atlas from `data/` (downloaded by `setup_references.sh`). With its production defaults, `BetaValueDeconvolution` automatically runs stratified bootstrap (95% CI) plus a column-permutation test (10000 reps, pooled null) to give a per-cell-type p-value, q-value, and a `significant` flag for each sample:
 
 ```bash
 java -Xmx20G -cp "$JAR" \
@@ -130,6 +130,7 @@ BH01     Blood-T     0.156        0.142      0.171      5.3e-05   5.3e-05   YES 
 ...
 ```
 
+Recommend to have at least 50M high quality fragments per sample. 
 Use `data/Atlas.CGI_shore.U250.l3.hg38.tsv` (or `.pluse_microglia_astrocyte.hg38.tsv`) for hg38 inputs. To build a custom atlas instead, see [tutorial/tutorial_ref_maps.md](tutorial/tutorial_ref_maps.md).
 
 ### Step 5: Differential TOO analysis (cohort comparison)
