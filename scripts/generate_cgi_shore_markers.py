@@ -320,15 +320,75 @@ def stage2_generate_blocks(args, cgi_shore_bed):
         else:
             eprint(f'  Segments exist: {blocks_path}')
 
+        # Fail loudly if the segmenter produced nothing usable, so the
+        # downstream empty-intersect error isn't blamed on bedtools.
+        if not op.isfile(blocks_path) or op.getsize(blocks_path) == 0:
+            raise RuntimeError(
+                f'wgbstools segment produced an empty file at {blocks_path}. '
+                f'Check that the first 10 beta files are valid for the genome '
+                f'(wgbstools init_genome {args.genome}) and that your wgbstools '
+                f'installation can segment those files.')
+        n_segments = sum(1 for _ in open(blocks_path))
+        eprint(f'  Segments produced: {n_segments:,}')
+
     # Intersect blocks with CGI+shore regions
     eprint('  Intersecting blocks with CGI+shore regions...')
     if not check_executable('bedtools'):
         raise RuntimeError('bedtools not found. Please install bedtools.')
 
     intersect_path = op.join(args.out_dir, f'cgi_shore_blocks_raw.{args.genome}.bed')
+    # -f 0.1 (default) is a gentle filter — require at least 10% of each
+    # segment to fall inside a CGI+shore region. The old default of 0.5
+    # was too strict: wgbstools often produces multi-kb segments that
+    # straddle CGI boundaries, and a 50% coverage requirement dropped
+    # biologically-useful blocks entirely. Users can tighten via
+    # --intersect-min-overlap.
+    min_overlap = float(getattr(args, 'intersect_min_overlap', 0.1))
     cmd = (f'bedtools intersect -a {blocks_path} -b {cgi_shore_bed} '
-           f'-wa -f 0.5 | sort -k1,1 -k2,2n | uniq > {intersect_path}')
+           f'-wa -f {min_overlap} | sort -k1,1 -k2,2n | uniq > {intersect_path}')
     run_cmd(cmd, verbose=args.verbose)
+
+    # Sanity-check the intersect output BEFORE pandas chokes on empty file.
+    if not op.isfile(intersect_path) or op.getsize(intersect_path) == 0:
+        # Diagnose why nothing survived the intersect.
+        try:
+            import subprocess
+            n_any = int(subprocess.check_output(
+                f'bedtools intersect -a {blocks_path} -b {cgi_shore_bed} -u | wc -l',
+                shell=True, text=True).strip().split()[0])
+        except Exception:
+            n_any = -1
+        # Peek chromosome names from each file.
+        def _first_chrom(path):
+            try:
+                with open(path) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        return line.split('\t', 1)[0]
+            except Exception:
+                pass
+            return '?'
+        chrom_segments = _first_chrom(blocks_path)
+        chrom_cgi = _first_chrom(cgi_shore_bed)
+        hint = ''
+        if n_any == 0:
+            hint = (
+                f'\nNo segments overlap CGI+shore at all. Likely a chromosome-'
+                f'naming mismatch: segments use "{chrom_segments}", CGI+shore '
+                f'uses "{chrom_cgi}". Normalize both files to the same '
+                f'convention (both with or both without the "chr" prefix).')
+        elif n_any > 0:
+            hint = (
+                f'\n{n_any:,} segments overlap CGI+shore with ANY overlap, but '
+                f'none meet the {min_overlap} coverage threshold. Re-run with '
+                f'--intersect-min-overlap 0.05 (or 0.0 for any overlap).')
+        raise RuntimeError(
+            f'Intersection at {intersect_path} is empty.{hint}')
+
+    n_intersect = sum(1 for _ in open(intersect_path))
+    eprint(f'  Blocks after CGI+shore intersect ({min_overlap} overlap): {n_intersect:,}')
 
     # Add CpG indices if not present
     eprint('  Adding CpG indices...')
@@ -1243,6 +1303,16 @@ def parse_args():
     # Block generation
     parser.add_argument('--blocks',
                         help='Pre-existing blocks file (skip segmentation)')
+    parser.add_argument('--intersect-min-overlap', type=float, default=0.1,
+                        help='Minimum fractional overlap required for a segment '
+                             'to be retained after the CGI+shore intersect '
+                             '(bedtools -f). wgbstools often produces multi-kb '
+                             'segments that straddle CGI boundaries; the old '
+                             '0.5 default dropped many biologically-useful '
+                             'blocks. 0.1 (default) keeps a segment if at '
+                             'least 10%% of its length lies inside CGI+shore. '
+                             'Set to 0.0 to keep any overlap; 0.5 restores '
+                             'the legacy strict filter.')
 
     # Marker selection
     parser.add_argument('--num-markers', type=int, default=250,
