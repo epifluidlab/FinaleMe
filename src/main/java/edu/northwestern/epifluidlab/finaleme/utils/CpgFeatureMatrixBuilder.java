@@ -12,6 +12,7 @@ import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.ValidationStringency;
+import htsjdk.samtools.util.BlockCompressedInputStream;
 import htsjdk.samtools.util.BlockCompressedOutputStream;
 import htsjdk.samtools.util.IntervalTree;
 import htsjdk.samtools.util.SequenceUtil;
@@ -524,9 +525,10 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						log.info("Get total reads number used for scaling from input option -totalReadsInBam ... ");
 						readsNumTotal = totalReadsInBam;
 					}else if(useTabixFragmentInput){
-						log.info("Get total fragments number used for scaling from tabix fragment file (full scan)... ");
+						log.info("Get total fragments number used for scaling from tabix fragment file (BGZF sampling) ... ");
 						readsNumTotal = estimateTotalFragmentsFromTabixInput(wgsBamFile);
-						log.info("Counted " + (long)readsNumTotal + " fragments from tabix fragment input");
+						log.info("Estimated total fragments: " + (long)readsNumTotal +
+								" (sampled from BGZF; pass -totalReadsInBam <N> to skip estimation)");
 					}else{
 						// Strategy 1 (fast, ~2 seconds): Get raw total from BAM index or
 						// samtools idxstats, then sample ~1M reads to measure the pass
@@ -967,6 +969,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												continue;
 											}
 
+										// SCALE NOTE: this is "raw reads at CpG / total filtered reads",
+										// where for PE BAM input each fragment may contribute 1 or 2
+										// SAMRecords depending on whether both read ends overlap the CpG.
+										// `finalReadsNumTotal` is the raw filtered read count (~ 2 *
+										// #fragments for PE). Tabix fragment mode produces
+										// "fragments_at_CpG / total_fragments" (see line ~1325), which
+										// for typical cfDNA is roughly 2x larger than the BAM ratio
+										// for the same sample. See tutorial.md §4.3 for details and
+										// guidance on cross-mode training/decoding.
 										double normalizedFragCov = (double)readNumber/finalReadsNumTotal;
 
 										byte[] refBasesExt = CcInferenceUtils.toUpperCase(binRefParser.loadFragment(end-1-kmerExt, kmerExt*2+1).getBytes());
@@ -1731,7 +1742,118 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 			}
 		}
 
+		/**
+		 * Estimate the total number of fragments in a bgzipped tabix-indexed
+		 * fragment file using a fast sampling-based approach analogous to the
+		 * BAM-index estimator. Order of strategies, fastest first:
+		 *
+		 *   1. BGZF sampling (default for .bed.gz / .tsv.gz with bgzip header):
+		 *        Read first {@code TABIX_COUNT_SAMPLE_LINES} lines via
+		 *        BlockCompressedInputStream, track the compressed-byte
+		 *        offset (from the BGZF virtual file pointer's high 48 bits),
+		 *        compute compressed_bytes_per_line, then extrapolate over
+		 *        the total compressed file size. Typical cost: tens of
+		 *        milliseconds on a multi-GB file.
+		 *
+		 *   2. Full scan (fallback): the legacy line-by-line counter, used
+		 *        when the input is not bgzip (so virtual file pointers are
+		 *        unavailable), when sampling fails for any reason, or when
+		 *        the file is small enough that scanning is cheaper than
+		 *        opening BCI.
+		 *
+		 * Returns an exact count for path 2 and an approximate count for
+		 * path 1. If users need an exact count, they can pass it directly
+		 * via -totalReadsInBam.
+		 */
 		private long estimateTotalFragmentsFromTabixInput(String fragmentInputFile) throws IOException{
+			Long sampled = estimateTotalFragmentsFromTabixSampling(fragmentInputFile);
+			if(sampled != null){
+				return sampled;
+			}
+			log.info("BGZF sampling not available for " + fragmentInputFile + "; falling back to full scan");
+			return estimateTotalFragmentsFromTabixFullScan(fragmentInputFile);
+		}
+
+		/**
+		 * Sample size for BGZF-based extrapolation. 50K lines is large enough
+		 * to span at least a few BGZF blocks (typically ~64KB compressed each)
+		 * so the compressed_bytes_per_line ratio averages out, and small
+		 * enough to read in well under a second.
+		 */
+		private static final int TABIX_COUNT_SAMPLE_LINES = 50_000;
+
+		/**
+		 * Minimum number of bytes the sample must consume in the bgzip
+		 * compressed stream before we trust the extrapolation. If the
+		 * sample finishes inside the first BGZF block (no block boundary
+		 * crossed), the offset is rounded to 0 and the estimate would be
+		 * infinite; in that case we return null and let the caller fall
+		 * back to a full scan.
+		 */
+		private static final long TABIX_COUNT_MIN_COMPRESSED_BYTES = 1L << 16; // 64 KB
+
+		private Long estimateTotalFragmentsFromTabixSampling(String fragmentInputFile) {
+			File file = new File(fragmentInputFile);
+			long fileSize = file.length();
+			if (fileSize <= 0) {
+				return null;
+			}
+			BlockCompressedInputStream bgzf = null;
+			BufferedReader br = null;
+			try {
+				bgzf = new BlockCompressedInputStream(file);
+				br = new BufferedReader(new InputStreamReader(bgzf));
+				long sampledLines = 0;
+				String line;
+				while (sampledLines < TABIX_COUNT_SAMPLE_LINES && (line = br.readLine()) != null) {
+					if (line.startsWith("#") || line.trim().isEmpty()) {
+						continue;
+					}
+					String[] splitLines = line.split("\t", 4);
+					if (splitLines.length < 3) {
+						continue;
+					}
+					sampledLines++;
+				}
+				if (sampledLines == 0) {
+					return 0L;
+				}
+				long virtualPointer = bgzf.getFilePointer();
+				long compressedBytesConsumed = virtualPointer >> 16; // BGZF: high 48 bits
+				if (compressedBytesConsumed < TABIX_COUNT_MIN_COMPRESSED_BYTES) {
+					// Sample fits inside the first BGZF block; the compressed
+					// offset is 0 and we cannot extrapolate. Either the file
+					// is tiny or the records are huge -- fall back to full scan.
+					return null;
+				}
+				if (sampledLines >= TABIX_COUNT_SAMPLE_LINES &&
+						compressedBytesConsumed < fileSize) {
+					// Normal case: enough sample to extrapolate.
+					double compressedBytesPerLine = (double) compressedBytesConsumed / (double) sampledLines;
+					double estimated = (double) fileSize / compressedBytesPerLine;
+					long estimatedLong = Math.max(sampledLines, Math.round(estimated));
+					log.info(String.format(
+							"Tabix fragment count (BGZF sampling): %,d sampled lines used %,d compressed bytes; "
+									+ "extrapolating to total compressed size %,d bytes -> ~%,d fragments",
+							sampledLines, compressedBytesConsumed, fileSize, estimatedLong));
+					return estimatedLong;
+				}
+				// We exhausted the file before reaching the sample target;
+				// sampledLines IS the exact total.
+				log.info(String.format(
+						"Tabix fragment count (whole file fits within sample): %,d fragments",
+						sampledLines));
+				return sampledLines;
+			} catch (IOException e) {
+				log.warn("BGZF sampling failed for " + fragmentInputFile + ": " + e.getMessage());
+				return null;
+			} finally {
+				try { if (br != null) br.close(); } catch (IOException ignored) {}
+				try { if (bgzf != null) bgzf.close(); } catch (IOException ignored) {}
+			}
+		}
+
+		private long estimateTotalFragmentsFromTabixFullScan(String fragmentInputFile) throws IOException{
 			long total = 0;
 			BufferedReader br = openMaybeGzipReader(fragmentInputFile);
 			String line;
