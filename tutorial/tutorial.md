@@ -143,7 +143,6 @@ java -Xmx20G -cp "$JAR" \
   -fragmentInputTabix \
   -fragStrandColumn 4 \
   -valueWigs methyPrior:0:data/wgbs_buffyCoat_jensen2015GB.methy.hg19.bw \
-  -inferMethyFromValueWig \
   -t 4
 ```
 
@@ -193,10 +192,9 @@ java -Xmx20G -cp "$JAR" \
 | `-fragmentInputTabix` | Force tabix fragment mode. |
 | `-fragStrandColumn` | 1-based strand column index (0=auto). |
 | `-fragNameColumn` | 1-based fragment-name column index (0=auto/synthetic). |
-| `-fragMethyColumn` | 1-based methylation column index (`m/u`) (0=infer/default). |
+| `-fragMethyColumn` | 1-based methylation column index (`m`/`u`) (0=use `-defaultMethyStat`). Rare; use only if your tabix file carries per-fragment methylation calls. |
 | `-fragBaseQ` | Synthetic base quality for fragment mode (default 60). |
-| `-defaultMethyStat` | Default methylation state if not provided/inferred (`m` or `u`). |
-| `-inferMethyFromValueWig` | Infer methylation from first `-valueWigs` track (`>=50 => m`). |
+| `-defaultMethyStat` | Value written to the `methy_stat` output column when `-fragMethyColumn` is unset and no inline `m`/`u` token is detected. Default: `m`. The HMM does NOT use `methy_stat` as a label or input — it is unsupervised over the feature vector — so this only affects the AUC/QC reporting columns. The default `m` matches BAM behavior under `-wgsMode`. |
 
 ## 4.4 Step 1 output format (`*.cpg_features*.bed.gz`)
 

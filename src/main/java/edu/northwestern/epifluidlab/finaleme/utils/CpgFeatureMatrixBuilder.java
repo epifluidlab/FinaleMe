@@ -142,11 +142,8 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	@Option(name="-fragBaseQ",usage="synthetic baseQ used for tabix fragment input when no per-base quality exists. default: 60")
 	public int fragBaseQ = 60;
 
-	@Option(name="-defaultMethyStat",usage="default methylation state (m or u) for tabix fragment input when no methylation column/inference exists. default: u")
-	public String defaultMethyStat = "u";
-
-	@Option(name="-inferMethyFromValueWig",usage="for tabix fragment input, infer methy_stat from first -valueWigs track at each CpG (>=50 => m; <50 => u) if -fragMethyColumn is unset. default: true")
-	public boolean inferMethyFromValueWig = true;
+	@Option(name="-defaultMethyStat",usage="default methylation state ('m' or 'u') for the methy_stat output column in tabix fragment mode when -fragMethyColumn is unset and no inline 'm'/'u' token is detected in extra columns. methy_stat is NOT consumed by HMM training or decoding -- the HMM is unsupervised over the feature vector -- so this only affects the output column used for AUC/QC reporting. The default 'm' matches the behavior of BAM input under -wgsMode (where every covered CpG is labeled 'm' because the read base is the unconverted reference). default: m")
+	public String defaultMethyStat = "m";
 
 	@Option(name="-useEndMotif",usage="add 5' end 4-mer motif score as a feature column in the output. Default: false")
 	public boolean useEndMotif = false;
@@ -719,7 +716,6 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						final LinkedHashSet<String> finalValueBedLocString = valueBedLocString;
 						final LinkedHashSet<String> finalValueWigLocString = valueWigLocString;
 						final LinkedHashSet<String> finalKmerCollections = kmerCollections;
-						final String finalFirstValueWigKey = finalValueWigLocString.isEmpty() ? null : finalValueWigLocString.iterator().next();
 						final long finalTotalCpgTargets = Math.max(1L, totalCpgTargets);
 
 					// Parallel processing of genomic bins
@@ -1434,7 +1430,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 													}
 												}
 
-												char methyStat = resolveFragmentMethyStat(fragment, finalFirstValueWigKey, valWigStatCollections);
+												char methyStat = resolveFragmentMethyStat(fragment);
 												if(methyStat != 'm' && methyStat != 'u'){
 													continue;
 												}
@@ -1813,18 +1809,27 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 			return new FragmentRecord(chr, start, end, strand, readName, methyStat, fragBaseQ);
 		}
 
-		private char resolveFragmentMethyStat(FragmentRecord fragment, String firstValueWigKey, HashMap<String, Double> valWigStatCollections){
+		/**
+		 * Resolve the methy_stat output column for a tabix-fragment row.
+		 *
+		 * Order of precedence:
+		 *   1. If the input row had an explicit 'm'/'u' token (from
+		 *      -fragMethyColumn or auto-detected in extra columns), use it.
+		 *   2. Otherwise, return -defaultMethyStat (default 'm').
+		 *
+		 * methy_stat is NOT consumed by HMM training or decoding -- the HMM
+		 * is unsupervised over the feature vector and predicts the methylation
+		 * label as the hidden state. methy_stat is written to the output for
+		 * AUC/QC reporting only. Under -wgsMode for BAM input, every covered
+		 * CpG is also labeled 'm' for the same reason (the read base is the
+		 * unconverted reference C/G), so 'm' is the natural default for tabix
+		 * fragment input as well.
+		 */
+		private char resolveFragmentMethyStat(FragmentRecord fragment){
 			if(fragment.methyStat == 'm' || fragment.methyStat == 'u'){
 				return fragment.methyStat;
 			}
-			if(inferMethyFromValueWig && firstValueWigKey != null && valWigStatCollections != null){
-				Double inferred = valWigStatCollections.get(firstValueWigKey);
-				if(inferred != null && !Double.isNaN(inferred)){
-					return inferred >= 50.0 ? 'm' : 'u';
-				}
-			}
-			char fallback = defaultMethyStat.toLowerCase(Locale.US).startsWith("m") ? 'm' : 'u';
-			return fallback;
+			return defaultMethyStat.toLowerCase(Locale.US).startsWith("m") ? 'm' : 'u';
 		}
 
 		private boolean isStrandToken(String token){
