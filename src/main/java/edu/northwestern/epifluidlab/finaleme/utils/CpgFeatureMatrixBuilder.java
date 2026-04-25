@@ -221,6 +221,25 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					if (saveMotifLookup != null && loadMotifLookup != null) {
 						throw new CmdLineException(parser, "-saveMotifLookup and -loadMotifLookup are mutually exclusive", new Throwable());
 					}
+					// -saveMotifLookup needs ground-truth methylation per CpG to compute
+					// methylated/total per 4-mer. The only mode that supplies this is
+					// bisulfite-converted BAM input (default BAM, -wgsMode=false). Under
+					// -wgsMode every covered CpG is labeled 'm' (the read base is the
+					// unconverted reference C/G), so -saveMotifLookup would silently
+					// produce a degenerate lookup with score=1.0 for every 4-mer.
+					// Error out early instead of producing a useless file. The tabix
+					// equivalent of this check happens after useTabixFragmentInput is
+					// resolved below (line ~268).
+					if (saveMotifLookup != null && wgsMode) {
+						throw new CmdLineException(parser,
+								"-saveMotifLookup requires bisulfite-converted BAM input " +
+								"(-wgsMode=false). Under -wgsMode every covered CpG is " +
+								"labeled methylated, so the lookup table would be " +
+								"degenerate (score=1.0 for every 4-mer). Train the motif " +
+								"lookup on a paired bisulfite/WGBS BAM, then re-use it " +
+								"in -wgsMode/tabix runs via -loadMotifLookup.",
+								new Throwable());
+					}
 
 					// Initialize motif data structures
 					if (saveMotifLookup != null) {
@@ -242,6 +261,21 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					log.info("Input fragment source mode: " + (useTabixFragmentInput ? "tabix BED/TSV" : "BAM/CRAM"));
 					if(useTabixFragmentInput){
 						validateTabixIndexExists(wgsBamFile);
+					}
+					// Companion check to the -saveMotifLookup + -wgsMode validation
+					// above: tabix fragment input also lacks per-CpG bisulfite
+					// information, so methy_stat is constant ('m' under
+					// -defaultMethyStat) and the resulting lookup would be
+					// degenerate.
+					if (saveMotifLookup != null && useTabixFragmentInput) {
+						throw new CmdLineException(parser,
+								"-saveMotifLookup is not supported with tabix fragment " +
+								"input. Tabix fragment files lack per-CpG bisulfite " +
+								"information, so methy_stat is constant and the resulting " +
+								"motif lookup would be degenerate (score=1.0 for every " +
+								"4-mer). Train the motif lookup on a paired WGBS BAM, " +
+								"then re-use it on tabix/WGS runs via -loadMotifLookup.",
+								new Throwable());
 					}
 
 					initiate();			

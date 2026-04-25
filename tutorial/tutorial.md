@@ -196,6 +196,44 @@ java -Xmx20G -cp "$JAR" \
 | `-fragBaseQ` | Synthetic base quality for fragment mode (default 60). |
 | `-defaultMethyStat` | Value written to the `methy_stat` output column when `-fragMethyColumn` is unset and no inline `m`/`u` token is detected. Default: `m`. The HMM does NOT use `methy_stat` as a label or input — it is unsupervised over the feature vector — so this only affects the AUC/QC reporting columns. The default `m` matches BAM behavior under `-wgsMode`. |
 
+#### How the total fragment count is computed in tabix mode
+
+The `Norm_Frag_cov` column normalizes per-CpG read coverage by the total fragment count (per million). In tabix mode this is determined as follows, in priority order:
+
+1. `-totalReadsInBam <N>`: skip the count entirely and use `N`.
+2. Full single-pass scan of the input file: `estimateTotalFragmentsFromTabixInput()` reads every line, skips comments / blanks / rows with <3 columns, and increments a counter. Single-threaded, O(N) lines.
+
+For very large inputs (e.g. 300M-row fragment files) the full scan can take several minutes. If you already know the count (e.g. from `wc -l`), pass it via `-totalReadsInBam` to skip the scan.
+
+This is intentionally simpler than the BAM-mode estimator (which uses BAM-index counts plus sampling). Tabix indexes do not store a global record count, and bgzip GZI offsets only give virtual byte positions, not line counts — so a full scan is the most reliable mechanism currently supported.
+
+#### `-useEndMotif` and `-saveMotifLookup` in tabix mode
+
+`-useEndMotif` is **fully supported** in tabix mode. The 5' end 4-mer is extracted from the reference at `(fragment.start, fragment.end)` (with strand awareness), cached per `readName` so the same fragment at multiple CpGs reuses the same motif, and either the motif string (training mode) or the lookup score (`-loadMotifLookup`) is written as the trailing output column.
+
+`-saveMotifLookup` is **NOT supported** in tabix mode. The lookup table is built as `methylated_count / total_count` per 4-mer, which requires per-CpG bisulfite ground truth. Tabix fragment input has no such info — `methy_stat` is constant `'m'` from `-defaultMethyStat` — so the resulting lookup would be degenerate (score 1.0 for every 4-mer). The script therefore **errors out at startup** with a clear message:
+
+```
+-saveMotifLookup is not supported with tabix fragment input. Tabix fragment
+files lack per-CpG bisulfite information, so methy_stat is constant and the
+resulting motif lookup would be degenerate (score=1.0 for every 4-mer). Train
+the motif lookup on a paired WGBS BAM, then re-use it on tabix/WGS runs via
+-loadMotifLookup.
+```
+
+The same restriction applies to BAM input under `-wgsMode` (every covered CpG is labeled `'m'` because the read base is the unconverted reference). Standard recipe:
+
+1. Train the motif lookup once on a paired WGBS/bisulfite-converted BAM:
+   ```bash
+   java ... CpgFeatureMatrixBuilder ... wgbs.bam wgbs.cpg_features.bed.gz \
+     -useEndMotif -saveMotifLookup motif_lookup.tsv
+   ```
+2. Re-use it on tabix or WGS-mode runs:
+   ```bash
+   java ... CpgFeatureMatrixBuilder ... fragments.bed.gz cpg_features.bed.gz \
+     -fragmentInputTabix -useEndMotif -loadMotifLookup motif_lookup.tsv
+   ```
+
 ## 4.4 Step 1 output format (`*.cpg_features*.bed.gz`)
 
 Header starts with:
