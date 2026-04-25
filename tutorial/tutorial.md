@@ -198,14 +198,34 @@ java -Xmx20G -cp "$JAR" \
 
 #### How the total fragment count is computed in tabix mode
 
-The `Norm_Frag_cov` column normalizes per-CpG read coverage by the total fragment count (per million). In tabix mode this is determined as follows, in priority order:
+The `Norm_Frag_cov` column normalizes per-CpG coverage by the total record count. In tabix mode the count is determined as follows, in priority order:
 
-1. `-totalReadsInBam <N>`: skip the count entirely and use `N`.
-2. Full single-pass scan of the input file: `estimateTotalFragmentsFromTabixInput()` reads every line, skips comments / blanks / rows with <3 columns, and increments a counter. Single-threaded, O(N) lines.
+1. `-totalReadsInBam <N>`: skip estimation entirely and use `N`.
+2. **BGZF sampling** (default): open the bgzipped file with `BlockCompressedInputStream`, read the first 50,000 data rows, extract the compressed-byte offset from the BGZF virtual file pointer, compute compressed bytes per line, then extrapolate to the full compressed file size. Typical cost: tens of milliseconds even on multi-GB files.
+3. **Full scan** (fallback): the legacy line-by-line counter. Used only when BGZF sampling fails (plain-gzip header, very small file, or the sample fits inside the first BGZF block).
 
-For very large inputs (e.g. 300M-row fragment files) the full scan can take several minutes. If you already know the count (e.g. from `wc -l`), pass it via `-totalReadsInBam` to skip the scan.
+Sampling accuracy on a synthetic 5M-row file: estimate 5,148,318 vs exact 5,000,000 (3% over) in 42 ms vs 1311 ms full-scan (31× speedup). For exact counts pass `-totalReadsInBam` directly.
 
-This is intentionally simpler than the BAM-mode estimator (which uses BAM-index counts plus sampling). Tabix indexes do not store a global record count, and bgzip GZI offsets only give virtual byte positions, not line counts — so a full scan is the most reliable mechanism currently supported.
+#### Important: BAM vs tabix `Norm_Frag_cov` are NOT on the same scale
+
+The BAM-mode and tabix-mode coverage normalizations operate in different units:
+
+| Mode | Numerator at each CpG | Denominator |
+|---|---|---|
+| BAM | reads overlapping the CpG (1 SAMRecord = 1 read; both ends of a PE fragment count separately) | filtered raw reads in the BAM (≈ 2 × #fragments for PE) |
+| tabix | fragments overlapping the CpG (1 row = 1 fragment) | total fragments in the tabix file |
+
+For typical cfDNA (fragment ~166 bp, read ~150 bp) most CpGs are covered by only ONE read of a PE fragment. The math then becomes:
+
+- BAM ratio ≈ fragments_at_CpG / (2 × total_fragments)  ≈ **0.5 × tabix ratio**
+- tabix ratio  = fragments_at_CpG / total_fragments
+
+This means the same biological sample fed to BAM mode produces `Norm_Frag_cov` values roughly **half** of what tabix mode produces. Because the HMM uses `Norm_Frag_cov` as a feature, **a model trained on BAM input cannot be applied to tabix input (or vice versa) without retraining or rescaling**, even on the same sample.
+
+Consistent practices:
+- Train and decode in the **same input mode** (BAM-BAM or tabix-tabix). Within either mode the scaling is internally consistent.
+- If you must mix modes (e.g., trained on a BAM cohort, decoding on a fragment-only cohort), pre-rescale by approximately ×2 when converting BAM → tabix, or train a separate model for the new modality. The exact factor depends on per-CpG fragment overlap and is not a strict 2.0 — it's the average across your CpGs.
+- Use `-noCoverage` if `Norm_Frag_cov` is being reported as a feature you don't trust to compare across modes (the column becomes NaN and the HMM will skip it).
 
 #### `-useEndMotif` and `-saveMotifLookup` in tabix mode
 

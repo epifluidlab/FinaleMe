@@ -969,6 +969,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												continue;
 											}
 
+										// SCALE NOTE: this is "raw reads at CpG / total filtered reads",
+										// where for PE BAM input each fragment may contribute 1 or 2
+										// SAMRecords depending on whether both read ends overlap the CpG.
+										// `finalReadsNumTotal` is the raw filtered read count (~ 2 *
+										// #fragments for PE). Tabix fragment mode produces
+										// "fragments_at_CpG / total_fragments" (see line ~1325), which
+										// for typical cfDNA is roughly 2x larger than the BAM ratio
+										// for the same sample. See tutorial.md §4.3 for details and
+										// guidance on cross-mode training/decoding.
 										double normalizedFragCov = (double)readNumber/finalReadsNumTotal;
 
 										byte[] refBasesExt = CcInferenceUtils.toUpperCase(binRefParser.loadFragment(end-1-kmerExt, kmerExt*2+1).getBytes());
