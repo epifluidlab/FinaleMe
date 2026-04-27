@@ -137,7 +137,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	@Option(name="-fragStrandColumn",usage="1-based column index for fragment strand in tabix BED/TSV input. 0 means auto-detect from col4/col6. default: 0")
 	public int fragStrandColumn = 0;
 
-	@Option(name="-fragNameColumn",usage="1-based column index for fragment name in tabix BED/TSV input. 0 means auto-detect/synthetic. default: 0")
+	@Option(name="-fragNameColumn",usage="1-based column index for fragment name in tabix BED/TSV input. 0 = synthesize a per-row coordinate-based name (chr_start_end_strand_line; guaranteed unique per fragment). Set this to a positive index ONLY when the input has genuine unique read names (e.g., a BAM-derived fragment file with original SAM read names) -- the column value must NOT be a BED placeholder ('.', '*', empty) or every fragment collapses to one 'read' and breaks HMM training with a singular covariance matrix. default: 0")
 	public int fragNameColumn = 0;
 
 	@Option(name="-fragMethyColumn",usage="1-based column index for methylation state (m/u) in tabix BED/TSV input. 0 means infer from valueWig/default. default: 0")
@@ -279,6 +279,30 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 								"motif lookup would be degenerate (score=1.0 for every " +
 								"4-mer). Train the motif lookup on a paired WGBS BAM, " +
 								"then re-use it on tabix/WGS runs via -loadMotifLookup.",
+								new Throwable());
+					}
+
+					// In tabix fragment mode we cannot train a motif lookup
+					// (the check above), so -useEndMotif requires a pre-trained
+					// lookup. Without -loadMotifLookup, getMotifScore() returns
+					// 0.5 for every fragment -> the motif_score column is a
+					// constant -> downstream FinaleMe HMM training hits a
+					// singular covariance matrix (sd=0 feature). Catch this
+					// at startup with a clear message rather than producing
+					// a feature matrix that silently breaks training.
+					if (useEndMotif && useTabixFragmentInput && loadMotifLookup == null) {
+						throw new CmdLineException(parser,
+								"-useEndMotif on tabix fragment input requires " +
+								"-loadMotifLookup <pretrained.tsv>. Without it the " +
+								"motif_score column is constant (0.5 for every " +
+								"fragment) because the motif lookup cannot be " +
+								"trained in tabix mode (methy_stat is degenerate). " +
+								"That makes the motif_score feature degenerate and " +
+								"causes 'matrix is singular' errors in FinaleMe HMM " +
+								"training. Either drop -useEndMotif, or train the " +
+								"lookup on a paired bisulfite/WGBS BAM (default BAM " +
+								"mode + -saveMotifLookup) and pass the resulting " +
+								"TSV here via -loadMotifLookup.",
 								new Throwable());
 					}
 
@@ -2030,21 +2054,35 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 				}
 			}
 
+			// Resolve readName. The HMM uses readName to GROUP CpG observations
+			// belonging to the same fragment (the sequential observations along
+			// one fragment); collapsing all rows to a single readName collapses
+			// the training set to one giant pseudo-fragment of millions of
+			// observations and produces a singular GMM covariance matrix.
+			//
+			// In tabix mode each row IS one fragment, so we synthesize a
+			// coordinate+strand+line-number readName by default - guaranteed
+			// unique per row. The user can override via -fragNameColumn when
+			// the input has genuine unique read names (e.g., a BAM-derived
+			// fragment file with original SAM read names). Even then we reject
+			// BED placeholder values (".", "*", empty) that otherwise collapse
+			// every row to one "read".
+			//
+			// We deliberately do NOT auto-detect a name from col4/col5 (older
+			// behavior): that consumed BED placeholder values and produced
+			// "1 unique read" pathologies that broke training silently.
 			String readName = null;
 			if(fragNameColumn > 0){
 				int idx = fragNameColumn - 1;
 				if(idx < splitLines.length){
-					readName = splitLines[idx];
-				}
-			}else{
-				if(splitLines.length >= 4 && !isStrandToken(splitLines[3])){
-					readName = splitLines[3];
-				}else if(splitLines.length >= 5 && !isStrandToken(splitLines[4])){
-					readName = splitLines[4];
+					String candidate = splitLines[idx].trim();
+					if(!candidate.isEmpty() && !candidate.equals(".") && !candidate.equals("*")){
+						readName = candidate;
+					}
 				}
 			}
 			if(readName == null || readName.isEmpty()){
-				readName = "frag_" + lineNumber + "_" + chr + "_" + start + "_" + end;
+				readName = "frag_" + lineNumber + "_" + chr + "_" + start + "_" + end + "_" + strand;
 			}
 
 			char methyStat = '.';
