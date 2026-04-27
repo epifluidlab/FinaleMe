@@ -76,8 +76,11 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	@Option(name="-maxDistToFragEnd",usage="maximum distant to the end of the fragment allowed to check. in order to be copnsistent with training model. Default: 250")
 	public int maxDistToFragEnd = 250;
 
-	@Option(name="-totalReadsInBam",usage="total number of reads used to normalize coverage column. default estimate from bam file by program. Default: -1")
+	@Option(name="-totalReadsInBam",usage="total number of reads (or fragments, depending on -coverageReadLevel) used to normalize coverage column. default estimate from bam file by program. Default: -1")
 	public long totalReadsInBam = -1;
+
+	@Option(name="-coverageReadLevel",usage="legacy mode: count Norm_Frag_cov as raw_reads_at_CpG / total_filtered_reads (each PE read counted separately on both numerator and denominator). The new default (false) uses fragments for both: numerator = unique fragments at CpG (deduplicated by readName), denominator = total filtered fragments. Fragment-level matches tabix fragment mode and gives a Norm_Frag_cov scale that's independent of paired-end vs single-end input. Set to true ONLY when re-using a model trained before v0.64 (which was trained at the read-level scale). Default: false")
+	public boolean coverageReadLevel = false;
 	
 	@Option(name="-maxCov",usage="maximum coverage allowed to check. Default: 250")
 	public int maxCov = 250;
@@ -601,6 +604,13 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						} else if(rawIndexTotal >= FULL_SCAN_THRESHOLD){
 							long sampled = 0;
 							long passed = 0;
+							// Track unique read names among PASSING reads so we can
+							// compute a fragments-per-passing-read ratio. For typical
+							// PE data this is ~0.5 (each fragment has two reads sharing
+							// the same readName); for SE data it's 1.0; mixed PE+SE
+							// gives somewhere in between. The HashSet caps at ~ TARGET_PER_CHROM
+							// × ~22 chromosomes ≈ 1M entries, ~80 MB at typical readName lengths.
+							java.util.HashSet<String> sampleFragmentNames = new java.util.HashSet<>();
 							SamReader sampleReader = SamReaderFactory.makeDefault()
 								.validationStringency(ValidationStringency.SILENT)
 								.open(new File(wgsBamFile));
@@ -629,6 +639,7 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											continue;
 										}
 										passed++;
+										sampleFragmentNames.add(r.getReadName());
 									}
 									regionIt.close();
 								} catch(Exception regionEx){
@@ -640,12 +651,33 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 							if(sampled > 0 && passed > 0){
 								double passRate = (double) passed / sampled;
-								readsNumTotal = (long)(rawIndexTotal * passRate);
-								usedIndex = true;
-								log.info("Sampled " + sampled + " reads across " + chromsWithReads +
-										 " chromosomes: " + passed + " passed filters (" +
-										 String.format("%.1f%%", passRate * 100) + "); estimated " +
-										 (long)readsNumTotal + " filtered reads");
+								long filteredReadsTotal = (long)(rawIndexTotal * passRate);
+								if(coverageReadLevel){
+									// Legacy: denominator = filtered raw reads.
+									readsNumTotal = filteredReadsTotal;
+									usedIndex = true;
+									log.info("Sampled " + sampled + " reads across " + chromsWithReads +
+											 " chromosomes: " + passed + " passed filters (" +
+											 String.format("%.1f%%", passRate * 100) + "); estimated " +
+											 filteredReadsTotal + " filtered reads " +
+											 "(read-level coverage scale; legacy)");
+								} else {
+									// New default: denominator = filtered fragments.
+									// fragmentRatio = unique fragment names / passing reads.
+									// For PE: ~0.5; for SE: 1.0; mixed: in-between.
+									double fragmentRatio = (double) sampleFragmentNames.size() / (double) passed;
+									long filteredFragmentsTotal = (long)(filteredReadsTotal * fragmentRatio);
+									readsNumTotal = filteredFragmentsTotal;
+									usedIndex = true;
+									log.info("Sampled " + sampled + " reads across " + chromsWithReads +
+											 " chromosomes: " + passed + " passed filters (" +
+											 String.format("%.1f%%", passRate * 100) + "); " +
+											 sampleFragmentNames.size() + " unique fragments " +
+											 String.format("(fragment ratio %.3f)", fragmentRatio) +
+											 "; estimated " + filteredReadsTotal + " filtered reads -> " +
+											 filteredFragmentsTotal + " filtered fragments " +
+											 "(fragment-level coverage scale)");
+								}
 							} else if(sampled > 0){
 								log.warn("All " + sampled + " sampled reads were filtered; using raw index total");
 								readsNumTotal = rawIndexTotal;
@@ -657,6 +689,9 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 						if(!usedIndex){
 							log.info("No BAM index available. Full scan for read count ...");
 							SAMRecordIterator wgsIt = wgsReader.iterator();
+							java.util.HashSet<String> fragmentNames =
+									coverageReadLevel ? null : new java.util.HashSet<>();
+							long readsPassed = 0;
 							while(wgsIt.hasNext()){
 								SAMRecord r = wgsIt.next();
 								if(failFlagFilter(r)){
@@ -666,13 +701,30 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 										continue;
 									}
 								}
-								readsNumTotal++;
+								readsPassed++;
+								if(fragmentNames != null){
+									fragmentNames.add(r.getReadName());
+								}
 							}
 							wgsIt.close();
+							if(coverageReadLevel){
+								readsNumTotal = readsPassed;
+								log.info("Full scan: " + readsPassed + " filtered reads " +
+										"(read-level coverage scale; legacy)");
+							} else {
+								readsNumTotal = (fragmentNames == null ? readsPassed : fragmentNames.size());
+								log.info("Full scan: " + readsPassed + " filtered reads -> " +
+										readsNumTotal + " unique fragments " +
+										"(fragment-level coverage scale)");
+							}
 						}
 					}
 
-					log.info((long)readsNumTotal + " reads in total ...");
+					if(coverageReadLevel){
+						log.info((long)readsNumTotal + " reads in total (read-level coverage scale) ...");
+					} else {
+						log.info((long)readsNumTotal + " fragments in total (fragment-level coverage scale) ...");
+					}
 					readsNumTotal = readsNumTotal/1000000;
 					log.info("Output value for each CpG in each DNA fragment ... ");
 
@@ -969,16 +1021,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												continue;
 											}
 
-										// SCALE NOTE: this is "raw reads at CpG / total filtered reads",
-										// where for PE BAM input each fragment may contribute 1 or 2
-										// SAMRecords depending on whether both read ends overlap the CpG.
-										// `finalReadsNumTotal` is the raw filtered read count (~ 2 *
-										// #fragments for PE). Tabix fragment mode produces
-										// "fragments_at_CpG / total_fragments" (see line ~1325), which
-										// for typical cfDNA is roughly 2x larger than the BAM ratio
-										// for the same sample. See tutorial.md §4.3 for details and
-										// guidance on cross-mode training/decoding.
-										double normalizedFragCov = (double)readNumber/finalReadsNumTotal;
+										// SCALE: by default v0.64+, BAM coverage is fragment-level
+										// to match tabix mode: numerator = countedReads.size()
+										// (deduplicated by readName) and denominator = total
+										// filtered fragments. Use -coverageReadLevel for legacy
+										// pre-v0.64 behavior (raw reads on both numerator and
+										// denominator). See tutorial.md §4.3.
+										double normalizedFragCov = coverageReadLevel
+												? (double) readNumber / finalReadsNumTotal
+												: (double) countedReads.size() / finalReadsNumTotal;
 
 										byte[] refBasesExt = CcInferenceUtils.toUpperCase(binRefParser.loadFragment(end-1-kmerExt, kmerExt*2+1).getBytes());
 										byte refBase = refBasesExt[kmerExt];
@@ -1775,23 +1826,52 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 		}
 
 		/**
-		 * Sample size for BGZF-based extrapolation. 50K lines is large enough
-		 * to span at least a few BGZF blocks (typically ~64KB compressed each)
-		 * so the compressed_bytes_per_line ratio averages out, and small
-		 * enough to read in well under a second.
+		 * Cap on the number of records read during the BGZF sample. Large
+		 * enough to span many chromosomes naturally (a sorted tabix file
+		 * crosses chromosome boundaries every few hundred to few thousand
+		 * records on whole-genome data), small enough to stay under ~1 second.
 		 */
-		private static final int TABIX_COUNT_SAMPLE_LINES = 50_000;
+		private static final int TABIX_COUNT_SAMPLE_LINES = 200_000;
 
 		/**
-		 * Minimum number of bytes the sample must consume in the bgzip
-		 * compressed stream before we trust the extrapolation. If the
-		 * sample finishes inside the first BGZF block (no block boundary
-		 * crossed), the offset is rounded to 0 and the estimate would be
-		 * infinite; in that case we return null and let the caller fall
-		 * back to a full scan.
+		 * Minimum chromosomes the sample must span before we accept the
+		 * estimate. If we haven't crossed at least this many chromosome
+		 * boundaries, the bytes-per-record ratio may be biased toward whatever
+		 * chromosome happens to be at the start of the file. Below this we
+		 * keep reading until we either reach the line cap or run out of file.
+		 */
+		private static final int TABIX_COUNT_MIN_CHROMOSOMES = 5;
+
+		/**
+		 * Minimum compressed bytes consumed before we trust the
+		 * bytes-per-record ratio. If the sample fits inside the first BGZF
+		 * block (no block boundary crossed), the consumed-byte counter
+		 * rounds to 0 and the estimate would be infinite.
 		 */
 		private static final long TABIX_COUNT_MIN_COMPRESSED_BYTES = 1L << 16; // 64 KB
 
+		/**
+		 * BGZF stratified-by-chromosome sampler.
+		 *
+		 * Reads from the start of the bgzipped fragment file and tracks both
+		 * the BGZF virtual file pointer (for compressed-bytes-per-record) and
+		 * the set of distinct chromosomes seen so far. Stops when EITHER:
+		 *
+		 *   * we have read {@link #TABIX_COUNT_SAMPLE_LINES} records, OR
+		 *   * we have seen records from at least
+		 *     {@link #TABIX_COUNT_MIN_CHROMOSOMES} distinct chromosomes AND
+		 *     have crossed at least 64 KB of compressed bytes.
+		 *
+		 * Tabix files are sorted by chromosome, position, so iterating forward
+		 * naturally pulls samples from successive chromosomes — this is the
+		 * closest practical analog to BAM-style per-chromosome sampling
+		 * (BAM index supplies exact per-chromosome record counts for free,
+		 * but tabix indexes only store byte offsets and BGZF block-boundary
+		 * seeks are fragile to off-block compressed offsets).
+		 *
+		 * Falls back to a full scan when sampling fails or when the whole
+		 * file fits in fewer than the line cap.
+		 */
 		private Long estimateTotalFragmentsFromTabixSampling(String fragmentInputFile) {
 			File file = new File(fragmentInputFile);
 			long fileSize = file.length();
@@ -1804,46 +1884,70 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 				bgzf = new BlockCompressedInputStream(file);
 				br = new BufferedReader(new InputStreamReader(bgzf));
 				long sampledLines = 0;
+				long compressedBytesConsumed = 0;
+				java.util.LinkedHashSet<String> chromosomesSeen = new java.util.LinkedHashSet<>();
 				String line;
-				while (sampledLines < TABIX_COUNT_SAMPLE_LINES && (line = br.readLine()) != null) {
-					if (line.startsWith("#") || line.trim().isEmpty()) {
-						continue;
-					}
-					String[] splitLines = line.split("\t", 4);
-					if (splitLines.length < 3) {
-						continue;
-					}
+				boolean exhausted = false;
+				while ((line = br.readLine()) != null) {
+					if (line.startsWith("#") || line.trim().isEmpty()) continue;
+					int firstTab = line.indexOf('\t');
+					if (firstTab <= 0) continue;
+					int secondTab = line.indexOf('\t', firstTab + 1);
+					if (secondTab < 0) continue; // <3 columns
 					sampledLines++;
+					if (chromosomesSeen.size() < TABIX_COUNT_MIN_CHROMOSOMES + 1) {
+						chromosomesSeen.add(line.substring(0, firstTab));
+					}
+					compressedBytesConsumed = bgzf.getFilePointer() >> 16;
+
+					boolean haveEnoughChroms =
+							chromosomesSeen.size() >= TABIX_COUNT_MIN_CHROMOSOMES;
+					boolean haveEnoughBytes =
+							compressedBytesConsumed >= TABIX_COUNT_MIN_COMPRESSED_BYTES;
+					if (haveEnoughChroms && haveEnoughBytes &&
+							sampledLines >= TABIX_COUNT_SAMPLE_LINES / 4) {
+						// Stop early: we've already crossed multiple chromosomes
+						// and have enough compressed-byte advance for a stable
+						// bytes-per-record estimate. Reading further would only
+						// shrink the relative uncertainty marginally.
+						break;
+					}
+					if (sampledLines >= TABIX_COUNT_SAMPLE_LINES) {
+						break;
+					}
 				}
+				if (br.readLine() == null && sampledLines > 0 &&
+						sampledLines < TABIX_COUNT_SAMPLE_LINES) {
+					exhausted = true;
+				}
+
 				if (sampledLines == 0) {
 					return 0L;
 				}
-				long virtualPointer = bgzf.getFilePointer();
-				long compressedBytesConsumed = virtualPointer >> 16; // BGZF: high 48 bits
+				if (exhausted) {
+					// Whole file fits in the sample → exact count.
+					log.info(String.format(
+							"Tabix fragment count (whole file fits within sample): " +
+									"%,d fragments across %d chromosome(s)",
+							sampledLines, chromosomesSeen.size()));
+					return sampledLines;
+				}
 				if (compressedBytesConsumed < TABIX_COUNT_MIN_COMPRESSED_BYTES) {
-					// Sample fits inside the first BGZF block; the compressed
-					// offset is 0 and we cannot extrapolate. Either the file
-					// is tiny or the records are huge -- fall back to full scan.
+					// Sampling didn't cross enough compressed bytes for a
+					// reliable bytes-per-record ratio. Caller falls back.
 					return null;
 				}
-				if (sampledLines >= TABIX_COUNT_SAMPLE_LINES &&
-						compressedBytesConsumed < fileSize) {
-					// Normal case: enough sample to extrapolate.
-					double compressedBytesPerLine = (double) compressedBytesConsumed / (double) sampledLines;
-					double estimated = (double) fileSize / compressedBytesPerLine;
-					long estimatedLong = Math.max(sampledLines, Math.round(estimated));
-					log.info(String.format(
-							"Tabix fragment count (BGZF sampling): %,d sampled lines used %,d compressed bytes; "
-									+ "extrapolating to total compressed size %,d bytes -> ~%,d fragments",
-							sampledLines, compressedBytesConsumed, fileSize, estimatedLong));
-					return estimatedLong;
-				}
-				// We exhausted the file before reaching the sample target;
-				// sampledLines IS the exact total.
+				double bytesPerLine =
+						(double) compressedBytesConsumed / (double) sampledLines;
+				double estimated = (double) fileSize / bytesPerLine;
+				long estimatedLong = Math.max(sampledLines, Math.round(estimated));
 				log.info(String.format(
-						"Tabix fragment count (whole file fits within sample): %,d fragments",
-						sampledLines));
-				return sampledLines;
+						"Tabix fragment count (BGZF sampling, %d chromosomes spanned): " +
+								"%,d sampled lines used %,d compressed bytes -> %.2f " +
+								"bytes/line; total compressed size %,d bytes -> ~%,d fragments",
+						chromosomesSeen.size(), sampledLines, compressedBytesConsumed,
+						bytesPerLine, fileSize, estimatedLong));
+				return estimatedLong;
 			} catch (IOException e) {
 				log.warn("BGZF sampling failed for " + fragmentInputFile + ": " + e.getMessage());
 				return null;

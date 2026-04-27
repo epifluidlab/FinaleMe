@@ -206,26 +206,37 @@ The `Norm_Frag_cov` column normalizes per-CpG coverage by the total record count
 
 Sampling accuracy on a synthetic 5M-row file: estimate 5,148,318 vs exact 5,000,000 (3% over) in 42 ms vs 1311 ms full-scan (31× speedup). For exact counts pass `-totalReadsInBam` directly.
 
-#### Important: BAM vs tabix `Norm_Frag_cov` are NOT on the same scale
+#### `Norm_Frag_cov` is fragment-level by default in v0.63+
 
-The BAM-mode and tabix-mode coverage normalizations operate in different units:
+Both BAM and tabix modes now produce **fragment-level** coverage by default:
 
 | Mode | Numerator at each CpG | Denominator |
 |---|---|---|
-| BAM | reads overlapping the CpG (1 SAMRecord = 1 read; both ends of a PE fragment count separately) | filtered raw reads in the BAM (≈ 2 × #fragments for PE) |
+| BAM (default v0.63+) | unique fragments overlapping the CpG (deduplicated by readName) | total filtered fragments (estimated from sample's unique-readName ratio) |
 | tabix | fragments overlapping the CpG (1 row = 1 fragment) | total fragments in the tabix file |
 
-For typical cfDNA (fragment ~166 bp, read ~150 bp) most CpGs are covered by only ONE read of a PE fragment. The math then becomes:
+Both ratios produce the same `Norm_Frag_cov` scale on the same biological sample, so models trained on BAM transfer cleanly to tabix-fragment input and vice versa.
 
-- BAM ratio ≈ fragments_at_CpG / (2 × total_fragments)  ≈ **0.5 × tabix ratio**
-- tabix ratio  = fragments_at_CpG / total_fragments
+#### Legacy read-level scale (`-coverageReadLevel`)
 
-This means the same biological sample fed to BAM mode produces `Norm_Frag_cov` values roughly **half** of what tabix mode produces. Because the HMM uses `Norm_Frag_cov` as a feature, **a model trained on BAM input cannot be applied to tabix input (or vice versa) without retraining or rescaling**, even on the same sample.
+For models trained on BAM input **before v0.63**, the historical scale was read-level:
 
-Consistent practices:
-- Train and decode in the **same input mode** (BAM-BAM or tabix-tabix). Within either mode the scaling is internally consistent.
-- If you must mix modes (e.g., trained on a BAM cohort, decoding on a fragment-only cohort), pre-rescale by approximately ×2 when converting BAM → tabix, or train a separate model for the new modality. The exact factor depends on per-CpG fragment overlap and is not a strict 2.0 — it's the average across your CpGs.
-- Use `-noCoverage` if `Norm_Frag_cov` is being reported as a feature you don't trust to compare across modes (the column becomes NaN and the HMM will skip it).
+- Numerator = raw SAMRecords overlapping the CpG (PE: each end counted separately when both overlap)
+- Denominator = filtered raw reads (≈ 2 × fragments for PE)
+
+Pass `-coverageReadLevel` to recover this legacy behavior when re-using a pre-v0.63 BAM-trained model. With this flag:
+
+- Pre-v0.63 BAM-trained models keep working unchanged on BAM input.
+- The flag is **not honored in tabix fragment mode** (tabix files have no read-level information; the count is inherently fragment-level).
+
+Cross-mode practice:
+
+| Trained on | Decode input | Recommended flags |
+|---|---|---|
+| BAM, v0.63+ (default fragment-level) | BAM **or** tabix | none (default works) |
+| BAM, pre-v0.63 (read-level) | BAM | `-coverageReadLevel` |
+| BAM, pre-v0.63 (read-level) | tabix | retrain or rescale; the legacy read-level scale cannot be reproduced from tabix |
+| Tabix, any version | BAM **or** tabix | none (default works) |
 
 #### `-useEndMotif` and `-saveMotifLookup` in tabix mode
 
