@@ -486,13 +486,17 @@ public class CpgLociMultiMetricsStats {
 								}
 								
 								int bisulfitePos = 0;
-								if(!wgsMode){
-									if(r.getTransientAttribute("BS") != null){ //if the reads had been processed before
-										bisulfitePos = Integer.parseInt((String) r.getTransientAttribute("BS"));
+								if(!wgsMode){ //if the reads had been processed before
+									// SAMRecord.setTransientAttribute(String, Object) stores
+									// the autoboxed Integer; retrieving as String fails with
+									// ClassCastException when the cache hits. Store/retrieve
+									// consistently as Integer.
+									Object cachedBs = r.getTransientAttribute("BS");
+									if(cachedBs != null){
+										bisulfitePos = (Integer) cachedBs;
 									}else{
 										bisulfitePos = CcInferenceUtils.bisulfiteIncompleteReads(r);
 										r.setTransientAttribute("BS", bisulfitePos);
-										
 									}
 								}
 								

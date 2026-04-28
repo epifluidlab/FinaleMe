@@ -982,8 +982,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 												int bisulfitePos = 0;
 												if(!wgsMode){
-													if(r.getTransientAttribute("BS") != null){
-														bisulfitePos = Integer.parseInt((String) r.getTransientAttribute("BS"));
+													// SAMRecord.setTransientAttribute(String, Object) stores
+													// the autoboxed Integer; retrieving as String fails with
+													// ClassCastException when the cache hits (= the same
+													// SAMRecord covers more than one CpG in this bin, common
+													// at WGBS coverage). Store/retrieve consistently as
+													// Integer.
+													Object cachedBs = r.getTransientAttribute("BS");
+													if(cachedBs != null){
+														bisulfitePos = (Integer) cachedBs;
 													}else{
 														bisulfitePos = CcInferenceUtils.bisulfiteIncompleteReads(r);
 														r.setTransientAttribute("BS", bisulfitePos);
