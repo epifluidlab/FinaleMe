@@ -138,8 +138,17 @@ public class FinaleMe {
 	@Option(name="-randomPerm",usage="use the prior methylation to randomly assign m or um point, instead of trained HMM. default: false")
 	public boolean randomPerm = false;
 
-	@Option(name="-aucMode",usage="calcualte auc in each threshold. default: false")
+	@Option(name="-aucMode",usage="evaluate the trained HMM against the methy_stat truth column in -aucMode -- sweeps a range of thresholds, prints (FPR, TPR) per threshold to stdout (legacy behavior), and now also computes scalar AUROC + AUPRC and (optionally) writes the full per-threshold curve to TSV / a 2-panel ROC+PR PDF. Default: false")
 	public boolean aucMode = false;
+
+	@Option(name="-aucCurveTsv",usage="write the per-threshold ROC/PR curve data (threshold, TP, FN, FP, TN, FPR, TPR, Precision, Recall) to this TSV path. AUROC and AUPRC are written as commented header lines. Implies -aucMode. Default: null")
+	public String aucCurveTsv = null;
+
+	@Option(name="-aucCurvePdf",usage="write a 2-panel ROC + Precision-Recall plot to this PDF path. Implies -aucMode and requires -aucCurveTsv (the data source) plus python3 with matplotlib on PATH (the plot is rendered by scripts/plot_roc_curve.py). Default: null")
+	public String aucCurvePdf = null;
+
+	@Option(name="-aucNThresholds",usage="number of evenly-spaced thresholds in [-1, 1] to sweep in -aucMode for the AUC integration. 0 = use the legacy 19-point non-uniform list (denser at extremes; fastest, lowest curve resolution). Higher values give smoother curves and tighter trapezoidal AUC estimates at the cost of N Viterbi passes over the input. Default: 0")
+	public int aucNThresholds = 0;
 	
 	@Option(name="-decodeModeOnly",usage="only decode, no training. default: false")
 	public boolean decodeModeOnly = false;
@@ -2501,12 +2510,12 @@ public class FinaleMe {
 	
 	//decoding HMM 
 	private void aucMode(MatrixObj matrixObj, String hmmFile, String outputFile) throws Exception{
-		System.out.println("\nROC curve ...\n");	
+		System.out.println("\nROC curve ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
-		
+
 		for(Triple<HashMap<Integer, Pair<Integer, Double>>, ArrayList<ObservationVector>, ArrayList<String>> row : matrixObj.matrix){
 			matrix.add(new Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>(row.getLeft(), row.getMiddle()));
-		
+
 		}
 		ArrayList<ArrayList<Integer>> matrixObserved = matrixObj.matrixObserved;
 
@@ -2515,23 +2524,37 @@ public class FinaleMe {
 		hmm.setMethyState(this.methylatedState);
 		hmm.setMaxCpgNum(cpgNumClip < 0 ? maxCpgNum : cpgNumClip);
 		hmm.setMinCpgNum(1);
+
+		// Threshold sweep. -aucNThresholds 0 (default) keeps the legacy
+		// 19-point non-uniform list (denser at the extremes); >0 generates
+		// that many evenly-spaced points in [-1, 1] for smoother curves.
+		double[] ps;
+		if(aucNThresholds > 0){
+			ps = new double[aucNThresholds];
+			for(int i = 0; i < aucNThresholds; i++){
+				ps[i] = -1.0 + 2.0 * i / (aucNThresholds - 1);
+			}
+		}else{
+			ps = new double[]{-1, -0.999, -0.99, -0.95, -0.9, -0.8, -0.7, -0.5, -0.1, 0.0,
+					0.1, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0};
+		}
+
+		// Per-threshold confusion-matrix entries. We retain everything so
+		// AUROC / AUPRC can be computed by trapezoidal integration after
+		// the sweep, and the curve data can be written out as TSV / PDF.
+		int n = ps.length;
+		long[] tps = new long[n], fns = new long[n], fps = new long[n], tns = new long[n];
+
 		boolean outFlag = false;
-		double[] ps = new double[]{-1,-0.999, -0.99, -0.95, -0.9,-0.8,-0.7,-0.5,-0.1,0.0, 0.1,0.5,0.7,0.8,0.9,0.95,0.99,0.999,1.0};
-		for(double p : ps){
+		for(int t = 0; t < n; t++){
+			double p = ps[t];
 			long countMethy = 0;
 			long countMethyCorrect = 0;
 			long countUnmethy = 0;
 			long countUnmethyCorrect = 0;
 
-			
-			
-			
-			
-			
-			for(int j=0; j < matrix.size(); j++){
-
+			for(int j = 0; j < matrix.size(); j++){
 				int[] hiddenState = (new ViterbiBayesianNhmmV5Calculator(matrix.get(j), hmm, methylatedState, p)).stateSequence();
-
 				Integer[] observedState = matrixObserved.get(j).toArray(new Integer[matrixObserved.get(j).size()]);
 				if(hiddenState.length != observedState.length){
 					throw new IllegalArgumentException("HiddenState Length does not match with observed state length");
@@ -2541,50 +2564,184 @@ public class FinaleMe {
 					for(int i = 0; i < observedState.length; i++){
 						Double methyPrior = cpgDistState.get(i).getSecond();
 						double rand = randomEngine.nextDouble();
-						if(rand < methyPrior+p){
-							hiddenState[i]=1;
+						if(rand < methyPrior + p){
+							hiddenState[i] = 1;
 						}else{
-							hiddenState[i]=0;
+							hiddenState[i] = 0;
 						}
 					}
 				}
-				
-				
-				
 
 				for(int i = 0; i < hiddenState.length; i++){
-					
-					
 					if(hiddenState[i] % 2 == observedState[i]){
-						
 						if(observedState[i] == 1){
 							countMethyCorrect++;
-							
 						}else{
 							countUnmethyCorrect++;
-							
 						}
 					}
-					
 					if(observedState[i] == 1){
 						countMethy++;
 					}else{
 						countUnmethy++;
 					}
-				}		
-				
+				}
 			}
+
 			if(!outFlag){
 				System.out.println(countMethy + "\t" + countUnmethy);
-				outFlag=true;
+				outFlag = true;
 			}
-			double fpr = (double)(countUnmethy-countUnmethyCorrect)/(double)countUnmethy;
-			double tpr = (double)(countMethyCorrect)/(double)countMethy;
-			System.out.println(fpr + "\t" + tpr);
+			double fpr = (double)(countUnmethy - countUnmethyCorrect) / (double)countUnmethy;
+			double tpr = (double)(countMethyCorrect) / (double)countMethy;
+			System.out.println(fpr + "\t" + tpr); // legacy stdout, preserved
+
+			tps[t] = countMethyCorrect;
+			fns[t] = countMethy - countMethyCorrect;
+			fps[t] = countUnmethy - countUnmethyCorrect;
+			tns[t] = countUnmethyCorrect;
 		}
-		
 
+		// Compute AUROC and AUPRC by trapezoidal integration. The PR curve
+		// gets a (recall=0, precision=1) virtual endpoint to anchor the
+		// left side -- standard convention when the threshold sweep doesn't
+		// reach 0% recall by itself.
+		double[] fprArr = new double[n];
+		double[] tprArr = new double[n];
+		double[] precArr = new double[n];
+		double[] recArr = new double[n];
+		for(int t = 0; t < n; t++){
+			double tp = tps[t], fn = fns[t], fp = fps[t], tn = tns[t];
+			fprArr[t] = (fp + tn) > 0 ? fp / (fp + tn) : 0.0;
+			tprArr[t] = (tp + fn) > 0 ? tp / (tp + fn) : 0.0;
+			precArr[t] = (tp + fp) > 0 ? tp / (tp + fp) : 1.0; // undefined -> 1.0 (no positives called)
+			recArr[t] = tprArr[t]; // recall == TPR
+		}
+		double auroc = trapezoidAUC(fprArr, tprArr);
+		double[] recForPR = new double[n + 1];
+		double[] precForPR = new double[n + 1];
+		recForPR[0] = 0.0; precForPR[0] = 1.0; // anchor
+		System.arraycopy(recArr, 0, recForPR, 1, n);
+		System.arraycopy(precArr, 0, precForPR, 1, n);
+		double auprc = trapezoidAUC(recForPR, precForPR);
 
+		System.out.println();
+		System.out.println("AUROC: " + String.format("%.6f", auroc));
+		System.out.println("AUPRC: " + String.format("%.6f", auprc));
+		log.info(String.format("AUROC = %.6f  AUPRC = %.6f  (n_methylated=%d, n_unmethylated=%d, %d thresholds)",
+				auroc, auprc, tps[0] + fns[0], fps[0] + tns[0], n));
+
+		// TSV with per-threshold curve data. Forced-on if -aucCurvePdf is
+		// requested (since the Python plotter consumes the TSV).
+		String tsvPath = aucCurveTsv;
+		if(tsvPath == null && aucCurvePdf != null){
+			tsvPath = aucCurvePdf + ".curve.tsv";
+			log.info("-aucCurvePdf set without -aucCurveTsv; writing curve data to " + tsvPath);
+		}
+		if(tsvPath != null){
+			writeAucCurveTsv(tsvPath, ps, tps, fns, fps, tns, fprArr, tprArr, precArr, recArr,
+					auroc, auprc);
+			log.info("Wrote ROC/PR curve data: " + tsvPath);
+		}
+		if(aucCurvePdf != null){
+			renderAucCurvePdf(tsvPath, aucCurvePdf, auroc, auprc);
+		}
+	}
+
+	/**
+	 * Trapezoidal AUC. Sorts the input pairs by x ascending, then sums
+	 * (x_i+1 - x_i) * (y_i + y_i+1) / 2 over consecutive pairs. NaN /
+	 * Infinity inputs are skipped.
+	 */
+	private static double trapezoidAUC(double[] xs, double[] ys){
+		if(xs.length != ys.length || xs.length < 2) return 0.0;
+		int n = xs.length;
+		double[][] pairs = new double[n][2];
+		for(int i = 0; i < n; i++){
+			pairs[i][0] = xs[i];
+			pairs[i][1] = ys[i];
+		}
+		java.util.Arrays.sort(pairs, (a, b) -> Double.compare(a[0], b[0]));
+		double area = 0.0;
+		for(int i = 1; i < n; i++){
+			double x0 = pairs[i - 1][0], y0 = pairs[i - 1][1];
+			double x1 = pairs[i][0], y1 = pairs[i][1];
+			if(Double.isNaN(x0) || Double.isNaN(x1) || Double.isNaN(y0) || Double.isNaN(y1)) continue;
+			area += (x1 - x0) * (y0 + y1) / 2.0;
+		}
+		return area;
+	}
+
+	private static void writeAucCurveTsv(String path, double[] ps, long[] tps, long[] fns,
+			long[] fps, long[] tns, double[] fpr, double[] tpr, double[] prec, double[] rec,
+			double auroc, double auprc) throws IOException{
+		try(BufferedWriter bw = new BufferedWriter(new FileWriter(path))){
+			bw.write("# AUROC\t" + String.format("%.6f", auroc) + "\n");
+			bw.write("# AUPRC\t" + String.format("%.6f", auprc) + "\n");
+			bw.write("# n_methylated\t" + (tps[0] + fns[0]) + "\n");
+			bw.write("# n_unmethylated\t" + (fps[0] + tns[0]) + "\n");
+			bw.write("threshold\tTP\tFN\tFP\tTN\tFPR\tTPR\tPrecision\tRecall\n");
+			for(int t = 0; t < ps.length; t++){
+				bw.write(String.format("%.6f\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f%n",
+						ps[t], tps[t], fns[t], fps[t], tns[t],
+						fpr[t], tpr[t], prec[t], rec[t]));
+			}
+		}
+	}
+
+	/**
+	 * Render the ROC + PR curves to PDF by invoking scripts/plot_roc_curve.py.
+	 * Tries CWD-relative path first, then JAR-relative ../scripts. The Python
+	 * helper requires matplotlib; if it's missing or python3 isn't on PATH,
+	 * we log a clear error pointing at the TSV (which already has all the
+	 * data the user needs to plot externally).
+	 */
+	private static void renderAucCurvePdf(String tsvPath, String pdfPath, double auroc, double auprc) {
+		File script = null;
+		File cwdScript = new File("scripts/plot_roc_curve.py");
+		if(cwdScript.exists()){
+			script = cwdScript;
+		}else{
+			try {
+				File jarLoc = new File(FinaleMe.class.getProtectionDomain()
+						.getCodeSource().getLocation().toURI());
+				File rel = new File(jarLoc.getParentFile().getParentFile(),
+						"scripts/plot_roc_curve.py");
+				if(rel.exists()) script = rel;
+			} catch (Exception e) { /* ignore */ }
+		}
+		if(script == null){
+			log.warn("Could not locate scripts/plot_roc_curve.py to render " + pdfPath +
+					"; the curve data is in " + tsvPath +
+					" -- plot it manually with: python3 scripts/plot_roc_curve.py " +
+					tsvPath + " -o " + pdfPath);
+			return;
+		}
+		try {
+			ProcessBuilder pb = new ProcessBuilder("python3", script.getAbsolutePath(),
+					tsvPath, "-o", pdfPath);
+			pb.redirectErrorStream(true);
+			Process proc = pb.start();
+			java.io.BufferedReader reader = new java.io.BufferedReader(
+					new java.io.InputStreamReader(proc.getInputStream()));
+			StringBuilder out = new StringBuilder();
+			String line;
+			while((line = reader.readLine()) != null){
+				out.append(line).append("\n");
+			}
+			int rc = proc.waitFor();
+			if(rc != 0){
+				log.warn("plot_roc_curve.py exited " + rc + "; PDF not produced. " +
+						"Output:\n" + out + "\nThe curve data is in " + tsvPath +
+						" -- you can plot it manually.");
+			}else{
+				log.info("Wrote ROC/PR PDF: " + pdfPath);
+			}
+		} catch (Exception e) {
+			log.warn("Could not invoke python3 scripts/plot_roc_curve.py: " +
+					e.getMessage() + ". The curve data is in " + tsvPath +
+					" -- plot it manually if needed.");
+		}
 	}
 
 	
