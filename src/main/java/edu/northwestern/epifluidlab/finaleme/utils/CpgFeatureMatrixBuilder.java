@@ -76,6 +76,9 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	@Option(name="-maxDistToFragEnd",usage="maximum distant to the end of the fragment allowed to check. in order to be copnsistent with training model. Default: 250")
 	public int maxDistToFragEnd = 250;
 
+	@Option(name="-useSignedDistCenter",usage="write a STRAND-AWARE SIGNED distance from fragment center in the Dist_frag_end column instead of the legacy unsigned distance-to-nearest-end. Value = (cpgOffset_from_5'end) - fragLen/2.0, sign-corrected for strand: negative = CpG is in the 5' half of its fragment, positive = 3' half, magnitude = bp from center. The legacy unsigned form is symmetric and discards 5'/3' position information; the signed form preserves it and is strictly more informative for the HMM. Header column name becomes 'Signed_Dist_Center' so downstream tools can detect which form is in use. NOTE: a model trained on one form CANNOT be reused with the other (the feature distribution differs); set this consistently across train and decode runs. Default: false")
+	public boolean useSignedDistCenter = false;
+
 	@Option(name="-totalReadsInBam",usage="total number of reads (or fragments, depending on -coverageReadLevel) used to normalize coverage column. default estimate from bam file by program. Default: -1")
 	public long totalReadsInBam = -1;
 
@@ -804,7 +807,8 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					BlockCompressedOutputStream bgzipOut = new BlockCompressedOutputStream(output, (java.io.File) null);
 					OutputStreamWriter writer = new OutputStreamWriter(bgzipOut, "UTF-8");
 					// Header prefixed with '#' so tabix skips it automatically.
-					writer.write("#chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\tDist_frag_end");
+					String distColumnHeader = useSignedDistCenter ? "Signed_Dist_Center" : "Dist_frag_end";
+					writer.write("#chr\tstart\tend\treadName\tFragLen\tFrag_strand\tmethy_stat\tNorm_Frag_cov\tbaseQ\tOffset_frag\t" + distColumnHeader);
 					if (useEndMotif) {
 						writer.write("\tmotif_score");
 					}
@@ -1284,8 +1288,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 											}
 
 											double covValue = noCoverage ? Double.NaN : normalizedFragCov;
+											// Distance feature: legacy unsigned distance-to-nearest-end,
+											// or signed strand-aware distance-from-center when -useSignedDistCenter.
+											// The unsigned distToFragEnd computed above is still used for the
+											// -maxDistToFragEnd filter (so the filter semantics don't change).
+											String distColValue = useSignedDistCenter
+													? String.format("%.1f", signedDistFromCenter(cpgOffset, fragLen, negStrand))
+													: Integer.toString(distToFragEnd);
 											binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",covValue)
-													 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
+													 + "\t" + (int)baseQ + "\t" + cpgOffset + "\t" + distColValue);
 											if (useEndMotif) {
 												if (saveMotifLookup != null && loadMotifLookup == null) {
 													// Training mode: write 4-mer string as placeholder.
@@ -1608,8 +1619,15 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 												}
 
 												double tabixCovValue = noCoverage ? Double.NaN : normalizedFragCov;
+												// Distance feature: legacy unsigned distance-to-nearest-end,
+												// or signed strand-aware distance-from-center when -useSignedDistCenter.
+												// distToFragEnd above is still used for the -maxDistToFragEnd filter
+												// so the filter semantics are unchanged across the two modes.
+												String distColValue = useSignedDistCenter
+														? String.format("%.1f", signedDistFromCenter(cpgOffset, fragLen, negStrand))
+														: Integer.toString(distToFragEnd);
 												binWriter.write(binChr + "\t" + start + "\t" + end + "\t" + readName + "\t" + fragLen + "\t" + fragStrand + "\t" + methyStat + "\t" + String.format("%.6f",tabixCovValue)
-														 + "\t" + baseQ + "\t" + cpgOffset + "\t" + distToFragEnd);
+														 + "\t" + baseQ + "\t" + cpgOffset + "\t" + distColValue);
 												if (useEndMotif) {
 													if (saveMotifLookup != null && loadMotifLookup == null) {
 														// Training mode: write 4-mer string as placeholder
@@ -2272,6 +2290,22 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 		} catch (Exception e) {
 			return null;
 		}
+	}
+
+	/**
+	 * Signed CpG-to-fragment-center distance, strand-corrected so that
+	 * negative = CpG is in the 5' half of its fragment, positive = 3' half.
+	 *
+	 * Both BAM and tabix code paths compute cpgOffset as the offset from
+	 * the LEFTMOST coordinate of the fragment (i.e., from fragment.start).
+	 * On + strand fragments, the leftmost coordinate IS the 5' end, so
+	 * cpgOffset already measures from the 5'. On - strand fragments, the
+	 * leftmost coordinate is the 3' end, so we flip to (fragLen-1)-cpgOffset
+	 * to get the offset from the 5'. Then subtract fragLen/2 to center.
+	 */
+	private static double signedDistFromCenter(int cpgOffset, int fragLen, boolean negStrand) {
+		int offsetFrom5Prime = negStrand ? (fragLen - 1 - cpgOffset) : cpgOffset;
+		return offsetFrom5Prime - fragLen / 2.0;
 	}
 
 	/**
