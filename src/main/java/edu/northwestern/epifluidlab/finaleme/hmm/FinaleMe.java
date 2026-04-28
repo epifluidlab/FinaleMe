@@ -23,6 +23,7 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -306,6 +307,146 @@ public class FinaleMe {
 		try (LegacyPackageObjectInputStream objectinputstream =
 				new LegacyPackageObjectInputStream(new FileInputStream(hmmFile))) {
 			return (BayesianNhmmV5<ObservationVector>) objectinputstream.readObject();
+		}
+	}
+
+	// ----------------------------------------------------------------------
+	// Distance-column compatibility check.
+	//
+	// CpgFeatureMatrixBuilder writes one of two distance columns:
+	//   - "Dist_frag_end"     legacy unsigned distance-to-nearest-end
+	//   - "Signed_Dist_Center" -useSignedDistCenter, strand-aware signed
+	//                          distance from fragment center
+	// The HMM reads features by COLUMN INDEX, not by name, so a model
+	// trained on one form will silently mis-predict if decoded against a
+	// BED of the other form. We persist the training-time column name in a
+	// sidecar file next to the model (`<model>.meta.tsv`) and validate
+	// matching at every decode entry point.
+	// ----------------------------------------------------------------------
+
+	private static final String DIST_COL_LEGACY = "Dist_frag_end";
+	private static final String DIST_COL_SIGNED = "Signed_Dist_Center";
+
+	/**
+	 * Read the distance-column name from a CpG features BED's header line.
+	 * Returns the canonical column name found in the header, or
+	 * DIST_COL_LEGACY if no recognizable header is present (older BED files
+	 * predating the option, which were always unsigned).
+	 */
+	private static String readDistColumnNameFromHeader(String bedFile) throws IOException {
+		BufferedReader br;
+		GZIPInputStream gz = null;
+		if (bedFile.endsWith(".gz")) {
+			gz = new GZIPInputStream(new FileInputStream(bedFile), 1 << 16);
+			br = new BufferedReader(new InputStreamReader(gz), 1 << 16);
+		} else {
+			br = new BufferedReader(new FileReader(bedFile), 1 << 16);
+		}
+		try {
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.startsWith("#")) {
+					String stripped = line.substring(1);
+					String[] cols = stripped.split("\t");
+					for (String c : cols) {
+						String t = c.trim();
+						if (DIST_COL_SIGNED.equals(t) || DIST_COL_LEGACY.equals(t)) {
+							return t;
+						}
+					}
+					// Header line found but neither canonical name present.
+					// Fall back to legacy: this matches older BED files that
+					// used different conventions for the column header.
+					return DIST_COL_LEGACY;
+				}
+				if (!line.isEmpty()) {
+					// Hit data without finding a header; legacy BED.
+					return DIST_COL_LEGACY;
+				}
+			}
+		} finally {
+			br.close();
+			if (gz != null) gz.close();
+		}
+		return DIST_COL_LEGACY;
+	}
+
+	private static String modelMetaPath(String modelFile) {
+		return modelFile + ".meta.tsv";
+	}
+
+	/**
+	 * Write the model's training-time metadata sidecar. Called by trainHmm
+	 * (and any other path that produces a fresh model file).
+	 */
+	private static void writeModelMeta(String modelFile, String distColName) {
+		try (BufferedWriter bw = new BufferedWriter(new FileWriter(modelMetaPath(modelFile)))) {
+			bw.write("key\tvalue\n");
+			bw.write("dist_column\t" + distColName + "\n");
+		} catch (IOException e) {
+			// Sidecar write failure shouldn't kill training; log and continue.
+			log.warn("Could not write model metadata sidecar " +
+					modelMetaPath(modelFile) + ": " + e.getMessage());
+		}
+	}
+
+	/**
+	 * Read the distance-column name recorded in the model's sidecar.
+	 * Returns null if the sidecar is missing (older model trained before
+	 * this validation existed).
+	 */
+	private static String readModelDistColumn(String modelFile) {
+		File meta = new File(modelMetaPath(modelFile));
+		if (!meta.exists()) return null;
+		try (BufferedReader br = new BufferedReader(new FileReader(meta))) {
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.startsWith("key\t")) continue;
+				String[] kv = line.split("\t", 2);
+				if (kv.length == 2 && "dist_column".equals(kv[0].trim())) {
+					return kv[1].trim();
+				}
+			}
+		} catch (IOException e) {
+			log.warn("Could not read model metadata sidecar " +
+					modelMetaPath(modelFile) + ": " + e.getMessage());
+		}
+		return null;
+	}
+
+	/**
+	 * Confirm the input BED's distance-column form matches the model's
+	 * training-time form. Throws on mismatch with an actionable message.
+	 * If the model has no metadata sidecar (older model), warns and assumes
+	 * legacy form.
+	 */
+	private static void validateDistColumnAgainstModel(String inputFile, String modelFile)
+			throws IOException {
+		String inputCol = readDistColumnNameFromHeader(inputFile);
+		String modelCol = readModelDistColumn(modelFile);
+		if (modelCol == null) {
+			log.warn("No metadata sidecar found at " + modelMetaPath(modelFile) +
+					" -- assuming this model was trained with the legacy " +
+					DIST_COL_LEGACY + " distance form. The current input BED " +
+					"reports " + inputCol + ". If those don't match, decode " +
+					"results will be silently wrong; rebuild features with " +
+					"the matching -useSignedDistCenter setting or re-train " +
+					"the model on the matching feature form.");
+			return;
+		}
+		if (!modelCol.equals(inputCol)) {
+			throw new IllegalArgumentException(
+					"Distance-column mismatch: model " + modelFile +
+					" was trained with '" + modelCol + "' (per " +
+					modelMetaPath(modelFile) + "), but input BED " + inputFile +
+					" carries '" + inputCol + "'. The HMM reads features by " +
+					"column index, so this mismatch would silently produce " +
+					"wrong predictions. Rebuild the input BED with " +
+					(DIST_COL_SIGNED.equals(modelCol)
+							? "-useSignedDistCenter"
+							: "the legacy unsigned distance (drop -useSignedDistCenter)") +
+					" in CpgFeatureMatrixBuilder, OR re-train the model on " +
+					"a BED matching the input's '" + inputCol + "' form.");
 		}
 	}
 
@@ -658,10 +799,10 @@ public class FinaleMe {
 									miniDataPoints = 2;
 									MatrixObj matrixObj2 = processMatrixFile(inputFile);
 									matrixObj2.cpgDistFreq = null;
-									trainHmm(matrixObj2, modelFile);
+									trainHmm(matrixObj2, modelFile, inputFile);
 									matrixObj2 = null; // allow GC of second copy
 								}else{
-									trainHmm(matrixObj, modelFile);
+									trainHmm(matrixObj, modelFile, inputFile);
 								}
 								miniDataPoints = miniDataPointsPre;
 							}
@@ -1132,6 +1273,16 @@ public class FinaleMe {
 	
 	//initiate HMM && training HMM
 	private void trainHmm(MatrixObj matrixObj, String modelFile) throws IOException, CloneNotSupportedException{
+		trainHmm(matrixObj, modelFile, null);
+	}
+
+	/**
+	 * Train + save the HMM model AND record the input BED's distance-column
+	 * form in a sidecar metadata file. trainingInputFile is used solely to
+	 * read the BED header for that purpose; if null, the sidecar is skipped
+	 * (legacy callers).
+	 */
+	private void trainHmm(MatrixObj matrixObj, String modelFile, String trainingInputFile) throws IOException, CloneNotSupportedException{
 		System.out.println("HMM training new ....");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		
@@ -1193,11 +1344,25 @@ public class FinaleMe {
 		oos.writeObject(hmm);
 		oos.close();
 
+		// Record the training-time distance-column form so future decode
+		// runs can refuse mismatched BEDs. See validateDistColumnAgainstModel.
+		if (trainingInputFile != null) {
+			String distCol = readDistColumnNameFromHeader(trainingInputFile);
+			log.info("Recording training distance column '" + distCol +
+					"' to " + modelMetaPath(modelFile));
+			writeModelMeta(modelFile, distCol);
+		}
+
 	}
-	
+
 
 	//decoding HMM
 	private double decodeHmm(MatrixObj matrixObj, String hmmFile, String outputFile, String inputFile, boolean reestimate, CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception{
+		// Reject mismatched distance-column form. In the train+decode path
+		// trainHmm has just written the metadata sidecar matching this same
+		// input, so this passes by construction; the check matters when
+		// decodeHmm is invoked with a pre-existing model.
+		validateDistColumnAgainstModel(inputFile, hmmFile);
 		System.out.println("\nDecoding ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		List<ArrayList<String>> matrixLoc = new ArrayList<ArrayList<String>>();
@@ -1399,6 +1564,10 @@ public class FinaleMe {
 									CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder,
 									SummaryStatistics[] precomputedStats) throws Exception {
 		System.out.println("\nStreaming decode-only mode ...\n");
+
+		// Reject input BEDs whose distance-column form differs from the
+		// model's training-time form (silent mis-prediction otherwise).
+		validateDistColumnAgainstModel(inputFile, modelFile);
 
 		// Load region/exclude intervals
 		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
@@ -3009,6 +3178,10 @@ public class FinaleMe {
 										 CpgIndex cpgIndex, LinkedHashMap<String, Integer> chromOrder) throws Exception {
 		System.out.println("\nAdaptation + decode mode ...\n");
 
+		// Reject input BEDs whose distance-column form differs from the
+		// reference model's training-time form.
+		validateDistColumnAgainstModel(inputFile, modelFile);
+
 		// Load reference model
 		BayesianNhmmV5<ObservationVector> refHmm = loadHmmModel(modelFile);
 		refHmm.setBayesianFactor(bayesianFactor);
@@ -3318,12 +3491,26 @@ public class FinaleMe {
 		oos.close();
 		log.info("Adapted model written to temp file: " + adaptedModelTmp.getAbsolutePath());
 
+		// Propagate the reference model's distance-column metadata to the
+		// adapted temp model so the downstream decodeOnlyStreaming call
+		// (which validates) doesn't reject it. The adapted model uses the
+		// same feature schema as the reference.
+		String refDistCol = readModelDistColumn(modelFile);
+		String adaptedDistCol = (refDistCol != null)
+				? refDistCol
+				: readDistColumnNameFromHeader(inputFile);
+		writeModelMeta(adaptedModelTmp.getAbsolutePath(), adaptedDistCol);
+		File adaptedTmpMeta = new File(modelMetaPath(adaptedModelTmp.getAbsolutePath()));
+		adaptedTmpMeta.deleteOnExit();
+
 		// Optionally save adapted model to a user-specified path
 		if (saveAdaptedModel != null) {
 			java.nio.file.Files.copy(adaptedModelTmp.toPath(),
 				new File(saveAdaptedModel).toPath(),
 				java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-			log.info("Adapted model saved to: " + saveAdaptedModel);
+			writeModelMeta(saveAdaptedModel, adaptedDistCol);
+			log.info("Adapted model saved to: " + saveAdaptedModel +
+					" (with metadata sidecar)");
 		}
 
 		// Free adaptation data before decode to reduce memory
