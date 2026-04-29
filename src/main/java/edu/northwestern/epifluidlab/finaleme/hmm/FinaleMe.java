@@ -449,6 +449,8 @@ public class FinaleMe {
 
 	private int bedColMotifScore = -1;   // -1 = column not present in the BED
 	private int bedColMethyPrior = -1;   // -1 = absent; will fall back below
+	private int bedColDist = 10;         // legacy default: Dist_frag_end at col 10
+	private boolean bedDistIsSigned = false;  // true when column is Signed_Dist_Center
 	private boolean bedColumnsResolved = false;
 
 	/**
@@ -494,9 +496,27 @@ public class FinaleMe {
 					bedColMotifScore = motifIdx != null ? motifIdx : -1;
 					Integer methyIdx = idx.get("methyPrior");
 					bedColMethyPrior = methyIdx != null ? methyIdx : -1;
+					// Resolve the distance column position AND its semantics:
+					// Signed_Dist_Center  -> value is signed offset from center
+					//                        (cpgOffset_from_5'end - fragLen/2),
+					//                        use directly.
+					// Dist_frag_end       -> value is unsigned distance to nearest
+					//                        end (min(off, fragLen-1-off)),
+					//                        convert via fragLen/2 - val + 0.5.
+					Integer signedIdx = idx.get("Signed_Dist_Center");
+					Integer unsignedIdx = idx.get("Dist_frag_end");
+					if (signedIdx != null) {
+						bedColDist = signedIdx;
+						bedDistIsSigned = true;
+					} else if (unsignedIdx != null) {
+						bedColDist = unsignedIdx;
+						bedDistIsSigned = false;
+					} // else leave the legacy defaults (col 10, unsigned)
 					log.info("BED column layout resolved from header: " +
 							"motif_score=" + (bedColMotifScore >= 0 ? bedColMotifScore : "absent") +
-							", methyPrior=" + (bedColMethyPrior >= 0 ? bedColMethyPrior : "absent"));
+							", methyPrior=" + (bedColMethyPrior >= 0 ? bedColMethyPrior : "absent") +
+							", dist=col" + bedColDist +
+							(bedDistIsSigned ? " (Signed_Dist_Center)" : " (Dist_frag_end)"));
 					bedColumnsResolved = true;
 					return;
 				}
@@ -685,7 +705,21 @@ public class FinaleMe {
 
 		double fragLen = Double.parseDouble(splitLines[4]);
 		double coverage = Double.parseDouble(splitLines[7]);
-		double distToCenter = fragLen / 2 - Double.parseDouble(splitLines[10]) + 0.5;
+		// Distance column has two distinct value semantics, indicated by
+		// the BED's column header (resolved up-front in
+		// resolveBedColumnsFromHeader):
+		//   - Dist_frag_end (legacy): unsigned distance to nearest end,
+		//     value range [0, fragLen/2]. Convert with fragLen/2 - val + 0.5
+		//     (matches the original FinaleMe paper's formula -- gives
+		//     unsigned distance from center, range [0.5, fragLen/2+0.5]).
+		//   - Signed_Dist_Center: already a signed distance from center,
+		//     value range [-fragLen/2, +fragLen/2]. Use as-is.
+		// Hard-coding splitLines[10] + the legacy formula is now wrong for
+		// signed BEDs and would silently flip / scale every value.
+		double rawDist = Double.parseDouble(splitLines[bedColDist]);
+		double distToCenter = bedDistIsSigned
+				? rawDist
+				: (fragLen / 2 - rawDist + 0.5);
 
 		if (Double.compare(methyPrior, 100.0) == 0) {
 			methyPrior -= 0.01;
