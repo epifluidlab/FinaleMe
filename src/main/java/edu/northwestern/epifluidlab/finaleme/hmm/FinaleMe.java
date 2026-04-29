@@ -423,6 +423,117 @@ public class FinaleMe {
 		return null;
 	}
 
+	// ----------------------------------------------------------------------
+	// BED column-layout resolution.
+	//
+	// The CpG features BED has a fixed prefix (chr..Dist_frag_end at cols
+	// 0-10) plus a variable trailing block whose layout depends on which
+	// CpgFeatureMatrixBuilder flags were used: -useEndMotif adds a
+	// motif_score column, -includeCpgDist adds dist_nearest_CpG, and
+	// -valueWigs methyPrior:0:... adds a methyPrior column. parseLine used
+	// to hard-code methyPrior at col 11 (or 12 with -useEndMotif on FinaleMe
+	// itself), but this collapses three independent CpgFeatureMatrixBuilder
+	// flags into one FinaleMe flag. Concretely: a BED built with
+	// -useEndMotif -valueWigs methyPrior has motif_score at col 11 and
+	// methyPrior at col 12 -- if FinaleMe is then called WITHOUT
+	// -useEndMotif it reads motif_score as methyPrior, then divides it by
+	// 100 (as if it were a percent), giving a near-zero "prior" that pulls
+	// every prediction to U and tanks AUC to ~0.5.
+	//
+	// Fix: parse the BED's '#'-prefixed header row up front, find the
+	// motif_score and methyPrior columns by NAME, and use those indices
+	// throughout parseLine. Backward compat: if the BED has no header (or
+	// uses the legacy un-prefixed "chr\tstart\tend\t..." form), fall back
+	// to the legacy hardcoded indices.
+	// ----------------------------------------------------------------------
+
+	private int bedColMotifScore = -1;   // -1 = column not present in the BED
+	private int bedColMethyPrior = -1;   // -1 = absent; will fall back below
+	private boolean bedColumnsResolved = false;
+
+	/**
+	 * Open the BED, find the first header line (either '#'-prefixed or the
+	 * legacy bare "chr start end ..." row), and resolve the motif_score and
+	 * methyPrior column indices by name. If no header is present, leave the
+	 * indices at -1 -- parseLine then falls back to legacy hardcoded indices
+	 * driven by -useEndMotif.
+	 */
+	private void resolveBedColumnsFromHeader(String inputFile) throws IOException {
+		if (bedColumnsResolved) return;
+		BufferedReader br;
+		GZIPInputStream gz = null;
+		if (inputFile.endsWith(".gz")) {
+			gz = new GZIPInputStream(new FileInputStream(inputFile), GZIP_BUFFER_SIZE);
+			br = new BufferedReader(new InputStreamReader(gz), READER_BUFFER_SIZE);
+		} else {
+			br = new BufferedReader(new FileReader(inputFile), READER_BUFFER_SIZE);
+		}
+		try {
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.isEmpty()) continue;
+
+				String[] cols;
+				boolean isHeader = false;
+				if (line.startsWith("#")) {
+					cols = line.substring(1).split("\t");
+					isHeader = true;
+				} else {
+					cols = line.split("\t");
+					if (cols.length >= 2 && cols[1].equalsIgnoreCase("start")) {
+						isHeader = true;
+					}
+				}
+
+				if (isHeader) {
+					Map<String, Integer> idx = new HashMap<>();
+					for (int i = 0; i < cols.length; i++) {
+						idx.put(cols[i].trim(), i);
+					}
+					Integer motifIdx = idx.get("motif_score");
+					bedColMotifScore = motifIdx != null ? motifIdx : -1;
+					Integer methyIdx = idx.get("methyPrior");
+					bedColMethyPrior = methyIdx != null ? methyIdx : -1;
+					log.info("BED column layout resolved from header: " +
+							"motif_score=" + (bedColMotifScore >= 0 ? bedColMotifScore : "absent") +
+							", methyPrior=" + (bedColMethyPrior >= 0 ? bedColMethyPrior : "absent"));
+					bedColumnsResolved = true;
+					return;
+				}
+				// First non-empty line is data: legacy un-headered BED.
+				log.info("BED has no header row; parseLine will use legacy column " +
+						"indices (motif_score and methyPrior position controlled by " +
+						"-useEndMotif).");
+				bedColumnsResolved = true;
+				return;
+			}
+		} finally {
+			br.close();
+			if (gz != null) gz.close();
+		}
+		bedColumnsResolved = true;
+	}
+
+	/**
+	 * Validate that -useEndMotif on FinaleMe matches what the BED actually
+	 * carries: -useEndMotif requires a motif_score column. Without this
+	 * check, parseLine would either NaN-out the motif feature (silently bad
+	 * model) or throw an ArrayIndexOutOfBoundsException at a random row.
+	 */
+	private void validateBedHasMotifIfRequested(String inputFile) {
+		if (!useEndMotif) return;
+		if (!bedColumnsResolved || bedColMotifScore < 0) {
+			throw new IllegalArgumentException(
+					"-useEndMotif requires the input BED " + inputFile +
+					" to have a 'motif_score' column. The BED's header does not " +
+					"include one, which means CpgFeatureMatrixBuilder was run " +
+					"without -useEndMotif. Either drop -useEndMotif from this " +
+					"FinaleMe invocation, or rebuild the feature BED with " +
+					"-useEndMotif (and a -loadMotifLookup or -saveMotifLookup) in " +
+					"CpgFeatureMatrixBuilder.");
+		}
+	}
+
 	/**
 	 * Confirm the input BED's distance-column form matches the model's
 	 * training-time form. Throws on mismatch with an actionable message.
@@ -508,8 +619,28 @@ public class FinaleMe {
 								HashMap<String, IntervalTree<Integer>> excludeLoc) {
 		if (line.startsWith("#")) return null;
 		String[] splitLines = line.split("\t");
-		int minCols = features + 4 + (useEndMotif ? 1 : 0);
-		if (splitLines.length < minCols || splitLines[1].equalsIgnoreCase("start")
+		// Header lines start with '#' (current format) or have "start" in
+		// the second column (legacy un-prefixed form). Either way, skip.
+		if (line.startsWith("#") || splitLines[1].equalsIgnoreCase("start")) {
+			return null;
+		}
+		// Resolve which columns to read. The header was parsed up-front by
+		// resolveBedColumnsFromHeader and stored in instance state; if that
+		// returned absent (legacy un-headered BED), fall back to the legacy
+		// hardcoded indices keyed off -useEndMotif so existing pipelines
+		// keep working.
+		int motifScoreCol = bedColMotifScore;
+		int methyPriorCol = bedColMethyPrior;
+		if (methyPriorCol < 0) {
+			// Legacy fallback when the BED has no header at all.
+			methyPriorCol = useEndMotif ? 12 : 11;
+			if (motifScoreCol < 0 && useEndMotif) {
+				motifScoreCol = 11;
+			}
+		}
+		int minCols = Math.max(methyPriorCol + 1,
+				motifScoreCol >= 0 ? motifScoreCol + 1 : 0);
+		if (splitLines.length < minCols
 				|| Integer.parseInt(splitLines[4]) >= maxFragLen
 				|| Integer.parseInt(splitLines[4]) <= minFragLen
 				|| Double.parseDouble(splitLines[8]) <= 5) {
@@ -540,12 +671,13 @@ public class FinaleMe {
 		int offset = Integer.parseInt(splitLines[9]);
 		if (offset < 0) return null;
 
-		// When -useEndMotif is set, motif_score is at col [11] and methyPrior shifts to [12]
+		// motif_score: read only when both (a) the BED carries the column
+		// AND (b) the user requested -useEndMotif so the HMM consumes it.
+		// Reading without (a) is what produced the silent prior-shift bug
+		// that this whole header-resolution mechanism exists to prevent.
 		double motifScore = Double.NaN;
-		int methyPriorCol = 11;
-		if (useEndMotif) {
-			motifScore = Double.parseDouble(splitLines[11]);
-			methyPriorCol = 12;
+		if (useEndMotif && motifScoreCol >= 0) {
+			motifScore = Double.parseDouble(splitLines[motifScoreCol]);
 		}
 
 		double methyPrior = Double.parseDouble(splitLines[methyPriorCol]);
@@ -763,6 +895,15 @@ public class FinaleMe {
 					String outputFile = arguments.get(2);
 						log.info("Using " + resolveThreadCount() + " threads for FinaleMe parallel sections ...");
 					initiate();
+
+					// Resolve where motif_score / methyPrior live in the BED by
+					// reading the '#'-prefixed header. parseLine uses the resolved
+					// indices instead of guessing from the -useEndMotif flag, which
+					// silently mis-parses when the two flag-sets diverge between
+					// CpgFeatureMatrixBuilder (which determines what's in the BED)
+					// and FinaleMe (which determines what gets used).
+					resolveBedColumnsFromHeader(inputFile);
+					validateBedHasMotifIfRequested(inputFile);
 
 					if (adaptEmissionOnly && decodeModeOnly) {
 						// Adaptation + decode path
