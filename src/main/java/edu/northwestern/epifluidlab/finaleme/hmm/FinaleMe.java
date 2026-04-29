@@ -2545,61 +2545,106 @@ public class FinaleMe {
 		int n = ps.length;
 		long[] tps = new long[n], fns = new long[n], fps = new long[n], tns = new long[n];
 
+		// Parallelize the per-fragment Viterbi inner loop. The HMM object
+		// is read-only after loadHmmModel + setters, so each task can
+		// instantiate its own ViterbiBayesianNhmmV5Calculator over a
+		// disjoint chunk of fragments and reduce four long counters into
+		// a shared array. The threshold sweep stays sequential (each
+		// threshold writes one stdout line, and the legacy stdout order
+		// matters); the heavy work (Viterbi) is what gets parallelized.
+		final int nThreads = resolveThreadCount();
+		final int matrixSize = matrix.size();
+		final int chunkSize = Math.max(1, (matrixSize + nThreads - 1) / nThreads);
+		log.info("AUC sweep: " + n + " thresholds x " + matrixSize +
+				" fragments using " + nThreads + " threads");
+		ExecutorService aucExecutor = Executors.newFixedThreadPool(nThreads);
+		final List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrixFinal = matrix;
+		final ArrayList<ArrayList<Integer>> matrixObservedFinal = matrixObserved;
+
 		boolean outFlag = false;
-		for(int t = 0; t < n; t++){
-			double p = ps[t];
-			long countMethy = 0;
-			long countMethyCorrect = 0;
-			long countUnmethy = 0;
-			long countUnmethyCorrect = 0;
-
-			for(int j = 0; j < matrix.size(); j++){
-				int[] hiddenState = (new ViterbiBayesianNhmmV5Calculator(matrix.get(j), hmm, methylatedState, p)).stateSequence();
-				Integer[] observedState = matrixObserved.get(j).toArray(new Integer[matrixObserved.get(j).size()]);
-				if(hiddenState.length != observedState.length){
-					throw new IllegalArgumentException("HiddenState Length does not match with observed state length");
-				}
-				if(randomPerm){
-					HashMap<Integer, Pair<Integer, Double>> cpgDistState = matrix.get(j).getFirst();
-					for(int i = 0; i < observedState.length; i++){
-						Double methyPrior = cpgDistState.get(i).getSecond();
-						double rand = randomEngine.nextDouble();
-						if(rand < methyPrior + p){
-							hiddenState[i] = 1;
-						}else{
-							hiddenState[i] = 0;
+		try {
+			for(int t = 0; t < n; t++){
+				final double p = ps[t];
+				final int thresholdIdx = t;
+				List<Future<long[]>> futures = new ArrayList<>(nThreads);
+				for(int chunkStart = 0; chunkStart < matrixSize; chunkStart += chunkSize){
+					final int cs = chunkStart;
+					final int ce = Math.min(cs + chunkSize, matrixSize);
+					futures.add(aucExecutor.submit(() -> {
+						long lMethy = 0, lMethyCorrect = 0, lUnmethy = 0, lUnmethyCorrect = 0;
+						// Per-task RNG keeps -randomPerm reproducible regardless
+						// of thread count: seed = global-seed XOR threshold-index
+						// XOR chunk-start. MersenneTwister is not thread-safe,
+						// so we cannot share `randomEngine` across tasks.
+						MersenneTwister localRng = randomPerm
+								? new MersenneTwister(0x9E3779B97F4A7C15L
+										^ ((long) thresholdIdx << 32) ^ (long) cs)
+								: null;
+						for(int j = cs; j < ce; j++){
+							int[] hiddenState = (new ViterbiBayesianNhmmV5Calculator(
+									matrixFinal.get(j), hmm, methylatedState, p)).stateSequence();
+							Integer[] observedState = matrixObservedFinal.get(j)
+									.toArray(new Integer[matrixObservedFinal.get(j).size()]);
+							if(hiddenState.length != observedState.length){
+								throw new IllegalArgumentException(
+										"HiddenState Length does not match with observed state length");
+							}
+							if(randomPerm){
+								HashMap<Integer, Pair<Integer, Double>> cpgDistState =
+										matrixFinal.get(j).getFirst();
+								for(int i = 0; i < observedState.length; i++){
+									Double methyPrior = cpgDistState.get(i).getSecond();
+									double rand = localRng.nextDouble();
+									if(rand < methyPrior + p){
+										hiddenState[i] = 1;
+									}else{
+										hiddenState[i] = 0;
+									}
+								}
+							}
+							for(int i = 0; i < hiddenState.length; i++){
+								if(hiddenState[i] % 2 == observedState[i]){
+									if(observedState[i] == 1){
+										lMethyCorrect++;
+									}else{
+										lUnmethyCorrect++;
+									}
+								}
+								if(observedState[i] == 1){
+									lMethy++;
+								}else{
+									lUnmethy++;
+								}
+							}
 						}
-					}
+						return new long[]{lMethy, lMethyCorrect, lUnmethy, lUnmethyCorrect};
+					}));
+				}
+				long countMethy = 0, countMethyCorrect = 0, countUnmethy = 0, countUnmethyCorrect = 0;
+				for(Future<long[]> f : futures){
+					long[] c = f.get();
+					countMethy        += c[0];
+					countMethyCorrect += c[1];
+					countUnmethy      += c[2];
+					countUnmethyCorrect += c[3];
 				}
 
-				for(int i = 0; i < hiddenState.length; i++){
-					if(hiddenState[i] % 2 == observedState[i]){
-						if(observedState[i] == 1){
-							countMethyCorrect++;
-						}else{
-							countUnmethyCorrect++;
-						}
-					}
-					if(observedState[i] == 1){
-						countMethy++;
-					}else{
-						countUnmethy++;
-					}
+				if(!outFlag){
+					System.out.println(countMethy + "\t" + countUnmethy);
+					outFlag = true;
 				}
-			}
+				double fpr = (double)(countUnmethy - countUnmethyCorrect) / (double)countUnmethy;
+				double tpr = (double)(countMethyCorrect) / (double)countMethy;
+				System.out.println(fpr + "\t" + tpr); // legacy stdout, preserved
 
-			if(!outFlag){
-				System.out.println(countMethy + "\t" + countUnmethy);
-				outFlag = true;
+				tps[t] = countMethyCorrect;
+				fns[t] = countMethy - countMethyCorrect;
+				fps[t] = countUnmethy - countUnmethyCorrect;
+				tns[t] = countUnmethyCorrect;
 			}
-			double fpr = (double)(countUnmethy - countUnmethyCorrect) / (double)countUnmethy;
-			double tpr = (double)(countMethyCorrect) / (double)countMethy;
-			System.out.println(fpr + "\t" + tpr); // legacy stdout, preserved
-
-			tps[t] = countMethyCorrect;
-			fns[t] = countMethy - countMethyCorrect;
-			fps[t] = countUnmethy - countUnmethyCorrect;
-			tns[t] = countUnmethyCorrect;
+		} finally {
+			aucExecutor.shutdown();
+			aucExecutor.awaitTermination(10, TimeUnit.SECONDS);
 		}
 
 		// Compute AUROC and AUPRC by trapezoidal integration. The PR curve
