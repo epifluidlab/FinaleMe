@@ -47,7 +47,7 @@ curl -L "https://zenodo.org/records/6914806/files/BH01.chr22.bam.bai?download=1"
 Set a jar variable once:
 
 ```bash
-JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.64-jar-with-dependencies.jar"
 ```
 
 ### Step 1: Build CpG feature matrix

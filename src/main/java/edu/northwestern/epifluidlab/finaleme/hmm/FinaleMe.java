@@ -80,7 +80,7 @@ public class FinaleMe {
 	@Option(name="-states",usage="number of states in HMM model. ##current only allow even states number##. default: 2")
 	public int states = 2;
 
-	@Option(name="-features",usage="number of features for each observation, default: 3")
+	@Option(name="-features",usage="dimension of the HMM observation vector. Must match the active feature flags: 3 + (-useEndMotif?1:0) + (-useBaseQ?1:0) - (-lowCoverage?1:0). Mismatch is caught at GMM-init time with a clear error, but it's better to set this correctly up front. Default: 3")
 	public int features = 3;
 	
 	@Option(name="-tol",usage="tolerence level for the converge, default: 1e-5")
@@ -200,6 +200,9 @@ public class FinaleMe {
 	
 	@Option(name="-useEndMotif",usage="include 5' end motif score as a third feature in lowCoverage mode (3D: fragLen, distToCenter, motifScore). Default: false")
 	public boolean useEndMotif = false;
+
+	@Option(name="-useBaseQ",usage="add per-CpG base-quality score (Phred) as an additional feature dimension in the HMM observation vector. Driven by Volkov et al. 2026 (biorxiv 10.64898/2026.03.08.710357), which shows that per-base quality scores at fragment positions correlate with cancer-associated fragmentation features. Complements -useEndMotif (which aggregates baseQ-driven errors at the FRAGMENT 5' end into a per-motif score) by exposing the per-CpG-SITE quality variation along the fragment directly. Resulting feature dimension is 3 + (useEndMotif?1:0) + (useBaseQ?1:0) - (lowCoverage?1:0); set -features accordingly. Note: tabix-fragment input has constant baseQ (= -fragBaseQ); a Pass-1 degeneracy guard will throw if baseQ has SD=0. Default: false")
+	public boolean useBaseQ = false;
 
 	@Option(name="-adaptEmissionOnly",usage="constrained Baum-Welch: freeze transitions/initiation, adapt emissions only. Requires -decodeModeOnly. Default: false")
 	public boolean adaptEmissionOnly = false;
@@ -386,17 +389,55 @@ public class FinaleMe {
 
 	/**
 	 * Write the model's training-time metadata sidecar. Called by trainHmm
-	 * (and any other path that produces a fresh model file).
+	 * (and any other path that produces a fresh model file). Single-arg
+	 * legacy form kept as a thin wrapper that records ONLY the
+	 * distance-column name (dist_column key) — used by callers that don't
+	 * have flag context. Newer callers should use the multi-arg form
+	 * below to record the full feature-flag set, which the decode-side
+	 * validator (validateFeatureFlagsAgainstModel) consumes to refuse
+	 * mismatched -useEndMotif / -useBaseQ / -lowCoverage invocations.
 	 */
 	private static void writeModelMeta(String modelFile, String distColName) {
+		writeModelMeta(modelFile, distColName, null, null, null, null);
+	}
+
+	private static void writeModelMeta(String modelFile, String distColName,
+			Boolean useEndMotif, Boolean useBaseQ, Boolean lowCoverage, Integer features) {
 		try (BufferedWriter bw = new BufferedWriter(new FileWriter(modelMetaPath(modelFile)))) {
 			bw.write("key\tvalue\n");
 			bw.write("dist_column\t" + distColName + "\n");
+			if (useEndMotif != null)  bw.write("use_motif\t"    + useEndMotif  + "\n");
+			if (useBaseQ != null)     bw.write("use_baseq\t"    + useBaseQ     + "\n");
+			if (lowCoverage != null)  bw.write("low_coverage\t" + lowCoverage  + "\n");
+			if (features != null)     bw.write("features\t"     + features     + "\n");
 		} catch (IOException e) {
 			// Sidecar write failure shouldn't kill training; log and continue.
 			log.warn("Could not write model metadata sidecar " +
 					modelMetaPath(modelFile) + ": " + e.getMessage());
 		}
+	}
+
+	/**
+	 * Read the entire model metadata sidecar as a key→value map. Returns
+	 * an empty map when the sidecar is missing (older model trained before
+	 * the metadata format existed).
+	 */
+	private static Map<String, String> readModelMeta(String modelFile) {
+		Map<String, String> out = new HashMap<>();
+		File meta = new File(modelMetaPath(modelFile));
+		if (!meta.exists()) return out;
+		try (BufferedReader br = new BufferedReader(new FileReader(meta))) {
+			String line;
+			while ((line = br.readLine()) != null) {
+				if (line.startsWith("key\t")) continue;
+				String[] kv = line.split("\t", 2);
+				if (kv.length == 2) out.put(kv[0].trim(), kv[1].trim());
+			}
+		} catch (IOException e) {
+			log.warn("Could not read model metadata sidecar " +
+					modelMetaPath(modelFile) + ": " + e.getMessage());
+		}
+		return out;
 	}
 
 	/**
@@ -590,6 +631,47 @@ public class FinaleMe {
 		}
 	}
 
+	/**
+	 * Validate that the current invocation's feature-flag set matches what
+	 * the model was trained with. Sidecar keys: use_motif, use_baseq,
+	 * low_coverage. The HMM reads features by column INDEX, so toggling a
+	 * flag between train and decode silently re-aligns observation vector
+	 * dimensions to the wrong stats and produces nonsense predictions.
+	 *
+	 * Backward compat: if the sidecar is missing or doesn't have a
+	 * particular key (older models trained pre-v0.64), log a warning and
+	 * proceed assuming the current invocation is correct.
+	 */
+	private void validateFeatureFlagsAgainstModel(String modelFile) {
+		Map<String, String> meta = readModelMeta(modelFile);
+		if (meta.isEmpty()) {
+			// Already covered by the dist-column validator's warning;
+			// don't double-log.
+			return;
+		}
+		checkFlagAgainstModel(meta, "use_motif",    "useEndMotif",  useEndMotif,  modelFile);
+		checkFlagAgainstModel(meta, "use_baseq",    "useBaseQ",     useBaseQ,     modelFile);
+		checkFlagAgainstModel(meta, "low_coverage", "lowCoverage",  lowCoverage,  modelFile);
+	}
+
+	private static void checkFlagAgainstModel(Map<String, String> meta,
+			String key, String flagName, boolean current, String modelFile) {
+		String trained = meta.get(key);
+		if (trained == null) return;  // older sidecar without this key; tolerate.
+		boolean trainedBool = Boolean.parseBoolean(trained);
+		if (trainedBool != current) {
+			throw new IllegalArgumentException(
+					"Feature-flag mismatch: model " + modelFile + " was trained " +
+					"with -" + flagName + "=" + trainedBool + " (per " +
+					modelMetaPath(modelFile) + "), but the current invocation " +
+					"has -" + flagName + "=" + current + ". The HMM reads " +
+					"features by column index, so this mismatch would silently " +
+					"produce wrong predictions. Toggle -" + flagName + " to " +
+					"match the trained model, or retrain on a BED matching the " +
+					"current invocation's flags.");
+		}
+	}
+
 	private int resolveThreadCount()
 	{
 		int resolved = threads > 0 ? threads : Runtime.getRuntime().availableProcessors();
@@ -729,9 +811,14 @@ public class FinaleMe {
 		methyPrior /= 100;
 		if (Double.isNaN(methyPrior)) return null;
 
+		// Per-CpG baseQ (Phred). Already read above for the >5 filter; capture
+		// it explicitly into ParsedRow so downstream paths can route it into
+		// the HMM observation vector when -useBaseQ is set.
+		double baseQ = Double.parseDouble(splitLines[8]);
+
 		String loc = chr + ":" + start + ":" + end;
 		String readName = splitLines[3];
-		return new ParsedRow(readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, distToCenter, motifScore);
+		return new ParsedRow(readName, splitLines[6], loc, offset, methyPrior, fragLen, coverage, distToCenter, motifScore, baseQ);
 	}
 
 	private AssembledFragment assembleFragment(
@@ -842,14 +929,99 @@ public class FinaleMe {
 			READER_BUFFER_SIZE);
 	}
 
+	/**
+	 * Index of the baseQ slot in stats[]. -1 when -useBaseQ is off; equals 3
+	 * when motif is off, 4 when motif is on. baseQ goes after motif so it
+	 * doesn't disturb the existing motif slot index.
+	 */
+	private int baseQStatsIndex() {
+		if (!useBaseQ) return -1;
+		return useEndMotif ? 4 : 3;
+	}
+
+	/**
+	 * Map an observation-vector dimension index (in the order produced by
+	 * buildObservationVector) to its slot in the stats[] array. Used by
+	 * adaptation re-centering to look up the right normalization stats per
+	 * feature. Layout (with flag legend in parentheses):
+	 *
+	 *   d=0: FragLen        → stats[0]
+	 *   d=1: Coverage       → stats[1]   (only when !lowCoverage)
+	 *        else d=1: DistToCenter → stats[2]
+	 *   d=2: DistToCenter   → stats[2]   (when !lowCoverage)
+	 *        else d=2: MotifScore → stats[3]    (when lowCoverage && useEndMotif)
+	 *        or  d=2: baseQ        → bqIdx     (when lowCoverage && useBaseQ only)
+	 *   d=3: MotifScore     → stats[3]   (when !lowCoverage && useEndMotif)
+	 *        or  d=3: baseQ → bqIdx     (when !lowCoverage && !useEndMotif && useBaseQ)
+	 *   d=4: baseQ          → bqIdx     (when !lowCoverage && useEndMotif && useBaseQ)
+	 *
+	 * Equivalent to walking the same conditional blocks as
+	 * buildObservationVector and incrementing through the stats indices.
+	 */
+	private int obsDimToStatsIdx(int dim) {
+		int d = 0;
+		// FragLen at d=0 -> stats[0]
+		if (dim == d) return 0;
+		d++;
+		if (!lowCoverage) {
+			if (dim == d) return 1; // Coverage
+			d++;
+		}
+		if (dim == d) return 2; // DistToCenter
+		d++;
+		if (useEndMotif) {
+			if (dim == d) return 3; // MotifScore
+			d++;
+		}
+		if (useBaseQ) {
+			if (dim == d) return baseQStatsIndex(); // baseQ
+			d++;
+		}
+		// Defensive: shouldn't happen if the caller respects observation-vector dimensions.
+		throw new IllegalStateException("obsDimToStatsIdx: dimension " + dim +
+				" out of range for current flag configuration");
+	}
+
+	/**
+	 * Build the z-scored observation vector from a parsed row according to
+	 * the active feature flags. Handles all four legacy cases plus the two
+	 * new cases that opt-in -useBaseQ. baseQ is appended at the END of the
+	 * vector to keep existing slot indices stable for motif-bearing models.
+	 *
+	 * Resulting dimension equals 3 + (useEndMotif ? 1 : 0) + (useBaseQ ? 1 : 0)
+	 * - (lowCoverage ? 1 : 0).
+	 */
+	private double[] buildObservationVector(ParsedRow row, SummaryStatistics[] stats, int bqIdx) {
+		java.util.ArrayList<Double> dims = new java.util.ArrayList<>(stats.length);
+		dims.add((row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation());
+		if (!lowCoverage) {
+			dims.add((row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation());
+		}
+		dims.add((row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation());
+		if (useEndMotif) {
+			dims.add((row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation());
+		}
+		if (useBaseQ && bqIdx >= 0) {
+			double sd = stats[bqIdx].getStandardDeviation();
+			double zscored = sd > 0
+					? (row.baseQ - stats[bqIdx].getMean()) / sd
+					: 0.0;  // SD=0 already caught by the degeneracy guard; defensive fallback
+			dims.add(zscored);
+		}
+		double[] out = new double[dims.size()];
+		for (int i = 0; i < out.length; i++) out[i] = dims.get(i);
+		return out;
+	}
+
 	private SummaryStatistics[] collectStats(String matrixFile,
 											 HashMap<String, IntervalTree<Integer>> overlapLoc,
 											 HashMap<String, IntervalTree<Integer>> excludeLoc) throws IOException {
-		int numStats = useEndMotif ? 4 : 3;
+		int numStats = 3 + (useEndMotif ? 1 : 0) + (useBaseQ ? 1 : 0);
 		SummaryStatistics[] stats = new SummaryStatistics[numStats];
 		for (int i = 0; i < numStats; i++) {
 			stats[i] = new SummaryStatistics();
 		}
+		int bqIdx = baseQStatsIndex();
 
 		BufferedReader br = openGzipReader(matrixFile);
 
@@ -863,6 +1035,9 @@ public class FinaleMe {
 			if (useEndMotif && !Double.isNaN(row.motifScore)) {
 				stats[3].addValue(row.motifScore);
 			}
+			if (useBaseQ && bqIdx >= 0) {
+				stats[bqIdx].addValue(row.baseQ);
+			}
 		}
 		br.close();
 
@@ -870,10 +1045,43 @@ public class FinaleMe {
 	}
 
 	private void logFeatureStats(SummaryStatistics[] stats) {
-		final String[] featureNames = new String[]{"FragLen", "Norm_Frag_cov", "DistToCenter", "MotifScore"};
+		// Build dynamic feature-name list based on which flags are active.
+		// Slots 0..2 are always FragLen / Norm_Frag_cov / DistToCenter.
+		// Slot 3 = MotifScore (if -useEndMotif) OR baseQ (if -useBaseQ alone)
+		// Slot 4 = baseQ (only when both -useEndMotif AND -useBaseQ)
+		String[] featureNames = new String[stats.length];
+		featureNames[0] = "FragLen";
+		if (stats.length > 1) featureNames[1] = "Norm_Frag_cov";
+		if (stats.length > 2) featureNames[2] = "DistToCenter";
+		int nextSlot = 3;
+		if (useEndMotif && nextSlot < stats.length) {
+			featureNames[nextSlot++] = "MotifScore";
+		}
+		if (useBaseQ && nextSlot < stats.length) {
+			featureNames[nextSlot++] = "baseQ";
+		}
 		for (int i = 0; i < stats.length; i++) {
-			String featureName = i < featureNames.length ? featureNames[i] : ("Feature" + i);
+			String featureName = featureNames[i] != null ? featureNames[i] : ("Feature" + i);
 			logFeatureStat(i, featureName, stats[i]);
+		}
+
+		// Degeneracy guard for -useBaseQ: tabix-fragment input writes a
+		// CONSTANT baseQ (= -fragBaseQ default), and feeding a constant
+		// feature into the GMM gives a singular covariance matrix at
+		// init. Fail fast with an actionable message rather than letting
+		// EigenDecomposition.getInverse() throw a cryptic stack trace.
+		int bqIdx = baseQStatsIndex();
+		if (bqIdx >= 0 && bqIdx < stats.length) {
+			SummaryStatistics bqStat = stats[bqIdx];
+			if (bqStat.getN() > 1 && bqStat.getStandardDeviation() == 0.0) {
+				throw new IllegalStateException(
+						"-useBaseQ feature has SD=0 across all CpGs (constant " +
+						"baseQ = " + bqStat.getMean() + " over " + bqStat.getN() + " " +
+						"observations). This typically means the BED came from " +
+						"tabix-fragment input where baseQ is a constant from " +
+						"-fragBaseQ. Either drop -useBaseQ, or rebuild the BED " +
+						"from a BAM input where baseQ varies per CpG site.");
+			}
 		}
 	}
 
@@ -1117,11 +1325,12 @@ public class FinaleMe {
 
 			// === Pass 1: Stats + per-read CpG count ===
 			String line;
-			int numStats = useEndMotif ? 4 : 3;
+			int numStats = 3 + (useEndMotif ? 1 : 0) + (useBaseQ ? 1 : 0);
 			SummaryStatistics[] stats = new SummaryStatistics[numStats];
 			for(int i = 0; i < numStats; i++){
 				stats[i] = new SummaryStatistics();
 			}
+			int bqIdx = baseQStatsIndex();
 			long statsRows = 0;
 
 			// Count CpGs per readName so Pass 2 can skip reads with too few CpGs.
@@ -1136,6 +1345,9 @@ public class FinaleMe {
 				stats[2].addValue(row.distToCenter);
 				if(useEndMotif && !Double.isNaN(row.motifScore)){
 					stats[3].addValue(row.motifScore);
+				}
+				if(useBaseQ && bqIdx >= 0){
+					stats[bqIdx].addValue(row.baseQ);
 				}
 				statsRows++;
 				// Count CpGs per read (use int[1] to avoid Integer boxing)
@@ -1191,40 +1403,12 @@ public class FinaleMe {
 
 			if(covOutlier > 0 && ((row.coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
 					(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
-					(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation() > covOutlier)){
+					(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation() > covOutlier ||
+					(useBaseQ && bqIdx >= 0 && stats[bqIdx].getStandardDeviation() > 0
+							&& (row.baseQ - stats[bqIdx].getMean()) / stats[bqIdx].getStandardDeviation() > covOutlier))){
 				continue;
 			}
-			double[] value;
-
-			if(lowCoverage && useEndMotif){
-				// 3D: fragLen, distToCenter, motifScore
-				value = new double[]{
-						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
-						(row.motifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
-				};
-			}else if(lowCoverage){
-				// 2D: fragLen, distToCenter
-				value = new double[]{
-						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
-				};
-			}else if(useEndMotif){
-				// 4D: fragLen, coverage, distToCenter, motifScore
-				value = new double[]{
-						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(row.coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
-						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
-						(row.motifScore-stats[3].getMean())/stats[3].getStandardDeviation(),
-				};
-			}else{
-				// 3D: fragLen, coverage, distToCenter
-				value = new double[]{
-						(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation(),
-						(row.coverage-stats[1].getMean())/stats[1].getStandardDeviation(),
-						(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation(),
-				};
-			}
+			double[] value = buildObservationVector(row, stats, bqIdx);
 
 			ObservationVector vector = new ObservationVector(value);
 
@@ -1528,13 +1712,16 @@ public class FinaleMe {
 		oos.writeObject(hmm);
 		oos.close();
 
-		// Record the training-time distance-column form so future decode
-		// runs can refuse mismatched BEDs. See validateDistColumnAgainstModel.
+		// Record the training-time distance-column form AND feature-flag
+		// set so future decode runs can refuse mismatched BEDs / flags. See
+		// validateDistColumnAgainstModel and validateFeatureFlagsAgainstModel.
 		if (trainingInputFile != null) {
 			String distCol = readDistColumnNameFromHeader(trainingInputFile);
 			log.info("Recording training distance column '" + distCol +
-					"' to " + modelMetaPath(modelFile));
-			writeModelMeta(modelFile, distCol);
+					"' and feature flags (use_motif=" + useEndMotif +
+					", use_baseq=" + useBaseQ + ", low_coverage=" + lowCoverage +
+					", features=" + features + ") to " + modelMetaPath(modelFile));
+			writeModelMeta(modelFile, distCol, useEndMotif, useBaseQ, lowCoverage, features);
 		}
 
 	}
@@ -1547,6 +1734,7 @@ public class FinaleMe {
 		// input, so this passes by construction; the check matters when
 		// decodeHmm is invoked with a pre-existing model.
 		validateDistColumnAgainstModel(inputFile, hmmFile);
+		validateFeatureFlagsAgainstModel(hmmFile);
 		System.out.println("\nDecoding ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 		List<ArrayList<String>> matrixLoc = new ArrayList<ArrayList<String>>();
@@ -1752,6 +1940,7 @@ public class FinaleMe {
 		// Reject input BEDs whose distance-column form differs from the
 		// model's training-time form (silent mis-prediction otherwise).
 		validateDistColumnAgainstModel(inputFile, modelFile);
+		validateFeatureFlagsAgainstModel(modelFile);
 
 		// Load region/exclude intervals
 		HashMap<String, IntervalTree<Integer>> overlapLoc = loadIntervalFile(region);
@@ -1816,6 +2005,7 @@ public class FinaleMe {
 		BufferedReader br = openGzipReader(inputFile);
 
 		String line;
+		int bqIdxStream = baseQStatsIndex();
 		while ((line = br.readLine()) != null) {
 			ParsedRow row = parseLine(line, overlapLoc, excludeLoc);
 			if (row == null) continue;
@@ -1823,41 +2013,15 @@ public class FinaleMe {
 			// Apply covOutlier filter
 			if (covOutlier > 0 && ((row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation() > covOutlier ||
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation() > covOutlier ||
-					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation() > covOutlier)) {
+					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation() > covOutlier ||
+					(useBaseQ && bqIdxStream >= 0 && stats[bqIdxStream].getStandardDeviation() > 0
+							&& (row.baseQ - stats[bqIdxStream].getMean()) / stats[bqIdxStream].getStandardDeviation() > covOutlier))) {
 				continue;
 			}
 
-			// Z-score normalize
-			double[] value;
-			if (lowCoverage && useEndMotif) {
-				// 3D: fragLen, distToCenter, motifScore
-				value = new double[]{
-					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
-					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
-					(row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation(),
-				};
-			} else if (lowCoverage) {
-				// 2D: fragLen, distToCenter
-				value = new double[]{
-					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
-					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
-				};
-			} else if (useEndMotif) {
-				// 4D: fragLen, coverage, distToCenter, motifScore
-				value = new double[]{
-					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
-					(row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation(),
-					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
-					(row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation(),
-				};
-			} else {
-				// 3D: fragLen, coverage, distToCenter
-				value = new double[]{
-					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation(),
-					(row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation(),
-					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation(),
-				};
-			}
+			// Z-score normalize via the shared helper so the streaming-decode
+			// path stays in sync with the training path's vector layout.
+			double[] value = buildObservationVector(row, stats, bqIdxStream);
 			ObservationVector vector = new ObservationVector(value);
 			points++;
 
@@ -2685,6 +2849,11 @@ public class FinaleMe {
 	
 	//decoding HMM 
 	private void aucMode(MatrixObj matrixObj, String hmmFile, String outputFile) throws Exception{
+		// Validate feature-flag consistency with the trained model. The AUC
+		// path shares parseLine + processMatrixFile with the training path,
+		// so the same flag-mismatch silent-corruption applies if a user
+		// trains with one flag set and AUC-evaluates with another.
+		validateFeatureFlagsAgainstModel(hmmFile);
 		System.out.println("\nROC curve ...\n");
 		List<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>> matrix = new ArrayList<Pair<HashMap<Integer, Pair<Integer, Double>>, List<ObservationVector>>>();
 
@@ -3046,11 +3215,13 @@ public class FinaleMe {
 		if (!matrix.isEmpty() && !matrix.get(0).getSecond().isEmpty()) {
 			int obsDim = matrix.get(0).getSecond().get(0).dimension();
 			if (obsDim != features) {
+				int expected = 3 + (useEndMotif ? 1 : 0) + (useBaseQ ? 1 : 0) - (lowCoverage ? 1 : 0);
 				throw new IllegalStateException(
 					"Observation vector dimension (" + obsDim + ") does not match -features (" + features + "). " +
-					"Check that -useEndMotif and -lowCoverage match the input file's feature schema, " +
-					"and that -features matches the expected dimension: " +
-					"3 for normal, 4 for !lowCoverage+useEndMotif, 2 for lowCoverage, 3 for lowCoverage+useEndMotif.");
+					"For the current flag set (-useEndMotif=" + useEndMotif + ", -useBaseQ=" + useBaseQ +
+					", -lowCoverage=" + lowCoverage + ") the expected -features value is " + expected + ". " +
+					"Set -features=" + expected + " or toggle the relevant flags so the HMM dimension matches " +
+					"the input observation vector.");
 			}
 		}
 		// Clip z-scored feature values to +/-OBS_CLIP_SD to prevent extreme
@@ -3386,10 +3557,11 @@ public class FinaleMe {
 		final double coverage;
 		final double distToCenter;
 		final double motifScore;
+		final double baseQ;       // per-CpG Phred score from BED col 8; consumed by HMM iff -useBaseQ
 
 		ParsedRow(String readName, String methyStat, String loc, int offset,
 				  double methyPrior, double fragLen, double coverage, double distToCenter,
-				  double motifScore) {
+				  double motifScore, double baseQ) {
 			this.readName = readName;
 			this.methyStat = methyStat;
 			this.loc = loc;
@@ -3399,6 +3571,7 @@ public class FinaleMe {
 			this.coverage = coverage;
 			this.distToCenter = distToCenter;
 			this.motifScore = motifScore;
+			this.baseQ = baseQ;
 		}
 	}
 
@@ -3558,6 +3731,7 @@ public class FinaleMe {
 		// Reject input BEDs whose distance-column form differs from the
 		// reference model's training-time form.
 		validateDistColumnAgainstModel(inputFile, modelFile);
+		validateFeatureFlagsAgainstModel(modelFile);
 
 		// Load reference model
 		BayesianNhmmV5<ObservationVector> refHmm = loadHmmModel(modelFile);
@@ -3868,15 +4042,27 @@ public class FinaleMe {
 		oos.close();
 		log.info("Adapted model written to temp file: " + adaptedModelTmp.getAbsolutePath());
 
-		// Propagate the reference model's distance-column metadata to the
-		// adapted temp model so the downstream decodeOnlyStreaming call
-		// (which validates) doesn't reject it. The adapted model uses the
-		// same feature schema as the reference.
-		String refDistCol = readModelDistColumn(modelFile);
+		// Propagate the reference model's distance-column metadata + feature
+		// flags to the adapted temp model so the downstream decodeOnlyStreaming
+		// call (which validates) doesn't reject it. The adapted model uses
+		// the same feature schema as the reference; reuse the reference's
+		// recorded flag values (or fall back to the current invocation's
+		// flags if the reference predates the v0.64 sidecar format).
+		Map<String, String> refMeta = readModelMeta(modelFile);
+		String refDistCol = refMeta.get("dist_column");
 		String adaptedDistCol = (refDistCol != null)
 				? refDistCol
 				: readDistColumnNameFromHeader(inputFile);
-		writeModelMeta(adaptedModelTmp.getAbsolutePath(), adaptedDistCol);
+		Boolean adaptedUseMotif = refMeta.containsKey("use_motif")
+				? Boolean.parseBoolean(refMeta.get("use_motif")) : useEndMotif;
+		Boolean adaptedUseBaseQ = refMeta.containsKey("use_baseq")
+				? Boolean.parseBoolean(refMeta.get("use_baseq")) : useBaseQ;
+		Boolean adaptedLowCov   = refMeta.containsKey("low_coverage")
+				? Boolean.parseBoolean(refMeta.get("low_coverage")) : lowCoverage;
+		Integer adaptedFeatures = refMeta.containsKey("features")
+				? Integer.parseInt(refMeta.get("features")) : features;
+		writeModelMeta(adaptedModelTmp.getAbsolutePath(), adaptedDistCol,
+				adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov, adaptedFeatures);
 		File adaptedTmpMeta = new File(modelMetaPath(adaptedModelTmp.getAbsolutePath()));
 		adaptedTmpMeta.deleteOnExit();
 
@@ -3885,7 +4071,8 @@ public class FinaleMe {
 			java.nio.file.Files.copy(adaptedModelTmp.toPath(),
 				new File(saveAdaptedModel).toPath(),
 				java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-			writeModelMeta(saveAdaptedModel, adaptedDistCol);
+			writeModelMeta(saveAdaptedModel, adaptedDistCol,
+					adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov, adaptedFeatures);
 			log.info("Adapted model saved to: " + saveAdaptedModel +
 					" (with metadata sidecar)");
 		}
@@ -3913,16 +4100,16 @@ public class FinaleMe {
 	 * for adaptation diagnostics.
 	 */
 	private void logEmissionParams(String label, BayesianNhmmV5<ObservationVector> hmm) {
-		final String[] featureNames;
-		if (lowCoverage && useEndMotif) {
-			featureNames = new String[]{"FragLen", "DistToCenter", "MotifScore"};
-		} else if (lowCoverage) {
-			featureNames = new String[]{"FragLen", "DistToCenter"};
-		} else if (useEndMotif) {
-			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter", "MotifScore"};
-		} else {
-			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter"};
-		}
+		// Build feature-name list dynamically based on the active flags so
+		// that -useBaseQ (and any future flag) propagates to the diagnostic
+		// logs without manual table edits.
+		java.util.ArrayList<String> names = new java.util.ArrayList<>(5);
+		names.add("FragLen");
+		if (!lowCoverage) names.add("Coverage");
+		names.add("DistToCenter");
+		if (useEndMotif) names.add("MotifScore");
+		if (useBaseQ) names.add("baseQ");
+		final String[] featureNames = names.toArray(new String[0]);
 
 		log.info("=== " + label + " ===");
 		for (int s = 0; s < hmm.nbStates(); s++) {
@@ -4119,21 +4306,16 @@ public class FinaleMe {
 			ArrayList<ArrayList<Double>> newProps = new ArrayList<>();
 
 			for (int d = 0; d < dim; d++) {
-				// Map feature dimension to stats index:
-				// lowCoverage+endMotif (3D):   [0]=fragLen(s0), [1]=distToCenter(s2), [2]=motifScore(s3)
-				// lowCoverage (2D):            [0]=fragLen(s0), [1]=distToCenter(s2)
-				// !lowCoverage+endMotif (4D):  [0]=fragLen(s0), [1]=coverage(s1), [2]=distToCenter(s2), [3]=motifScore(s3)
-				// normal (3D):                 [0]=fragLen(s0), [1]=coverage(s1), [2]=distToCenter(s2)
-				int statsIdx;
-				if (lowCoverage && useEndMotif) {
-					statsIdx = (d == 0) ? 0 : (d == 1) ? 2 : 3;
-				} else if (lowCoverage) {
-					statsIdx = (d == 0) ? 0 : 2;
-				} else if (useEndMotif) {
-					statsIdx = d; // 0→fragLen, 1→coverage, 2→distToCenter, 3→motifScore
-				} else {
-					statsIdx = d; // 0→fragLen, 1→coverage, 2→distToCenter
-				}
+				// Map feature-dimension index in the observation vector to
+				// its slot in the stats[] array. Uses the same flag matrix
+				// as buildObservationVector(); see that helper for layout
+				// reasoning. Order in the obs vector:
+				//   FragLen, [Coverage], DistToCenter, [MotifScore], [baseQ]
+				// where bracketed dims are present only when the
+				// corresponding flag is on. stats[] is always
+				//   [0]=FragLen, [1]=Coverage, [2]=DistToCenter,
+				//   [3]=MotifScore (if motif), [bqIdx]=baseQ.
+				int statsIdx = obsDimToStatsIdx(d);
 
 				double meanRef = refNormStats[statsIdx][0];
 				double sdRef = refNormStats[statsIdx][1];
@@ -4167,16 +4349,14 @@ public class FinaleMe {
 
 	private void logEmissionDelta(String label, BayesianNhmmV5<ObservationVector> refHmm,
 								  BayesianNhmmV5<ObservationVector> adaptedHmm) {
-		final String[] featureNames;
-		if (lowCoverage && useEndMotif) {
-			featureNames = new String[]{"FragLen", "DistToCenter", "MotifScore"};
-		} else if (lowCoverage) {
-			featureNames = new String[]{"FragLen", "DistToCenter"};
-		} else if (useEndMotif) {
-			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter", "MotifScore"};
-		} else {
-			featureNames = new String[]{"FragLen", "Coverage", "DistToCenter"};
-		}
+		// Build feature-name list dynamically (same logic as logEmissionParams).
+		java.util.ArrayList<String> names = new java.util.ArrayList<>(5);
+		names.add("FragLen");
+		if (!lowCoverage) names.add("Coverage");
+		names.add("DistToCenter");
+		if (useEndMotif) names.add("MotifScore");
+		if (useBaseQ) names.add("baseQ");
+		final String[] featureNames = names.toArray(new String[0]);
 
 		log.info("=== " + label + " ===");
 		for (int s = 0; s < refHmm.nbStates(); s++) {

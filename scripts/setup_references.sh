@@ -7,7 +7,7 @@ ZENODO_URL="https://zenodo.org/records/19392525/files"
 # Reference panels for tissue-of-origin deconvolution (BetaValueDeconvolution -refPanel).
 # DOI: 10.5281/zenodo.19742408
 ATLAS_ZENODO_URL="https://zenodo.org/records/19742408/files"
-JAR_PATH="${ROOT_DIR}/target/FinaleMe-0.63-jar-with-dependencies.jar"
+JAR_PATH="${ROOT_DIR}/target/FinaleMe-0.64-jar-with-dependencies.jar"
 
 OS=""
 ARCH=""
