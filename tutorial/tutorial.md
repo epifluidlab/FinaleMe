@@ -1,6 +1,6 @@
 # FinaleMe Tutorial
 
-This tutorial contains the full, detailed usage guide for FinaleMe v0.63.
+This tutorial contains the full, detailed usage guide for FinaleMe v0.64.
 
 If you want the shortest path to run the pipeline, start from [README.md](../README.md).
 
@@ -39,7 +39,7 @@ cd FinaleMe
 This command:
 
 - checks dependencies
-- builds `target/FinaleMe-0.63-jar-with-dependencies.jar` (if missing)
+- builds `target/FinaleMe-0.64-jar-with-dependencies.jar` (if missing)
 - downloads hg19/hg38 reference data into `data/`, including the pre-built TOO reference panels for Step 5
 
 Use a custom data directory with:
@@ -113,7 +113,7 @@ For tabix fragment BED/TSV, the file must include at least `chr`, `start`, `end`
 ## 4.1 Standard BAM command
 
 ```bash
-JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.64-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.CpgFeatureMatrixBuilder \
@@ -252,17 +252,38 @@ the motif lookup on a paired WGBS BAM, then re-use it on tabix/WGS runs via
 -loadMotifLookup.
 ```
 
-The same restriction applies to BAM input under `-wgsMode` (every covered CpG is labeled `'m'` because the read base is the unconverted reference). Standard recipe:
+Tabix is the only mode that hard-rejects `-saveMotifLookup`. **For BAM input under `-wgsMode`, training the lookup IS supported** (as of v0.64) — see the next subsection.
 
-1. Train the motif lookup once on a paired WGBS/bisulfite-converted BAM:
+#### `-saveMotifLookup` in `-wgsMode` (BAM): two distinct artifact types
+
+In a regular WGS BAM (no bisulfite conversion), `methy_stat` is *not* constant. The same C→T (or G→A) base call that bisulfite-converted reads use to mark `'u'` happens in WGS too, just driven by base-quality-correlated sequencing errors instead of bisulfite chemistry. Per [Volkov et al. 2026](https://doi.org/10.64898/2026.03.08.710357), per-base quality patterns at fragment ends correlate with cancer-fragmentomic features (5' end-motifs, short-fragment enrichment), so a wgsMode-trained lookup encodes a **per-motif fragment-end quality signature** rather than a methylation rate. This is empirically useful: training the lookup in `-wgsMode` has been observed to give **better TOO concordance with tumor fraction in prostate-cancer cfDNA** than a bisulfite-trained lookup.
+
+The two training modes share the file format but encode *different things*:
+
+| Training mode (BAM) | Encodes | TSV `# trained_mode:` tag | Best for |
+|---|---|---|---|
+| Bisulfite (default, no `-wgsMode`) | per-motif **methylation rate** in matched WGBS | `bisulfite` | tissue-of-origin via methylation prior |
+| `-wgsMode` | per-motif **fragment-end quality signature** | `wgsMode` | tumor-fraction estimation, cancer-vs-control detection |
+
+The `# trained_mode:` line in the saved TSV header (added in v0.64) tells you which artifact you're holding. Both load via `-loadMotifLookup` interchangeably as far as the HMM is concerned (it just consumes a per-fragment scalar feature).
+
+**Recipe — train on whichever is cheaper / available**:
+
+1. Bisulfite-trained (requires WGBS):
    ```bash
    java ... CpgFeatureMatrixBuilder ... wgbs.bam wgbs.cpg_features.bed.gz \
-     -useEndMotif -saveMotifLookup motif_lookup.tsv
+     -useEndMotif -saveMotifLookup motif_lookup.bisulfite.tsv
    ```
-2. Re-use it on tabix or WGS-mode runs:
+2. WGS-trained (no WGBS needed; gives quality-signature lookup):
+   ```bash
+   java ... CpgFeatureMatrixBuilder ... wgs.bam wgs.cpg_features.bed.gz \
+     -wgsMode -useEndMotif -saveMotifLookup motif_lookup.wgsMode.tsv
+   ```
+   Logs a clear startup `WARN` line explaining what the lookup encodes.
+3. Re-use either lookup on subsequent tabix or WGS-mode runs:
    ```bash
    java ... CpgFeatureMatrixBuilder ... fragments.bed.gz cpg_features.bed.gz \
-     -fragmentInputTabix -useEndMotif -loadMotifLookup motif_lookup.tsv
+     -fragmentInputTabix -useEndMotif -loadMotifLookup motif_lookup.<mode>.tsv
    ```
 
 ## 4.4 Step 1 output format (`*.cpg_features*.bed.gz`)
@@ -312,7 +333,9 @@ This writes a serialized model file (`.model`) and a prediction table.
 | Option | Description |
 |---|---|
 | `-states` | Number of hidden states (even number expected). |
-| `-features` | Number of features per observation vector. |
+| `-features` | Dimension of the observation vector. Required value: `3 + (useEndMotif?1:0) + (useBaseQ?1:0) - (lowCoverage?1:0)`. Mismatch is caught at GMM-init time with an actionable error. |
+| `-useEndMotif` | Include 5' end-motif score (per-fragment, from a loaded lookup TSV) as an extra feature dimension. See §4.3 for the lookup-training workflow. |
+| `-useBaseQ` | (v0.64+) Add per-CpG base-quality score (Phred) as an additional feature dimension, appended at the end of the observation vector. Empirically motivated by [Volkov et al. 2026](https://doi.org/10.64898/2026.03.08.710357), which shows that per-base quality scores at fragment positions correlate with cancer-associated fragmentation features. Complements `-useEndMotif` (which aggregates baseQ-driven errors at the fragment 5' end into a per-motif score) by exposing the per-CpG-site quality variation along the fragment directly. **Caveat**: meaningful only when baseQ varies per CpG; tabix-fragment input writes a constant baseQ (= `-fragBaseQ` default) and a Pass-1 degeneracy guard will throw if `baseQ.sd == 0`. The training-time flag is recorded in the model's `.meta.tsv` sidecar so subsequent `-decodeModeOnly` / `-aucMode` runs refuse mismatched flags. |
 | `-miniDataPoints` | Minimum CpGs per fragment to include. |
 | `-maxCpgs` | Maximum CpGs per fragment to include. |
 | `-maxFragLen` | Maximum fragment-length state bound. |
@@ -439,7 +462,7 @@ This is optional when Step 3 already runs with `-bwOutput`.
 The simplest workflow uses the atlas downloaded by `setup_references.sh`:
 
 ```bash
-JAR="target/FinaleMe-0.63-jar-with-dependencies.jar"
+JAR="target/FinaleMe-0.64-jar-with-dependencies.jar"
 
 java -Xmx20G -cp "$JAR" \
   edu.northwestern.epifluidlab.finaleme.utils.BetaValueDeconvolution \

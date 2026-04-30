@@ -237,15 +237,33 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 					// Error out early instead of producing a useless file. The tabix
 					// equivalent of this check happens after useTabixFragmentInput is
 					// resolved below (line ~268).
+					//
+					// HISTORICAL NOTE: an earlier version of this validator THREW on
+					// -saveMotifLookup + -wgsMode under the assumption that methyStat
+					// is constant 'm' in wgsMode. That assumption was wrong: methyStat
+					// is derived from the read base regardless of -wgsMode (C->T at a
+					// CpG -> 'u'), and in WGS those 'u' calls are driven by base-
+					// quality-correlated sequencing errors. Per Volkov et al. 2026
+					// (biorxiv 10.64898/2026.03.08.710357), per-base quality at
+					// fragment ends correlates with cancer-fragmentomic features,
+					// so a wgsMode-trained lookup encodes a real "fragment-end
+					// quality signature" rather than a methylation rate. The user has
+					// empirically confirmed that this WGS-trained lookup gives BETTER
+					// TOO concordance with tumor fraction in prostate-cancer cfDNA
+					// than a bisulfite-trained one. We therefore allow training in
+					// wgsMode and only emit a clear warning at startup so users
+					// don't confuse the two artifacts.
 					if (saveMotifLookup != null && wgsMode) {
-						throw new CmdLineException(parser,
-								"-saveMotifLookup requires bisulfite-converted BAM input " +
-								"(-wgsMode=false). Under -wgsMode every covered CpG is " +
-								"labeled methylated, so the lookup table would be " +
-								"degenerate (score=1.0 for every 4-mer). Train the motif " +
-								"lookup on a paired bisulfite/WGBS BAM, then re-use it " +
-								"in -wgsMode/tabix runs via -loadMotifLookup.",
-								new Throwable());
+						log.warn("Training motif lookup in -wgsMode. The resulting TSV " +
+								"will encode a per-motif FRAGMENT-END QUALITY SIGNATURE, " +
+								"NOT a tissue methylation rate. Sequencing errors at CpG " +
+								"sites (C->T, G->A) are interpreted as 'u' methyStat, and " +
+								"per Volkov et al. 2026 (biorxiv 10.64898/2026.03.08." +
+								"710357) those error rates correlate with tumor-associated " +
+								"5' end-motifs. Useful for tumor-fraction estimation; " +
+								"NOT a substitute for a bisulfite-trained methylation " +
+								"lookup. The output TSV will be tagged " +
+								"'# trained_mode: wgsMode'.");
 					}
 
 					// Initialize motif data structures
@@ -2339,15 +2357,29 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 
 	/**
 	 * Load motif score lookup table from TSV file.
-	 * Format: header line, then rows of "motif\tscore".
+	 *
+	 * Format:
+	 *   - zero or more leading lines starting with '#' (provenance comments
+	 *     like '# trained_mode: wgsMode'); skipped.
+	 *   - one column-header line ("motif\tscore"); skipped.
+	 *   - rows of "motif\tscore".
+	 *
+	 * The leading '#'-comment skip is permissive: any '#'-prefixed line
+	 * anywhere in the file is treated as a comment, so we can grow the
+	 * provenance header in future without breaking older readers.
 	 */
 	private HashMap<String, Double> loadMotifLookupFile(String path) throws IOException {
 		HashMap<String, Double> map = new HashMap<>();
 		BufferedReader br = new BufferedReader(new FileReader(path));
 		String line;
-		boolean header = true;
+		boolean columnHeaderSeen = false;
 		while ((line = br.readLine()) != null) {
-			if (header) { header = false; continue; }
+			if (line.isEmpty()) continue;
+			if (line.startsWith("#")) continue;            // provenance comment
+			if (!columnHeaderSeen) {                       // first non-# line is the column header
+				columnHeaderSeen = true;
+				continue;
+			}
 			String[] parts = line.split("\t");
 			if (parts.length >= 2) {
 				map.put(parts[0].trim(), Double.parseDouble(parts[1].trim()));
@@ -2418,9 +2450,26 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 	/**
 	 * Save motif score lookup table to TSV file.
 	 * Uses Laplace smoothing: score = (methylated + 1) / (total + 2).
+	 *
+	 * Output format:
+	 *   # FinaleMe motif lookup
+	 *   # trained_mode: wgsMode | bisulfite     (records what the score encodes)
+	 *   # n_motifs: 256
+	 *   motif\tscore
+	 *   ACGT\t0.847391
+	 *   ...
+	 *
+	 * The '# trained_mode:' line tags the artifact so users can tell a
+	 * bisulfite-derived methylation lookup apart from a wgsMode-derived
+	 * fragment-end quality signature lookup. loadMotifLookupFile() skips
+	 * any number of leading '#'-prefixed lines.
 	 */
 	private void saveMotifLookupFile(String path) throws IOException {
 		OutputStreamWriter mw = new OutputStreamWriter(new FileOutputStream(path), "UTF-8");
+		String trainedMode = wgsMode ? "wgsMode" : "bisulfite";
+		mw.write("# FinaleMe motif lookup\n");
+		mw.write("# trained_mode: " + trainedMode + "\n");
+		mw.write("# n_motifs: " + motifCounts.size() + "\n");
 		mw.write("motif\tscore\n");
 		for (java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLongArray> entry : motifCounts.entrySet()) {
 			long methylated = entry.getValue().get(0);
@@ -2429,7 +2478,8 @@ public class CpgFeatureMatrixBuilder extends AbstractCpgMultiMetricsStats {
 			mw.write(entry.getKey() + "\t" + String.format("%.6f", score) + "\n");
 		}
 		mw.close();
-		log.info("Motif lookup saved to " + path + " with " + motifCounts.size() + " motifs");
+		log.info("Motif lookup saved to " + path + " with " + motifCounts.size() +
+				" motifs (trained_mode: " + trainedMode + ")");
 	}
 
 }
