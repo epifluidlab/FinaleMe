@@ -201,8 +201,11 @@ public class FinaleMe {
 	@Option(name="-useEndMotif",usage="include 5' end motif score as a third feature in lowCoverage mode (3D: fragLen, distToCenter, motifScore). Default: false")
 	public boolean useEndMotif = false;
 
-	@Option(name="-useBaseQ",usage="add per-CpG base-quality score (Phred) as an additional feature dimension in the HMM observation vector. Driven by Volkov et al. 2026 (biorxiv 10.64898/2026.03.08.710357), which shows that per-base quality scores at fragment positions correlate with cancer-associated fragmentation features. Complements -useEndMotif (which aggregates baseQ-driven errors at the FRAGMENT 5' end into a per-motif score) by exposing the per-CpG-SITE quality variation along the fragment directly. Resulting feature dimension is 3 + (useEndMotif?1:0) + (useBaseQ?1:0) - (lowCoverage?1:0); set -features accordingly. Note: tabix-fragment input has constant baseQ (= -fragBaseQ); a Pass-1 degeneracy guard will throw if baseQ has SD=0. Default: false")
+	@Option(name="-useBaseQ",usage="add per-CpG base-quality score (Phred) as an additional feature dimension in the HMM observation vector. Driven by Volkov et al. 2026 (biorxiv 10.64898/2026.03.08.710357), which shows that per-base quality scores at fragment positions correlate with cancer-associated fragmentation features. Complements -useEndMotif (which aggregates baseQ-driven errors at the FRAGMENT 5' end into a per-motif score) by exposing the per-CpG-SITE quality variation along the fragment directly. Resulting feature dimension is 3 + (useEndMotif?1:0) + (useBaseQ?1:0) - (lowCoverage?1:0); set -features accordingly. Note: tabix-fragment input has constant baseQ (= -fragBaseQ); a Pass-1 degeneracy guard will throw if baseQ has SD=0. See -baseQTransform for distribution-shape handling. Default: false")
 	public boolean useBaseQ = false;
+
+	@Option(name="-baseQTransform",usage="how baseQ is transformed before feeding the GMM emission, when -useBaseQ is set. Choices: 'quantile' (default; rank-based inverse normal transformation -- empirical CDF then Phi^-1, makes the marginal exactly N(0,1) regardless of platform Q-score binning, so the same -features model trained on HiSeq applies to NovaSeq 4-bin data); 'raw' (legacy v0.64.0: z-score the raw Phred; non-Gaussian tail and discrete on Q-binned platforms but interpretable); 'logit' (z-score logit(1 - 10^(-Q/10)); compresses the high-Q saturation; similar to raw at typical baseQ regimes). Recorded in the model sidecar; decode-time validation refuses mismatches. Default: quantile")
+	public String baseQTransform = "quantile";
 
 	@Option(name="-adaptEmissionOnly",usage="constrained Baum-Welch: freeze transitions/initiation, adapt emissions only. Requires -decodeModeOnly. Default: false")
 	public boolean adaptEmissionOnly = false;
@@ -398,18 +401,25 @@ public class FinaleMe {
 	 * mismatched -useEndMotif / -useBaseQ / -lowCoverage invocations.
 	 */
 	private static void writeModelMeta(String modelFile, String distColName) {
-		writeModelMeta(modelFile, distColName, null, null, null, null);
+		writeModelMeta(modelFile, distColName, null, null, null, null, null);
 	}
 
 	private static void writeModelMeta(String modelFile, String distColName,
 			Boolean useEndMotif, Boolean useBaseQ, Boolean lowCoverage, Integer features) {
+		writeModelMeta(modelFile, distColName, useEndMotif, useBaseQ, lowCoverage, features, null);
+	}
+
+	private static void writeModelMeta(String modelFile, String distColName,
+			Boolean useEndMotif, Boolean useBaseQ, Boolean lowCoverage, Integer features,
+			String baseQTransform) {
 		try (BufferedWriter bw = new BufferedWriter(new FileWriter(modelMetaPath(modelFile)))) {
 			bw.write("key\tvalue\n");
 			bw.write("dist_column\t" + distColName + "\n");
-			if (useEndMotif != null)  bw.write("use_motif\t"    + useEndMotif  + "\n");
-			if (useBaseQ != null)     bw.write("use_baseq\t"    + useBaseQ     + "\n");
-			if (lowCoverage != null)  bw.write("low_coverage\t" + lowCoverage  + "\n");
-			if (features != null)     bw.write("features\t"     + features     + "\n");
+			if (useEndMotif != null)    bw.write("use_motif\t"        + useEndMotif    + "\n");
+			if (useBaseQ != null)       bw.write("use_baseq\t"        + useBaseQ       + "\n");
+			if (lowCoverage != null)    bw.write("low_coverage\t"     + lowCoverage    + "\n");
+			if (features != null)       bw.write("features\t"         + features       + "\n");
+			if (baseQTransform != null) bw.write("baseq_transform\t"  + baseQTransform + "\n");
 		} catch (IOException e) {
 			// Sidecar write failure shouldn't kill training; log and continue.
 			log.warn("Could not write model metadata sidecar " +
@@ -652,6 +662,13 @@ public class FinaleMe {
 		checkFlagAgainstModel(meta, "use_motif",    "useEndMotif",  useEndMotif,  modelFile);
 		checkFlagAgainstModel(meta, "use_baseq",    "useBaseQ",     useBaseQ,     modelFile);
 		checkFlagAgainstModel(meta, "low_coverage", "lowCoverage",  lowCoverage,  modelFile);
+		// baseq_transform is only relevant when the model used baseQ at all.
+		// If the model didn't, we don't care what the current invocation's
+		// transform setting is.
+		if (Boolean.parseBoolean(meta.getOrDefault("use_baseq", "false"))) {
+			checkStringFlagAgainstModel(meta, "baseq_transform",
+					"baseQTransform", baseQTransform, modelFile);
+		}
 	}
 
 	private static void checkFlagAgainstModel(Map<String, String> meta,
@@ -669,6 +686,23 @@ public class FinaleMe {
 					"produce wrong predictions. Toggle -" + flagName + " to " +
 					"match the trained model, or retrain on a BED matching the " +
 					"current invocation's flags.");
+		}
+	}
+
+	private static void checkStringFlagAgainstModel(Map<String, String> meta,
+			String key, String flagName, String current, String modelFile) {
+		String trained = meta.get(key);
+		if (trained == null) return;  // older sidecar without this key; tolerate.
+		if (!trained.equals(current)) {
+			throw new IllegalArgumentException(
+					"Feature-flag mismatch: model " + modelFile + " was trained " +
+					"with -" + flagName + "=" + trained + " (per " +
+					modelMetaPath(modelFile) + "), but the current invocation " +
+					"has -" + flagName + "=" + current + ". The transform changes " +
+					"the marginal distribution the GMM emission was fitted to, so " +
+					"a mismatch silently mis-predicts. Pass -" + flagName + " " +
+					trained + " to match the model, or retrain on the current " +
+					"transform.");
 		}
 	}
 
@@ -939,6 +973,112 @@ public class FinaleMe {
 		return useEndMotif ? 4 : 3;
 	}
 
+	// --- baseQ transform infrastructure ----------------------------------
+	//
+	// Phred is integer-valued and bounded ([0, ~Q41] in practice). For the
+	// quantile (RINT) transform we collect a small fixed-size histogram in
+	// Pass 1, then derive a mid-rank empirical CDF for O(1) per-row lookup
+	// in Pass 2. Memory: 64 longs = 512 bytes — trivial.
+	//
+	// Why mid-rank: a strict-rank CDF puts atoms at 0 and 1 for the extreme
+	// values, which Phi^-1 maps to ±infinity. Mid-rank places them at
+	// 1/(2N) and 1 - 1/(2N), keeping Phi^-1 finite without a hard clip.
+	//
+	// Per-sample CDF: rebuilt every Pass 1, NOT baked into the model. This
+	// is the platform-portability fix: NovaSeq 4-bin data and HiSeq full-Q
+	// data both produce N(0,1)-marginal features after RINT, so a single
+	// trained model applies on either.
+
+	private static final int BASEQ_HIST_SIZE = 64;
+	private long[] baseQHist = null;
+	private double[] baseQCdf = null;
+
+	private static final org.apache.commons.math3.distribution.NormalDistribution
+			STD_NORMAL = new org.apache.commons.math3.distribution.NormalDistribution(0.0, 1.0);
+
+	/**
+	 * Increment the empirical baseQ histogram. Called from Pass 1 on every
+	 * accepted row. No-op when -useBaseQ off or transform != quantile.
+	 */
+	private void accumulateBaseQHistogram(double rawBaseQ) {
+		if (!useBaseQ || !"quantile".equals(baseQTransform)) return;
+		if (baseQHist == null) baseQHist = new long[BASEQ_HIST_SIZE];
+		int q = (int) rawBaseQ;
+		if (q < 0) q = 0;
+		if (q >= BASEQ_HIST_SIZE) q = BASEQ_HIST_SIZE - 1;
+		baseQHist[q]++;
+	}
+
+	/**
+	 * Convert the raw histogram into a mid-rank cumulative CDF lookup table.
+	 * Called once after Pass 1 finishes. baseQCdf[q] == empirical CDF of
+	 * Phred=q, evaluated at the midpoint of bin q's mass.
+	 */
+	private void finalizeBaseQQuantileTable() {
+		if (baseQHist == null) return;
+		long total = 0;
+		for (long c : baseQHist) total += c;
+		if (total == 0) return;
+		baseQCdf = new double[BASEQ_HIST_SIZE];
+		long running = 0;
+		for (int i = 0; i < BASEQ_HIST_SIZE; i++) {
+			baseQCdf[i] = (running + baseQHist[i] / 2.0) / (double) total;
+			running += baseQHist[i];
+		}
+	}
+
+	/**
+	 * Return the value to accumulate into stats[bqIdx] in Pass 1, given the
+	 * current -baseQTransform setting. For 'quantile' and 'raw' the stats
+	 * are just diagnostics (raw Phred mean/sd); for 'logit' the stats need
+	 * to be of the logit-transformed value so the Pass-2 z-score uses the
+	 * right normalization.
+	 */
+	private double baseQValueForPass1Stats(double rawBaseQ) {
+		if ("logit".equals(baseQTransform)) {
+			double e = Math.pow(10.0, -rawBaseQ / 10.0);
+			double p = Math.max(1e-9, Math.min(1.0 - 1e-9, 1.0 - e));
+			return Math.log(p / (1.0 - p));
+		}
+		return rawBaseQ;
+	}
+
+	/**
+	 * Apply the configured baseQ transform to a single raw Phred value.
+	 *   - quantile: mid-rank empirical CDF then Phi^-1 -> already N(0,1).
+	 *   - logit:    logit(1 - 10^(-Q/10)) then z-score using stats[bqIdx]
+	 *               (which holds logit-space mean/sd from Pass 1).
+	 *   - raw:      z-score the raw Phred using stats[bqIdx].
+	 */
+	private double transformBaseQ(double rawBaseQ, SummaryStatistics[] stats, int bqIdx) {
+		switch (baseQTransform) {
+			case "quantile": {
+				if (baseQCdf == null) {
+					// Pass 1 didn't run with the quantile path active; defensive 0 fallback.
+					return 0.0;
+				}
+				int q = (int) rawBaseQ;
+				if (q < 0) q = 0;
+				if (q >= BASEQ_HIST_SIZE) q = BASEQ_HIST_SIZE - 1;
+				double cdf = baseQCdf[q];
+				cdf = Math.max(1e-9, Math.min(1.0 - 1e-9, cdf));
+				return STD_NORMAL.inverseCumulativeProbability(cdf);
+			}
+			case "logit": {
+				double e = Math.pow(10.0, -rawBaseQ / 10.0);
+				double p = Math.max(1e-9, Math.min(1.0 - 1e-9, 1.0 - e));
+				double logitVal = Math.log(p / (1.0 - p));
+				double sd = stats[bqIdx].getStandardDeviation();
+				return sd > 0 ? (logitVal - stats[bqIdx].getMean()) / sd : 0.0;
+			}
+			case "raw":
+			default: {
+				double sd = stats[bqIdx].getStandardDeviation();
+				return sd > 0 ? (rawBaseQ - stats[bqIdx].getMean()) / sd : 0.0;
+			}
+		}
+	}
+
 	/**
 	 * Map an observation-vector dimension index (in the order produced by
 	 * buildObservationVector) to its slot in the stats[] array. Used by
@@ -1002,11 +1142,11 @@ public class FinaleMe {
 			dims.add((row.motifScore - stats[3].getMean()) / stats[3].getStandardDeviation());
 		}
 		if (useBaseQ && bqIdx >= 0) {
-			double sd = stats[bqIdx].getStandardDeviation();
-			double zscored = sd > 0
-					? (row.baseQ - stats[bqIdx].getMean()) / sd
-					: 0.0;  // SD=0 already caught by the degeneracy guard; defensive fallback
-			dims.add(zscored);
+			// Three transform choices implemented in transformBaseQ:
+			//   quantile -> RINT, marginal already N(0,1) by construction
+			//   logit    -> z-scored logit(P(correct))
+			//   raw      -> z-scored raw Phred
+			dims.add(transformBaseQ(row.baseQ, stats, bqIdx));
 		}
 		double[] out = new double[dims.size()];
 		for (int i = 0; i < out.length; i++) out[i] = dims.get(i);
@@ -1036,10 +1176,21 @@ public class FinaleMe {
 				stats[3].addValue(row.motifScore);
 			}
 			if (useBaseQ && bqIdx >= 0) {
-				stats[bqIdx].addValue(row.baseQ);
+				// stats[] in 'logit' mode holds logit-transformed mean/sd so
+				// the Pass-2 z-score uses the right normalization. In 'raw'
+				// and 'quantile' modes stats[] holds raw Phred mean/sd
+				// (raw uses it for z-score, quantile uses it only for the
+				// degeneracy-guard SD=0 check).
+				stats[bqIdx].addValue(baseQValueForPass1Stats(row.baseQ));
+				accumulateBaseQHistogram(row.baseQ);
 			}
 		}
 		br.close();
+
+		// Finalize the quantile-transform table so Pass 2 / decode can call
+		// transformBaseQ() with O(1) CDF lookups. No-op if useBaseQ is off
+		// or transform != quantile.
+		finalizeBaseQQuantileTable();
 
 		return stats;
 	}
@@ -1347,7 +1498,11 @@ public class FinaleMe {
 					stats[3].addValue(row.motifScore);
 				}
 				if(useBaseQ && bqIdx >= 0){
-					stats[bqIdx].addValue(row.baseQ);
+					// See collectStats for the logic: stats[] gets the
+					// transform-appropriate value, baseQHist gets the raw
+					// integer Phred for the quantile transform.
+					stats[bqIdx].addValue(baseQValueForPass1Stats(row.baseQ));
+					accumulateBaseQHistogram(row.baseQ);
 				}
 				statsRows++;
 				// Count CpGs per read (use int[1] to avoid Integer boxing)
@@ -1359,6 +1514,11 @@ public class FinaleMe {
 				}
 			}
 			br.close();
+
+		// Finalize the quantile-transform CDF table so Pass 2 can call
+		// transformBaseQ() with O(1) lookups. No-op when baseQTransform
+		// != quantile or -useBaseQ is off.
+		finalizeBaseQQuantileTable();
 
 		logFeatureStats(stats);
 		lastComputedStats = stats; // expose for adaptAndDecodeStreaming
@@ -1404,8 +1564,8 @@ public class FinaleMe {
 			if(covOutlier > 0 && ((row.coverage-stats[1].getMean())/stats[1].getStandardDeviation() > covOutlier ||
 					(row.fragLen-stats[0].getMean())/stats[0].getStandardDeviation() > covOutlier ||
 					(row.distToCenter-stats[2].getMean())/stats[2].getStandardDeviation() > covOutlier ||
-					(useBaseQ && bqIdx >= 0 && stats[bqIdx].getStandardDeviation() > 0
-							&& (row.baseQ - stats[bqIdx].getMean()) / stats[bqIdx].getStandardDeviation() > covOutlier))){
+					(useBaseQ && bqIdx >= 0
+							&& transformBaseQ(row.baseQ, stats, bqIdx) > covOutlier))){
 				continue;
 			}
 			double[] value = buildObservationVector(row, stats, bqIdx);
@@ -1717,11 +1877,17 @@ public class FinaleMe {
 		// validateDistColumnAgainstModel and validateFeatureFlagsAgainstModel.
 		if (trainingInputFile != null) {
 			String distCol = readDistColumnNameFromHeader(trainingInputFile);
+			// Only record baseq_transform when -useBaseQ is on; for off, the
+			// transform setting is meaningless and shouldn't gate decode.
+			String recordedBaseQTransform = useBaseQ ? baseQTransform : null;
 			log.info("Recording training distance column '" + distCol +
 					"' and feature flags (use_motif=" + useEndMotif +
-					", use_baseq=" + useBaseQ + ", low_coverage=" + lowCoverage +
+					", use_baseq=" + useBaseQ +
+					(useBaseQ ? ", baseq_transform=" + baseQTransform : "") +
+					", low_coverage=" + lowCoverage +
 					", features=" + features + ") to " + modelMetaPath(modelFile));
-			writeModelMeta(modelFile, distCol, useEndMotif, useBaseQ, lowCoverage, features);
+			writeModelMeta(modelFile, distCol, useEndMotif, useBaseQ, lowCoverage,
+					features, recordedBaseQTransform);
 		}
 
 	}
@@ -2014,8 +2180,8 @@ public class FinaleMe {
 			if (covOutlier > 0 && ((row.coverage - stats[1].getMean()) / stats[1].getStandardDeviation() > covOutlier ||
 					(row.fragLen - stats[0].getMean()) / stats[0].getStandardDeviation() > covOutlier ||
 					(row.distToCenter - stats[2].getMean()) / stats[2].getStandardDeviation() > covOutlier ||
-					(useBaseQ && bqIdxStream >= 0 && stats[bqIdxStream].getStandardDeviation() > 0
-							&& (row.baseQ - stats[bqIdxStream].getMean()) / stats[bqIdxStream].getStandardDeviation() > covOutlier))) {
+					(useBaseQ && bqIdxStream >= 0
+							&& transformBaseQ(row.baseQ, stats, bqIdxStream) > covOutlier))) {
 				continue;
 			}
 
@@ -4061,8 +4227,12 @@ public class FinaleMe {
 				? Boolean.parseBoolean(refMeta.get("low_coverage")) : lowCoverage;
 		Integer adaptedFeatures = refMeta.containsKey("features")
 				? Integer.parseInt(refMeta.get("features")) : features;
+		String adaptedBaseQTransform = refMeta.containsKey("baseq_transform")
+				? refMeta.get("baseq_transform")
+				: (adaptedUseBaseQ ? baseQTransform : null);
 		writeModelMeta(adaptedModelTmp.getAbsolutePath(), adaptedDistCol,
-				adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov, adaptedFeatures);
+				adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov, adaptedFeatures,
+				adaptedBaseQTransform);
 		File adaptedTmpMeta = new File(modelMetaPath(adaptedModelTmp.getAbsolutePath()));
 		adaptedTmpMeta.deleteOnExit();
 
@@ -4072,7 +4242,8 @@ public class FinaleMe {
 				new File(saveAdaptedModel).toPath(),
 				java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 			writeModelMeta(saveAdaptedModel, adaptedDistCol,
-					adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov, adaptedFeatures);
+					adaptedUseMotif, adaptedUseBaseQ, adaptedLowCov,
+					adaptedFeatures, adaptedBaseQTransform);
 			log.info("Adapted model saved to: " + saveAdaptedModel +
 					" (with metadata sidecar)");
 		}
