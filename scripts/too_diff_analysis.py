@@ -426,11 +426,36 @@ def permutation_pvalues(
     for ct in cell_types:
         counts[ct] = 0 if test == "omnibus" else {}
 
+    # Pre-seed pairwise level counts to 0 for every observed (cell_type, level)
+    # pair, so cell types where NO permutation beats |t_obs| still get
+    # p = 1/(N+1) rather than NaN from a missing dict key.
+    if test != "omnibus":
+        for res in obs_results:
+            ct = res["cell_type"]
+            lvl = res.get("level")
+            if lvl is not None and ct in counts:
+                counts[ct].setdefault(lvl, 0)
+
+    # Preserve the Categorical dtype (with the user's --reference-group
+    # ordering) across permutations. A plain numpy assignment would coerce
+    # to object dtype, after which Patsy reverts to alphabetical ordering
+    # and the reference level changes — making the per-level counts diverge
+    # from the observed-statistic keys and yielding NaN p-values.
+    group_series = df[group_col]
+    is_categorical = isinstance(group_series.dtype, pd.CategoricalDtype)
+    group_categories = group_series.cat.categories if is_categorical else None
+    group_vals = group_series.to_numpy(copy=True)
+
     df_perm = df.copy()
-    group_vals = df[group_col].to_numpy(copy=True)
 
     for b in range(n_perm):
-        df_perm[group_col] = rng.permutation(group_vals)
+        perm_arr = rng.permutation(group_vals)
+        if is_categorical:
+            df_perm[group_col] = pd.Categorical(
+                perm_arr, categories=group_categories
+            )
+        else:
+            df_perm[group_col] = perm_arr
         for ct in cell_types:
             try:
                 res = fit_one_celltype(
