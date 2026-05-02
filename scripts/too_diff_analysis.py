@@ -385,6 +385,7 @@ def permutation_pvalues(
     n_perm: int,
     seed: int,
     verbose: bool = False,
+    n_jobs: int = 1,
 ) -> dict:
     """Compute empirical p-values by permuting the group-label column.
 
@@ -402,13 +403,17 @@ def permutation_pvalues(
     or empirical-Bayes p-values as the primary, and treat permutation
     as a robustness check.
 
+    Determinism: results are reproducible for a fixed combination of
+    (--permutations, --permutation-seed, --threads). Changing --threads
+    re-shards the B permutations across workers and therefore samples a
+    different set of permuted label vectors — output p-values will agree
+    statistically but not bit-identically across thread counts. Differences
+    are bounded by Monte Carlo SE ≈ sqrt(p(1-p)/B).
+
     Returns dict mapping cell_type -> p-value (omnibus) or
     cell_type -> {level: p-value} (pairwise).
     """
-    rng = np.random.default_rng(seed)
-
     # Build observed-statistic lookup from the already-fit results.
-    # obs_results matches the row layout of `results` dataframe.
     obs_stats: dict = {}
     for res in obs_results:
         if test == "omnibus":
@@ -422,20 +427,6 @@ def permutation_pvalues(
                                        and np.isfinite(beta)) else float("nan")
             obs_stats.setdefault(ct, {})[lvl] = t_obs
 
-    counts: dict = {}
-    for ct in cell_types:
-        counts[ct] = 0 if test == "omnibus" else {}
-
-    # Pre-seed pairwise level counts to 0 for every observed (cell_type, level)
-    # pair, so cell types where NO permutation beats |t_obs| still get
-    # p = 1/(N+1) rather than NaN from a missing dict key.
-    if test != "omnibus":
-        for res in obs_results:
-            ct = res["cell_type"]
-            lvl = res.get("level")
-            if lvl is not None and ct in counts:
-                counts[ct].setdefault(lvl, 0)
-
     # Preserve the Categorical dtype (with the user's --reference-group
     # ordering) across permutations. A plain numpy assignment would coerce
     # to object dtype, after which Patsy reverts to alphabetical ordering
@@ -443,12 +434,116 @@ def permutation_pvalues(
     # from the observed-statistic keys and yielding NaN p-values.
     group_series = df[group_col]
     is_categorical = isinstance(group_series.dtype, pd.CategoricalDtype)
-    group_categories = group_series.cat.categories if is_categorical else None
-    group_vals = group_series.to_numpy(copy=True)
+    group_categories = (
+        list(group_series.cat.categories) if is_categorical else None
+    )
+
+    # Initialize merged-counts skeleton (also pre-seeds every observed
+    # (cell_type, level) pair to 0 so cell types with zero hits still get
+    # p = 1/(N+1) rather than a missing dict key).
+    counts: dict = {}
+    for ct in cell_types:
+        counts[ct] = 0 if test == "omnibus" else {}
+    if test != "omnibus":
+        for res in obs_results:
+            ct = res["cell_type"]
+            lvl = res.get("level")
+            if lvl is not None and ct in counts:
+                counts[ct].setdefault(lvl, 0)
+
+    # Shard permutations across workers. Each worker gets an independent
+    # PCG64 stream seeded from `seed + i` so the union over chunks is a
+    # reproducible sequence (same total seed → same merged counts) and
+    # different chunks can't alias the same permutations.
+    n_jobs = max(1, int(n_jobs))
+    base_chunk = n_perm // n_jobs
+    remainder = n_perm % n_jobs
+    chunk_sizes = [base_chunk + (1 if i < remainder else 0) for i in range(n_jobs)]
+    chunk_sizes = [c for c in chunk_sizes if c > 0]
+
+    worker_args = [
+        (df, group_col, covariates, test, weights, cell_types,
+         obs_stats, group_categories, chunk_n, seed + 100003 * i)
+        for i, chunk_n in enumerate(chunk_sizes)
+    ]
+
+    def _merge(partial: dict) -> None:
+        for ct, val in partial.items():
+            if test == "omnibus":
+                counts[ct] = counts.get(ct, 0) + val
+            else:
+                bucket = counts.setdefault(ct, {})
+                for lvl, c in val.items():
+                    bucket[lvl] = bucket.get(lvl, 0) + c
+
+    if n_jobs == 1 or len(worker_args) == 1:
+        # In-process path — no pickling overhead.
+        for i, args in enumerate(worker_args):
+            partial = _permutation_chunk_worker(args)
+            _merge(partial)
+            if verbose:
+                print(
+                    f"  permutation chunk {i + 1}/{len(worker_args)} "
+                    f"({chunk_sizes[i]} perms) done",
+                    file=sys.stderr,
+                )
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        if verbose:
+            print(
+                f"  dispatching {n_perm} permutations across {n_jobs} workers "
+                f"({len(worker_args)} chunks)",
+                file=sys.stderr,
+            )
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = {ex.submit(_permutation_chunk_worker, a): i
+                       for i, a in enumerate(worker_args)}
+            done = 0
+            for fut in as_completed(futures):
+                partial = fut.result()
+                _merge(partial)
+                done += 1
+                if verbose:
+                    print(
+                        f"  chunk {done}/{len(worker_args)} done",
+                        file=sys.stderr,
+                    )
+
+    pvals: dict = {}
+    for ct in cell_types:
+        if test == "omnibus":
+            pvals[ct] = (counts[ct] + 1) / (n_perm + 1)
+        else:
+            pvals[ct] = {
+                lvl: (c + 1) / (n_perm + 1) for lvl, c in counts[ct].items()
+            }
+    return pvals
+
+
+def _permutation_chunk_worker(args: tuple) -> dict:
+    """Module-level worker for ProcessPoolExecutor: run `n_chunk` permutations
+    and return per-(cell_type, level) hit counts.
+
+    Defined at module level (not as a closure) so it pickles cleanly under
+    spawn-based multiprocessing on macOS / Windows.
+    """
+    (df, group_col, covariates, test, weights, cell_types,
+     obs_stats, group_categories, n_chunk, seed) = args
+
+    rng = np.random.default_rng(seed)
+    is_categorical = group_categories is not None
+    # Permute on the underlying labels; we re-wrap as Categorical below.
+    group_vals = df[group_col].astype(object).to_numpy(copy=True)
+
+    counts: dict = {ct: (0 if test == "omnibus" else {}) for ct in cell_types}
+    if test != "omnibus":
+        for ct, level_map in obs_stats.items():
+            if ct in counts:
+                for lvl in level_map:
+                    counts[ct].setdefault(lvl, 0)
 
     df_perm = df.copy()
-
-    for b in range(n_perm):
+    for _ in range(n_chunk):
         perm_arr = rng.permutation(group_vals)
         if is_categorical:
             df_perm[group_col] = pd.Categorical(
@@ -481,18 +576,7 @@ def permutation_pvalues(
                     t_obs = obs_stats.get(ct, {}).get(lvl, float("nan"))
                     if np.isfinite(t_perm) and np.isfinite(t_obs) and t_perm >= t_obs:
                         counts[ct][lvl] = counts[ct].get(lvl, 0) + 1
-        if verbose and (b + 1) % max(1, n_perm // 10) == 0:
-            print(f"  permutation {b + 1}/{n_perm}", file=sys.stderr)
-
-    pvals: dict = {}
-    for ct in cell_types:
-        if test == "omnibus":
-            pvals[ct] = (counts[ct] + 1) / (n_perm + 1)
-        else:
-            pvals[ct] = {
-                lvl: (c + 1) / (n_perm + 1) for lvl, c in counts[ct].items()
-            }
-    return pvals
+    return counts
 
 
 # -------- BH FDR correction (no scipy.stats.false_discovery_control dep) ---
@@ -649,6 +733,16 @@ def main() -> int:
         type=int,
         default=0,
         help="RNG seed for --permutations (default: 0, deterministic).",
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Parallelize the permutation null across N processes "
+             "(ProcessPoolExecutor). Each worker runs an independent shard "
+             "of the B permutations and counts are merged at the end. "
+             "Speedup is roughly linear up to physical core count. "
+             "Only used when --permutations > 0. Default: 1 (single-process).",
     )
     p.add_argument(
         "--output",
@@ -891,6 +985,7 @@ def main() -> int:
             n_perm=args.permutations,
             seed=args.permutation_seed,
             verbose=args.verbose,
+            n_jobs=args.threads,
         )
         if args.test == "omnibus":
             results["p_value_perm"] = results["cell_type"].map(perm_p)
