@@ -285,17 +285,58 @@ def _strip_level(term: str, group_pattern: str) -> str:
 
 # -------- Empirical-Bayes variance shrinkage (limma / Smyth 2004) ----------
 
-def smyth_eb_prior(s2: np.ndarray, df: np.ndarray) -> tuple[float, float]:
-    """Estimate the prior variance s0^2 and prior degrees of freedom d0
-    from a vector of per-cell-type residual variances and df.
+def _winsorize(arr: np.ndarray, k: float = 1.5) -> np.ndarray:
+    """Symmetric IQR-based Winsorization: clip values outside median +- k*IQR."""
+    arr = np.asarray(arr, dtype=float)
+    if arr.size < 4:
+        return arr
+    q1, q3 = np.percentile(arr, [25, 75])
+    iqr = q3 - q1
+    if not np.isfinite(iqr) or iqr <= 0:
+        return arr
+    med = float(np.median(arr))
+    lo = med - k * iqr
+    hi = med + k * iqr
+    return np.clip(arr, lo, hi)
 
-    Implements Smyth 2004 (limma) — fits a scaled chi-square prior to the
-    observed residual variances on the log scale, using the trigamma
-    moment-matching equation
+
+def _solve_d0_from_target(target: float) -> float:
+    """Solve trigamma(d0/2) = target for d0. Returns inf when degenerate."""
+    if target <= 0:
+        return float("inf")
+
+    def f(x):
+        return float(_polygamma(1, x)) - target
+
+    try:
+        if f(1e-3) * f(1e6) > 0:
+            return float("inf")
+        x = _brentq(f, 1e-3, 1e6, xtol=1e-6)
+    except Exception:
+        return float("inf")
+    return 2.0 * float(x)
+
+
+def smyth_eb_prior(
+    s2: np.ndarray, df: np.ndarray, robust: bool = False
+) -> tuple[float, float]:
+    """Estimate the pooled prior variance s0^2 and prior df d0 from a vector
+    of per-cell-type residual variances and df (Smyth 2004 limma).
+
+    Fits a scaled chi-square prior to the observed residual variances on
+    the log scale via the trigamma moment-matching equation
         var(log s2) - mean(trigamma(df/2)) = trigamma(d0/2)
-    Returns (s0_sq, d0). Falls back to (mean(s2), inf) — i.e. infinite
-    shrinkage to the pooled mean — when the moment estimator is degenerate
-    (very few cell types or near-uniform variances).
+
+    When `robust=True`, the prior moments (e_mean, e_var) are estimated on
+    the IQR-Winsorized e-vector — so a few extreme variances do not pull
+    the prior (Phipson, Lee, Majewski, Alexander, Smyth 2016). Useful when
+    one or two cell types have anomalously large/small residual variances
+    that would otherwise inflate d0 toward infinity (over-shrinkage) or
+    pull d0 toward zero (no shrinkage).
+
+    Falls back to (mean(s2), inf) — i.e. infinite shrinkage to the pooled
+    mean — when the moment estimator is degenerate (fewer than 3 cell
+    types or near-uniform variances).
     """
     s2 = np.asarray(s2, dtype=float)
     df = np.asarray(df, dtype=float)
@@ -307,27 +348,98 @@ def smyth_eb_prior(s2: np.ndarray, df: np.ndarray) -> tuple[float, float]:
     dfv = df[valid]
     z = np.log(s2v)
     e = z - _digamma(dfv / 2.0) + np.log(dfv / 2.0)
-    e_mean = float(e.mean())
-    e_var = float(e.var(ddof=1))
+    e_for_moments = _winsorize(e) if robust else e
+    e_mean = float(e_for_moments.mean())
+    e_var = float(e_for_moments.var(ddof=1))
     target = e_var - float(_polygamma(1, dfv / 2.0).mean())
-    if target <= 0:
-        # Observed between-cell-type variance is fully explained by within-
-        # group sampling noise → prior is infinitely informative.
+    d0 = _solve_d0_from_target(target)
+    if not np.isfinite(d0):
         return float(np.exp(e_mean)), float("inf")
-    # Solve trigamma(x) = target for x = d0/2. Trigamma is strictly
-    # decreasing on (0, inf), so we can bracket the root.
-    def f(x):
-        return float(_polygamma(1, x)) - target
-    try:
-        if f(1e-3) * f(1e6) > 0:
-            return float(np.exp(e_mean)), float("inf")
-        x = _brentq(f, 1e-3, 1e6, xtol=1e-6)
-    except Exception:
-        return float(np.exp(e_mean)), float("inf")
-    d0 = 2.0 * float(x)
+    x = d0 / 2.0
     log_s0_sq = e_mean + float(_digamma(x)) - float(np.log(x))
-    s0_sq = float(np.exp(log_s0_sq))
-    return s0_sq, d0
+    return float(np.exp(log_s0_sq)), d0
+
+
+def smyth_eb_prior_trended(
+    s2: np.ndarray,
+    df: np.ndarray,
+    abundance: np.ndarray,
+    lowess_frac: float = 0.5,
+    robust: bool = False,
+) -> tuple[np.ndarray, float]:
+    """Trended Smyth prior (limma `eBayes(trend=TRUE)`, Smyth 2009): fits
+    a smooth function f(abundance) to the per-cell-type log residual
+    variance, so each cell type gets its own prior mean s0^2_c instead
+    of pooling toward a single global mean.
+
+    Use this when residual variances are systematically heterogeneous
+    across cell types — e.g. when rare cell types live near the CLR eps
+    floor and have structurally larger variance than dominant lineages.
+    Pooled EB then over-shrinks the high-variance cell types (false
+    positives) and under-shrinks the low-variance ones (false negatives);
+    the trend absorbs that systematic structure.
+
+    Implementation: e_c = log(s2_c) - digamma(df_c/2) + log(df_c/2) is
+    the bias-corrected log-variance. We fit lowess(e ~ abundance) to get
+    a smoothed mean; d0 is estimated from the residuals around the trend
+    via the same trigamma identity. Per-cell-type s0^2_c is then backed
+    out from the smoothed e-values using the d0 correction:
+        log(s0^2_c) = smoothed_c - digamma(d0/2) + log(d0/2).
+
+    `robust=True` Winsorizes the post-trend residuals before fitting d0,
+    matching the rationale of the pooled robust path.
+
+    Returns (s0_sq_per_celltype_array, d0_scalar). The array is aligned
+    with the input `s2` order; positions where validation failed get
+    s0^2 = NaN and the caller should fall back to the pooled value or
+    skip moderation for that row.
+    """
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+
+    s2 = np.asarray(s2, dtype=float)
+    df = np.asarray(df, dtype=float)
+    abundance = np.asarray(abundance, dtype=float)
+    valid = (
+        (s2 > 0) & np.isfinite(s2) & np.isfinite(df) & (df > 0)
+        & np.isfinite(abundance)
+    )
+    if valid.sum() < 5:
+        # Too few cell types for a meaningful trend. Fall back to pooled.
+        s0_pool, d0 = smyth_eb_prior(s2, df, robust=robust)
+        return np.full(s2.shape, s0_pool, dtype=float), d0
+
+    s2v, dfv, abv = s2[valid], df[valid], abundance[valid]
+    z = np.log(s2v)
+    e = z - _digamma(dfv / 2.0) + np.log(dfv / 2.0)
+    # lowess returns smoothed values aligned with the input order when
+    # return_sorted=False.
+    smoothed = lowess(e, abv, frac=lowess_frac, return_sorted=False)
+    smoothed = np.asarray(smoothed, dtype=float)
+    if not np.all(np.isfinite(smoothed)):
+        # Lowess failed (e.g. too few unique abundance values). Fall back.
+        s0_pool, d0 = smyth_eb_prior(s2, df, robust=robust)
+        return np.full(s2.shape, s0_pool, dtype=float), d0
+
+    # Estimate d0 from the post-detrending residual variance, optionally
+    # Winsorized for robustness against outlier cell types.
+    resid = e - smoothed
+    resid_for_moments = _winsorize(resid) if robust else resid
+    target = float(resid_for_moments.var(ddof=1)) - float(
+        _polygamma(1, dfv / 2.0).mean()
+    )
+    d0 = _solve_d0_from_target(target)
+
+    # Back out per-cell-type s0^2 from the smoothed e-values.
+    if np.isfinite(d0):
+        x = d0 / 2.0
+        log_s0_sq = smoothed - float(_digamma(x)) + float(np.log(x))
+    else:
+        # Infinite-prior limit: correction term -> 0, s0^2_c = exp(smoothed_c).
+        log_s0_sq = smoothed
+
+    s0_sq_full = np.full(s2.shape, np.nan, dtype=float)
+    s0_sq_full[valid] = np.exp(log_s0_sq)
+    return s0_sq_full, d0
 
 
 def moderated_t_pvalue(
@@ -719,6 +831,34 @@ def main() -> int:
              "are kept in 'p_value_unshrunk'.",
     )
     p.add_argument(
+        "--eb-trend",
+        action="store_true",
+        help="Trended EB (limma 'trend=TRUE', Smyth 2009): instead of "
+             "pooling toward a single global prior mean, fit a lowess "
+             "smoother of log(s^2) vs log(mean proportion) and shrink each "
+             "cell type toward its trended prior. Strongly recommended when "
+             "rare and dominant cell types coexist (rare ones have "
+             "structurally larger CLR variance, so a pooled prior over- "
+             "shrinks them). No effect without --empirical-bayes.",
+    )
+    p.add_argument(
+        "--eb-trend-frac",
+        type=float,
+        default=0.5,
+        help="lowess span for --eb-trend (fraction of cell types in each "
+             "local fit). Default 0.5; raise toward 1.0 for very smooth "
+             "trends with few cell types. No effect without --eb-trend.",
+    )
+    p.add_argument(
+        "--eb-robust",
+        action="store_true",
+        help="Robust prior fitting (limma 'robust=TRUE', Phipson et al. "
+             "2016): IQR-Winsorize the e-vector (or post-trend residuals "
+             "when combined with --eb-trend) before estimating d0, so a "
+             "few cell types with anomalously large/small variance do not "
+             "drag the prior. No effect without --empirical-bayes.",
+    )
+    p.add_argument(
         "--permutations",
         type=int,
         default=0,
@@ -933,37 +1073,88 @@ def main() -> int:
         prior_table = (
             results[["cell_type", "s2_resid", "df_resid"]]
             .drop_duplicates("cell_type")
+            .reset_index(drop=True)
         )
-        s0_sq, d0 = smyth_eb_prior(
-            prior_table["s2_resid"].to_numpy(),
-            prior_table["df_resid"].to_numpy(),
-        )
-        if args.verbose:
-            print(
-                f"EB prior (Smyth): s0^2={s0_sq:.4g}, d0={d0:.4g}, "
-                f"n_celltypes={len(prior_table)}",
-                file=sys.stderr,
+        s2_arr = prior_table["s2_resid"].to_numpy()
+        df_arr = prior_table["df_resid"].to_numpy()
+
+        if args.eb_trend:
+            # Per-cell-type abundance covariate for the variance trend:
+            # log mean proportion across samples (post-prevalence-filter).
+            # Add a small floor to avoid -inf when a cell type is at the
+            # eps boundary in every sample.
+            mean_prop = w.reindex(columns=prior_table["cell_type"]).mean(
+                axis=0
             )
+            abundance = np.log(mean_prop.to_numpy() + 1e-8)
+            s0_sq_arr, d0 = smyth_eb_prior_trended(
+                s2_arr, df_arr, abundance,
+                lowess_frac=args.eb_trend_frac,
+                robust=args.eb_robust,
+            )
+            # Fall back to pooled value for any NaN positions (e.g. the
+            # cell type was filtered as invalid by the trend estimator).
+            if np.isnan(s0_sq_arr).any():
+                pool_s0, _ = smyth_eb_prior(
+                    s2_arr, df_arr, robust=args.eb_robust
+                )
+                s0_sq_arr = np.where(
+                    np.isnan(s0_sq_arr), pool_s0, s0_sq_arr
+                )
+            mode_label = (
+                f"trended (frac={args.eb_trend_frac:.2g})"
+                + (", robust" if args.eb_robust else "")
+            )
+            if args.verbose:
+                lo, hi = float(np.min(s0_sq_arr)), float(np.max(s0_sq_arr))
+                print(
+                    f"EB prior {mode_label}: s0^2 range=[{lo:.4g}, {hi:.4g}], "
+                    f"d0={d0:.4g}, n_celltypes={len(prior_table)}",
+                    file=sys.stderr,
+                )
+        else:
+            s0_pool, d0 = smyth_eb_prior(
+                s2_arr, df_arr, robust=args.eb_robust
+            )
+            s0_sq_arr = np.full_like(s2_arr, s0_pool, dtype=float)
+            mode_label = "pooled" + (", robust" if args.eb_robust else "")
+            if args.verbose:
+                print(
+                    f"EB prior {mode_label}: s0^2={s0_pool:.4g}, d0={d0:.4g}, "
+                    f"n_celltypes={len(prior_table)}",
+                    file=sys.stderr,
+                )
+
+        # Map cell_type -> per-cell-type s0^2 so pairwise rows (multiple
+        # rows per cell type) all see the same value.
+        s0_lookup = dict(zip(prior_table["cell_type"], s0_sq_arr))
+
         results["p_value_unshrunk"] = results["p_value"].copy()
         new_p: list[float] = []
+        eb_s0_col: list[float] = []
         for _, row in results.iterrows():
             s2 = row["s2_resid"]
             df_r = row["df_resid"]
+            s0_sq_c = s0_lookup.get(row["cell_type"], float("nan"))
+            eb_s0_col.append(s0_sq_c)
+            if not np.isfinite(s0_sq_c):
+                new_p.append(float("nan"))
+                continue
             if args.test == "omnibus":
                 _, p_mod = moderated_F_pvalue(
                     row.get("F_stat", float("nan")),
                     row.get("df_group", float("nan")),
-                    df_r, s2, d0, s0_sq,
+                    df_r, s2, d0, s0_sq_c,
                 )
             else:
                 _, p_mod = moderated_t_pvalue(
                     row.get("effect_clr", float("nan")),
                     row.get("std_err", float("nan")),
-                    df_r, s2, d0, s0_sq,
+                    df_r, s2, d0, s0_sq_c,
                 )
             new_p.append(p_mod)
         results["p_value"] = new_p
-        results["eb_s0_sq"] = s0_sq
+        results["eb_s0_sq"] = eb_s0_col
         results["eb_d0"] = d0
 
     # ---- Permutation-based group-label null --------------------------
