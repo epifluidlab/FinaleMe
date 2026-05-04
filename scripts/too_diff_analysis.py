@@ -522,8 +522,23 @@ def permutation_pvalues(
     statistically but not bit-identically across thread counts. Differences
     are bounded by Monte Carlo SE ≈ sqrt(p(1-p)/B).
 
-    Returns dict mapping cell_type -> p-value (omnibus) or
-    cell_type -> {level: p-value} (pairwise).
+    Returns a dict with three keys, each mapping cell_type -> p (omnibus)
+    or cell_type -> {level: p} (pairwise):
+      - "perm_p":       raw permutation p, P(stat_perm >= stat_obs)
+      - "perm_p_wy":    Westfall-Young max-T FWER-adjusted p (joint null)
+      - "perm_q_pooled": SAM-style FDR (Tusher Tibshirani Chu 2001) using
+                         the pooled empirical null across cell types
+
+    The three corrections trade off differently:
+      - perm_p alone is per-test exact but ignores multiplicity
+      - BH(perm_p) (computed by the caller) is the standard FDR control
+        and is conservative under positive dependence
+      - perm_p_wy controls family-wise error using the joint null and is
+        more powerful than Bonferroni when cell types are correlated
+      - perm_q_pooled assumes test statistics are exchangeable across
+        cell types under the null (best when stats are on a common scale,
+        e.g. EB-moderated; can be anti-conservative when raw t-stats have
+        very heterogeneous scales)
     """
     # Build observed-statistic lookup from the already-fit results.
     obs_stats: dict = {}
@@ -538,6 +553,27 @@ def permutation_pvalues(
             t_obs = abs(beta / se) if (se and np.isfinite(se) and se > 0
                                        and np.isfinite(beta)) else float("nan")
             obs_stats.setdefault(ct, {})[lvl] = t_obs
+
+    # Canonical (cell_type, level) ordering for the per-permutation
+    # statistic matrix that workers will fill column-wise. For omnibus,
+    # level is None.
+    pair_keys: list = []
+    obs_stat_vec: list = []
+    if test == "omnibus":
+        for ct in cell_types:
+            pair_keys.append((ct, None))
+            obs_stat_vec.append(obs_stats.get(ct, float("nan")))
+    else:
+        for r in obs_results:
+            ct = r["cell_type"]
+            lvl = r.get("level")
+            if lvl is None:
+                continue
+            pair_keys.append((ct, lvl))
+            obs_stat_vec.append(
+                obs_stats.get(ct, {}).get(lvl, float("nan"))
+            )
+    obs_stat_arr = np.asarray(obs_stat_vec, dtype=float)
 
     # Preserve the Categorical dtype (with the user's --reference-group
     # ordering) across permutations. A plain numpy assignment would coerce
@@ -575,18 +611,26 @@ def permutation_pvalues(
 
     worker_args = [
         (df, group_col, covariates, test, weights, cell_types,
-         obs_stats, group_categories, chunk_n, seed + 100003 * i)
+         obs_stats, group_categories, chunk_n, seed + 100003 * i,
+         pair_keys)
         for i, chunk_n in enumerate(chunk_sizes)
     ]
 
+    # Aggregator state: counts dict (BH-source p) + concatenated
+    # per-permutation statistic matrices (for WY and SAM).
+    stat_chunks: list = []
+    max_chunks: list = []
+
     def _merge(partial: dict) -> None:
-        for ct, val in partial.items():
+        for ct, val in partial["counts"].items():
             if test == "omnibus":
                 counts[ct] = counts.get(ct, 0) + val
             else:
                 bucket = counts.setdefault(ct, {})
                 for lvl, c in val.items():
                     bucket[lvl] = bucket.get(lvl, 0) + c
+        stat_chunks.append(partial["stat_matrix"])
+        max_chunks.append(partial["max_stats"])
 
     if n_jobs == 1 or len(worker_args) == 1:
         # In-process path — no pickling overhead.
@@ -621,6 +665,7 @@ def permutation_pvalues(
                         file=sys.stderr,
                     )
 
+    # ---- BH-source p (existing) -----------------------------------
     pvals: dict = {}
     for ct in cell_types:
         if test == "omnibus":
@@ -629,18 +674,116 @@ def permutation_pvalues(
             pvals[ct] = {
                 lvl: (c + 1) / (n_perm + 1) for lvl, c in counts[ct].items()
             }
-    return pvals
+
+    # ---- Aggregate per-permutation statistic matrices --------------
+    full_stat = (
+        np.vstack(stat_chunks) if stat_chunks
+        else np.zeros((0, len(pair_keys)), dtype=float)
+    )
+    full_max = (
+        np.concatenate(max_chunks) if max_chunks
+        else np.zeros(0, dtype=float)
+    )
+
+    # ---- Westfall-Young max-T FWER -----------------------------------
+    # For each cell type c, p_WY(c) = P(max_c' |t_perm,c'| >= |t_obs,c|)
+    # under the joint null. This is exact-FWER and tends to be much more
+    # powerful than Bonferroni when cell types are correlated.
+    valid_max = full_max[np.isfinite(full_max)]
+    B_eff = int(valid_max.size)
+    wy: dict = {}
+    for i, (ct, lvl) in enumerate(pair_keys):
+        t_o = obs_stat_arr[i]
+        if not np.isfinite(t_o) or B_eff == 0:
+            p_wy = float("nan")
+        else:
+            p_wy = (int(np.sum(valid_max >= t_o)) + 1) / (B_eff + 1)
+        if test == "omnibus":
+            wy[ct] = p_wy
+        else:
+            wy.setdefault(ct, {})[lvl] = p_wy
+
+    # ---- SAM-style pooled-null FDR (Tusher Tibshirani Chu 2001) -----
+    # Builds the empirical null by pooling permutation stats across both
+    # permutations and cell types. For threshold tau,
+    #   R(tau) = #{|t_obs| >= tau across cell types}
+    #   V(tau) = (1/B) * #{|t_perm| >= tau across (perms, cell types)}
+    #   FDR(tau) = V(tau) / R(tau), monotonized so smaller |t_obs| -> larger q.
+    # Caveat: assumes test stats are exchangeable across cell types under
+    # the null. Best when used with --empirical-bayes (so stats live on a
+    # common moderated scale) or when residual variances are similar.
+    sam_q_arr = _sam_pooled_qvalues(obs_stat_arr, full_stat)
+    sam: dict = {}
+    for i, (ct, lvl) in enumerate(pair_keys):
+        if test == "omnibus":
+            sam[ct] = float(sam_q_arr[i])
+        else:
+            sam.setdefault(ct, {})[lvl] = float(sam_q_arr[i])
+
+    return {
+        "perm_p": pvals,
+        "perm_p_wy": wy,
+        "perm_q_pooled": sam,
+    }
+
+
+def _sam_pooled_qvalues(
+    obs: np.ndarray, perm_matrix: np.ndarray
+) -> np.ndarray:
+    """SAM-style FDR using the pooled-across-cell-types empirical null.
+
+    obs: shape (K,) — observed test statistics (F or |t|; non-negative).
+    perm_matrix: shape (B, K) — permutation stats with matched columns.
+                 NaNs allowed for failed fits.
+    Returns q-values shape (K,).
+    """
+    K = int(obs.size)
+    out = np.full(K, float("nan"), dtype=float)
+    if K == 0 or perm_matrix.size == 0:
+        return out
+    B = int(perm_matrix.shape[0])
+    finite_perm = perm_matrix[np.isfinite(perm_matrix)]
+    if finite_perm.size == 0:
+        return out
+    # Order cell types by observed statistic descending (largest first).
+    order = np.argsort(-obs)
+    for rank_idx, c in enumerate(order):
+        tau = obs[c]
+        if not np.isfinite(tau):
+            continue
+        # Observed positives at threshold tau.
+        R = int(np.sum(obs[np.isfinite(obs)] >= tau))
+        if R == 0:
+            out[c] = 1.0
+            continue
+        # Expected number of null positives at tau, per permutation.
+        V = float(np.sum(finite_perm >= tau)) / B
+        out[c] = float(min(V / R, 1.0))
+    # Monotonize: q at decreasing |t_obs| must be non-decreasing.
+    last_q = float("nan")
+    for c in order:
+        if not np.isfinite(out[c]):
+            continue
+        if not np.isfinite(last_q):
+            last_q = out[c]
+            continue
+        if out[c] < last_q:
+            out[c] = last_q
+        else:
+            last_q = out[c]
+    return out
 
 
 def _permutation_chunk_worker(args: tuple) -> dict:
     """Module-level worker for ProcessPoolExecutor: run `n_chunk` permutations
-    and return per-(cell_type, level) hit counts.
+    and return per-(cell_type, level) hit counts plus the full per-perm
+    statistic matrix (used downstream for Westfall-Young and SAM FDR).
 
     Defined at module level (not as a closure) so it pickles cleanly under
     spawn-based multiprocessing on macOS / Windows.
     """
     (df, group_col, covariates, test, weights, cell_types,
-     obs_stats, group_categories, n_chunk, seed) = args
+     obs_stats, group_categories, n_chunk, seed, pair_keys) = args
 
     rng = np.random.default_rng(seed)
     is_categorical = group_categories is not None
@@ -654,8 +797,14 @@ def _permutation_chunk_worker(args: tuple) -> dict:
                 for lvl in level_map:
                     counts[ct].setdefault(lvl, 0)
 
+    # Statistic matrix layout: rows = permutations, cols = pair_keys order.
+    n_pairs = len(pair_keys)
+    pair_idx = {pk: i for i, pk in enumerate(pair_keys)}
+    stat_matrix = np.full((n_chunk, n_pairs), float("nan"), dtype=float)
+    max_stats = np.full(n_chunk, float("nan"), dtype=float)
+
     df_perm = df.copy()
-    for _ in range(n_chunk):
+    for b in range(n_chunk):
         perm_arr = rng.permutation(group_vals)
         if is_categorical:
             df_perm[group_col] = pd.Categorical(
@@ -663,6 +812,7 @@ def _permutation_chunk_worker(args: tuple) -> dict:
             )
         else:
             df_perm[group_col] = perm_arr
+        running_max = float("-inf")
         for ct in cell_types:
             try:
                 res = fit_one_celltype(
@@ -673,9 +823,14 @@ def _permutation_chunk_worker(args: tuple) -> dict:
             if test == "omnibus":
                 f_perm = res.get("F_stat", float("nan"))
                 f_obs = obs_stats.get(ct, float("nan"))
-                if (np.isfinite(f_perm) and np.isfinite(f_obs)
-                        and f_perm >= f_obs):
-                    counts[ct] += 1
+                if np.isfinite(f_perm):
+                    idx = pair_idx.get((ct, None))
+                    if idx is not None:
+                        stat_matrix[b, idx] = f_perm
+                    if f_perm > running_max:
+                        running_max = f_perm
+                    if np.isfinite(f_obs) and f_perm >= f_obs:
+                        counts[ct] += 1
             else:
                 for r in res:
                     lvl = r.get("level")
@@ -685,10 +840,22 @@ def _permutation_chunk_worker(args: tuple) -> dict:
                             and np.isfinite(beta)):
                         continue
                     t_perm = abs(beta / se)
+                    idx = pair_idx.get((ct, lvl))
+                    if idx is not None:
+                        stat_matrix[b, idx] = t_perm
+                    if t_perm > running_max:
+                        running_max = t_perm
                     t_obs = obs_stats.get(ct, {}).get(lvl, float("nan"))
-                    if np.isfinite(t_perm) and np.isfinite(t_obs) and t_perm >= t_obs:
+                    if np.isfinite(t_obs) and t_perm >= t_obs:
                         counts[ct][lvl] = counts[ct].get(lvl, 0) + 1
-    return counts
+        if running_max != float("-inf"):
+            max_stats[b] = running_max
+
+    return {
+        "counts": counts,
+        "stat_matrix": stat_matrix,
+        "max_stats": max_stats,
+    }
 
 
 # -------- BH FDR correction (no scipy.stats.false_discovery_control dep) ---
@@ -1178,15 +1345,21 @@ def main() -> int:
             verbose=args.verbose,
             n_jobs=args.threads,
         )
-        if args.test == "omnibus":
-            results["p_value_perm"] = results["cell_type"].map(perm_p)
-        else:
-            results["p_value_perm"] = results.apply(
-                lambda r: perm_p.get(r["cell_type"], {}).get(
+        def _map_perm_dict(d: dict) -> "pd.Series":
+            if args.test == "omnibus":
+                return results["cell_type"].map(d)
+            return results.apply(
+                lambda r: d.get(r["cell_type"], {}).get(
                     r.get("level"), float("nan")
                 ),
                 axis=1,
             )
+
+        results["p_value_perm"] = _map_perm_dict(perm_p["perm_p"])
+        results["p_value_perm_wy"] = _map_perm_dict(perm_p["perm_p_wy"])
+        results["q_value_perm_pooled"] = _map_perm_dict(
+            perm_p["perm_q_pooled"]
+        )
         results["q_value_perm"] = bh_correct(
             results["p_value_perm"].to_numpy()
         )
