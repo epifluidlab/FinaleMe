@@ -858,6 +858,292 @@ def _permutation_chunk_worker(args: tuple) -> dict:
     }
 
 
+# -------- ALDEx2-style Monte Carlo over bootstrap CIs ---------------------
+
+def _apply_eb_inline(
+    rows: list, w: pd.DataFrame, test: str, eb_config: dict
+) -> list:
+    """Apply EB variance shrinkage in-place to a list of fit-row dicts.
+
+    Mirrors the EB block in main() but as a pure function callable from
+    workers. Recomputes p_value using moderated_t / moderated_F and
+    annotates rows with eb_s0_sq, eb_d0, p_value_unshrunk.
+    """
+    if not rows:
+        return rows
+    table = pd.DataFrame(rows).drop_duplicates("cell_type").reset_index(drop=True)
+    s2_arr = table["s2_resid"].to_numpy()
+    df_arr = table["df_resid"].to_numpy()
+    if eb_config.get("trend"):
+        mean_prop = w.reindex(columns=table["cell_type"]).mean(axis=0)
+        abundance = np.log(mean_prop.to_numpy() + 1e-8)
+        s0_arr, d0 = smyth_eb_prior_trended(
+            s2_arr, df_arr, abundance,
+            lowess_frac=eb_config.get("trend_frac", 0.5),
+            robust=eb_config.get("robust", False),
+        )
+        if np.isnan(s0_arr).any():
+            pool, _ = smyth_eb_prior(
+                s2_arr, df_arr, robust=eb_config.get("robust", False)
+            )
+            s0_arr = np.where(np.isnan(s0_arr), pool, s0_arr)
+    else:
+        pool, d0 = smyth_eb_prior(
+            s2_arr, df_arr, robust=eb_config.get("robust", False)
+        )
+        s0_arr = np.full_like(s2_arr, pool, dtype=float)
+    s0_lookup = dict(zip(table["cell_type"], s0_arr))
+    for r in rows:
+        s2 = r.get("s2_resid", float("nan"))
+        dfr = r.get("df_resid", float("nan"))
+        s0 = s0_lookup.get(r["cell_type"], float("nan"))
+        r["eb_s0_sq"] = float(s0) if np.isfinite(s0) else float("nan")
+        r["eb_d0"] = float(d0)
+        r["p_value_unshrunk"] = r.get("p_value", float("nan"))
+        if not np.isfinite(s0):
+            r["p_value"] = float("nan")
+            continue
+        if test == "omnibus":
+            _, p_mod = moderated_F_pvalue(
+                r.get("F_stat", float("nan")),
+                r.get("df_group", float("nan")),
+                dfr, s2, d0, float(s0),
+            )
+        else:
+            _, p_mod = moderated_t_pvalue(
+                r.get("effect_clr", float("nan")),
+                r.get("std_err", float("nan")),
+                dfr, s2, d0, float(s0),
+            )
+        r["p_value"] = p_mod
+    return rows
+
+
+def _aldex_mc_worker(args: tuple) -> list:
+    """Worker for ALDEx2 MC: redo CLR + per-cell-type OLS (+ optional EB) on
+    one Monte Carlo replicate of the (samples x cell_types) proportion
+    matrix. Module-level so it pickles cleanly under spawn-based MP.
+    """
+    (w_array, sample_idx, cell_types, metadata, group_col,
+     covariates, test, weights_arr, group_categories,
+     clr_eps, eb_config) = args
+
+    w_rep = pd.DataFrame(w_array, index=sample_idx, columns=cell_types)
+    w_clr_rep = clr_transform(w_rep, eps=clr_eps)
+
+    meta = metadata.copy()
+    if group_categories is not None and group_col in meta.columns:
+        meta[group_col] = pd.Categorical(
+            meta[group_col].astype(object), categories=group_categories
+        )
+
+    common = w_clr_rep.index.intersection(meta.index)
+    df = w_clr_rep.loc[common].join(meta.loc[common])
+    needed = [group_col] + covariates
+    df = df.dropna(subset=needed)
+
+    weights = None
+    if weights_arr is not None:
+        weights = pd.Series(weights_arr, index=sample_idx).reindex(df.index)
+
+    rows: list = []
+    for ct in cell_types:
+        if ct not in df.columns:
+            continue
+        try:
+            res = fit_one_celltype(ct, df, group_col, covariates, test, weights)
+        except Exception:
+            continue
+        if isinstance(res, dict):
+            rows.append(res)
+        else:
+            rows.extend(res)
+
+    if eb_config is not None and rows:
+        try:
+            rows = _apply_eb_inline(rows, w_rep, test, eb_config)
+        except Exception:
+            # If EB fails on a particular replicate (e.g. lowess failure),
+            # fall through with raw OLS p-values rather than dropping the
+            # replicate entirely.
+            pass
+
+    return rows
+
+
+def run_aldex_mc(
+    w_point: pd.DataFrame,
+    ci_lower_df: pd.DataFrame,
+    ci_upper_df: pd.DataFrame,
+    metadata: pd.DataFrame,
+    group_col: str,
+    covariates: list,
+    test: str,
+    weights: Optional[pd.Series],
+    group_categories: Optional[list],
+    clr_eps: float,
+    eb_config: Optional[dict],
+    n_mc: int,
+    seed: int,
+    n_jobs: int,
+    fdr_alpha: float,
+    eps_floor: float = 1e-6,
+    verbose: bool = False,
+) -> dict:
+    """Run M Monte Carlo replicates over the bootstrap CIs and aggregate.
+
+    Sampling model: per (sample, cell_type), draw
+        proportion_replicate ~ Normal(point, SD)
+    where SD = (CI_upper - CI_lower) / 3.92 (Wald approximation to a 95%
+    CI). Replicates are clipped to [eps_floor, inf) and renormalized to
+    sum to 1 per sample, so they live on the simplex. This is the same
+    Gaussian-on-CLR-implied-by-Wald-CI approximation that ALDEx2 uses
+    internally when it lacks raw counts.
+
+    Each replicate is passed through the same CLR + per-cell-type OLS/WLS
+    + (optional) EB shrinkage pipeline as the point-estimate baseline.
+    Permutation is NOT redone per replicate (would be B*M fits) — use
+    the point-estimate permutation null instead.
+
+    Returns a dict mapping aggregator name -> {(cell_type, level): value}:
+        effect_median, effect_iqr, p_median, p_max, p_stability
+    """
+    rng = np.random.default_rng(seed)
+    sample_idx = list(w_point.index)
+    cell_types = list(w_point.columns)
+    n_samples = len(sample_idx)
+    n_cells = len(cell_types)
+
+    ci_lo = ci_lower_df.reindex(index=sample_idx, columns=cell_types).to_numpy()
+    ci_hi = ci_upper_df.reindex(index=sample_idx, columns=cell_types).to_numpy()
+    sd_arr = (ci_hi - ci_lo) / 3.92
+    sd_arr = np.where(np.isfinite(sd_arr) & (sd_arr > 0), sd_arr, 0.0)
+    w_arr = w_point.to_numpy()
+
+    weights_arr = (
+        weights.reindex(sample_idx).to_numpy()
+        if weights is not None else None
+    )
+
+    if verbose:
+        nz_frac = float((sd_arr > 0).mean())
+        print(
+            f"  MC sampling: SD>0 in {nz_frac:.0%} of (sample, cell-type) "
+            f"cells; mean SD={float(sd_arr[sd_arr>0].mean()) if nz_frac > 0 else 0:.3g}",
+            file=sys.stderr,
+        )
+
+    # Pre-generate the M w-replicates upfront. Memory at M=128, n=10, K=25:
+    # 128 * 250 * 8 = 256 KB. Trivial.
+    rep_seeds = rng.integers(0, 2**31 - 1, size=n_mc)
+    w_replicates: list = []
+    for m in range(n_mc):
+        rng_m = np.random.default_rng(int(rep_seeds[m]))
+        noise = rng_m.normal(0.0, sd_arr, size=(n_samples, n_cells))
+        rep = np.clip(w_arr + noise, eps_floor, None)
+        rep = rep / rep.sum(axis=1, keepdims=True)
+        w_replicates.append(rep)
+
+    worker_args = [
+        (w_replicates[m], sample_idx, cell_types, metadata, group_col,
+         covariates, test, weights_arr, group_categories,
+         clr_eps, eb_config)
+        for m in range(n_mc)
+    ]
+
+    rep_results: list = [None] * n_mc
+    n_jobs = max(1, int(n_jobs))
+    if n_jobs == 1 or n_mc <= 1:
+        for i, a in enumerate(worker_args):
+            rep_results[i] = _aldex_mc_worker(a)
+            if verbose and (i + 1) % max(1, n_mc // 10) == 0:
+                print(f"  MC replicate {i + 1}/{n_mc} done", file=sys.stderr)
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        if verbose:
+            print(
+                f"  dispatching {n_mc} MC replicates across {n_jobs} workers",
+                file=sys.stderr,
+            )
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = {
+                ex.submit(_aldex_mc_worker, a): i
+                for i, a in enumerate(worker_args)
+            }
+            count = 0
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    rep_results[i] = fut.result()
+                except Exception as exc:
+                    if verbose:
+                        print(
+                            f"  MC replicate {i} failed: {exc}",
+                            file=sys.stderr,
+                        )
+                    rep_results[i] = []
+                count += 1
+                if verbose and count % max(1, n_mc // 10) == 0:
+                    print(
+                        f"  MC replicate {count}/{n_mc} done",
+                        file=sys.stderr,
+                    )
+
+    # ---- Aggregate per-(cell_type, level) across replicates ---------
+    keys: list = []
+    effects: dict = {}
+    pvals: dict = {}
+    for rep in rep_results:
+        if not rep:
+            continue
+        for r in rep:
+            ct = r.get("cell_type")
+            lvl = r.get("level") if test != "omnibus" else None
+            key = (ct, lvl)
+            if key not in effects:
+                keys.append(key)
+                effects[key] = []
+                pvals[key] = []
+            if test == "omnibus":
+                eff = r.get("F_stat", float("nan"))
+            else:
+                eff = r.get("effect_clr", float("nan"))
+            effects[key].append(float(eff) if eff is not None else float("nan"))
+            p = r.get("p_value", float("nan"))
+            pvals[key].append(float(p) if p is not None else float("nan"))
+
+    eff_med, eff_iqr, p_med, p_max, p_stab = {}, {}, {}, {}, {}
+    for key in keys:
+        e_arr = np.asarray(effects[key], dtype=float)
+        p_arr = np.asarray(pvals[key], dtype=float)
+        e_fin = e_arr[np.isfinite(e_arr)]
+        p_fin = p_arr[np.isfinite(p_arr)]
+        if e_fin.size:
+            eff_med[key] = float(np.median(e_fin))
+            eff_iqr[key] = float(
+                np.percentile(e_fin, 75) - np.percentile(e_fin, 25)
+            )
+        else:
+            eff_med[key] = float("nan")
+            eff_iqr[key] = float("nan")
+        if p_fin.size:
+            p_med[key] = float(np.median(p_fin))
+            p_max[key] = float(np.max(p_fin))
+            p_stab[key] = float((p_fin < fdr_alpha).mean())
+        else:
+            p_med[key] = float("nan")
+            p_max[key] = float("nan")
+            p_stab[key] = float("nan")
+
+    return {
+        "effect_median": eff_med,
+        "effect_iqr": eff_iqr,
+        "p_median": p_med,
+        "p_max": p_max,
+        "p_stability": p_stab,
+    }
+
+
 # -------- BH FDR correction (no scipy.stats.false_discovery_control dep) ---
 
 def bh_correct(p: np.ndarray) -> np.ndarray:
@@ -1040,6 +1326,28 @@ def main() -> int:
         type=int,
         default=0,
         help="RNG seed for --permutations (default: 0, deterministic).",
+    )
+    p.add_argument(
+        "--aldex-mc",
+        type=int,
+        default=0,
+        help="If >0, run ALDEx2-style Monte Carlo aggregation: sample M "
+             "replicates of the (samples x cell-types) proportion matrix "
+             "from the bootstrap CIs of BetaValueDeconvolution, redo the "
+             "regression on each, and aggregate effect/p-value across "
+             "replicates. Adds columns effect_clr_mc_median, "
+             "effect_clr_mc_iqr, p_value_mc (= median p across replicates, "
+             "the 'expected p'), p_value_mc_max, p_value_mc_stability "
+             "(fraction of replicates with p<fdr_alpha), q_value_mc. "
+             "Composes with --empirical-bayes (each replicate gets its own "
+             "EB prior). Recommended M=128. Requires CI_lower/CI_upper in "
+             "the deconv input. Default: 0 (off).",
+    )
+    p.add_argument(
+        "--aldex-mc-seed",
+        type=int,
+        default=0,
+        help="RNG seed for --aldex-mc (default: 0, deterministic).",
     )
     p.add_argument(
         "--threads",
@@ -1323,6 +1631,111 @@ def main() -> int:
         results["p_value"] = new_p
         results["eb_s0_sq"] = eb_s0_col
         results["eb_d0"] = d0
+
+    # ---- ALDEx2-style Monte Carlo over bootstrap CIs -----------------
+    # Re-runs the CLR + per-cell-type OLS (+ optional EB) pipeline on M
+    # Monte Carlo replicates of the (samples x cell-types) proportion
+    # matrix sampled from the bootstrap CIs. The "expected p-value"
+    # (median across replicates) folds the per-(sample, cell-type)
+    # deconvolution uncertainty into the inference, and tends to be
+    # smaller for cell types whose effect is consistent across replicates
+    # while being larger for those whose effect is fragile.
+    if args.aldex_mc > 0:
+        if "CI_lower" not in deconv.columns or "CI_upper" not in deconv.columns:
+            sys.exit(
+                "ERROR: --aldex-mc requires CI_lower and CI_upper columns. "
+                "Run BetaValueDeconvolution with -bootstrap to produce them."
+            )
+        if args.verbose:
+            print(
+                f"Running ALDEx2 Monte Carlo with {args.aldex_mc} replicates "
+                f"on {len(cell_types)} cell types...",
+                file=sys.stderr,
+            )
+        ci_lo_full = pivot_long_to_wide(deconv, "CI_lower")
+        ci_hi_full = pivot_long_to_wide(deconv, "CI_upper")
+        # Align to the post-prevalence-filter w (which the baseline used),
+        # restricted to samples that survived the metadata join.
+        common_idx = df.index
+        w_for_mc = w.reindex(index=common_idx, columns=cell_types)
+        ci_lo_for_mc = ci_lo_full.reindex(
+            index=common_idx, columns=cell_types
+        ).fillna(0.0)
+        ci_hi_for_mc = ci_hi_full.reindex(
+            index=common_idx, columns=cell_types
+        ).fillna(0.0)
+
+        eb_cfg = None
+        if args.empirical_bayes:
+            eb_cfg = {
+                "trend": args.eb_trend,
+                "trend_frac": args.eb_trend_frac,
+                "robust": args.eb_robust,
+            }
+
+        meta_for_mc = metadata.loc[common_idx]
+        group_categories_mc = (
+            list(meta_for_mc[args.group_col].cat.categories)
+            if isinstance(
+                meta_for_mc[args.group_col].dtype, pd.CategoricalDtype
+            )
+            else None
+        )
+
+        mc_summary = run_aldex_mc(
+            w_point=w_for_mc,
+            ci_lower_df=ci_lo_for_mc,
+            ci_upper_df=ci_hi_for_mc,
+            metadata=meta_for_mc,
+            group_col=args.group_col,
+            covariates=covariates,
+            test=args.test,
+            weights=weights,
+            group_categories=group_categories_mc,
+            clr_eps=args.clr_eps,
+            eb_config=eb_cfg,
+            n_mc=args.aldex_mc,
+            seed=args.aldex_mc_seed,
+            n_jobs=args.threads,
+            fdr_alpha=args.fdr_alpha,
+            verbose=args.verbose,
+        )
+
+        def _mc_key(r):
+            return (
+                r["cell_type"],
+                r.get("level") if args.test != "omnibus" else None,
+            )
+
+        results["effect_clr_mc_median"] = results.apply(
+            lambda r: mc_summary["effect_median"].get(
+                _mc_key(r), float("nan")
+            ),
+            axis=1,
+        )
+        results["effect_clr_mc_iqr"] = results.apply(
+            lambda r: mc_summary["effect_iqr"].get(
+                _mc_key(r), float("nan")
+            ),
+            axis=1,
+        )
+        results["p_value_mc"] = results.apply(
+            lambda r: mc_summary["p_median"].get(_mc_key(r), float("nan")),
+            axis=1,
+        )
+        results["p_value_mc_max"] = results.apply(
+            lambda r: mc_summary["p_max"].get(_mc_key(r), float("nan")),
+            axis=1,
+        )
+        results["p_value_mc_stability"] = results.apply(
+            lambda r: mc_summary["p_stability"].get(
+                _mc_key(r), float("nan")
+            ),
+            axis=1,
+        )
+        results["q_value_mc"] = bh_correct(
+            results["p_value_mc"].to_numpy()
+        )
 
     # ---- Permutation-based group-label null --------------------------
     if args.permutations > 0:
