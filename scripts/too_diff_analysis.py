@@ -814,9 +814,12 @@ def _permutation_chunk_worker(args: tuple) -> dict:
             df_perm[group_col] = perm_arr
         running_max = float("-inf")
         for ct in cell_types:
+            df_ct, w_ct = _resolve_celltype_weights(weights, df_perm, ct)
+            if df_ct.shape[0] < 3:
+                continue
             try:
                 res = fit_one_celltype(
-                    ct, df_perm, group_col, covariates, test, weights
+                    ct, df_ct, group_col, covariates, test, w_ct
                 )
             except Exception:
                 continue
@@ -856,6 +859,164 @@ def _permutation_chunk_worker(args: tuple) -> dict:
         "stat_matrix": stat_matrix,
         "max_stats": max_stats,
     }
+
+
+# -------- Per-cell-type weights and detection masking --------------------
+
+def build_per_celltype_weights(
+    deconv: pd.DataFrame,
+    sample_index: pd.Index,
+    cell_types: list,
+    weight_mode: str,
+    mask_mode: str,
+    mask_source: str,
+    mask_thresh: float,
+    eps: float = 1e-9,
+    verbose: bool = False,
+) -> Optional[dict]:
+    """Build a dict mapping cell_type -> per-sample weight Series, combining a
+    CI-derived inverse-variance precision weight with an optional per-sample
+    detection-based soft/hard mask.
+
+    weight_mode:
+      'none'         all-ones (precision factor disabled)
+      'ci-width'     w = 1 / (CI_upper - CI_lower)^2 on the proportion scale
+      'ci-width-rel' w = 1 / ((CI_upper - CI_lower) / proportion)^2  -- the
+                     delta-method-correct GLS weight on the log/CLR scale,
+                     recommended.
+
+    mask_mode (uses the per-sample p_value or q_value column from
+    BetaValueDeconvolution -bootstrap output as a detection signal):
+      'none' no masking
+      'soft' multiply weight by (1 - detection); samples where the cell
+             type isn't reliably detected get smoothly down-weighted.
+      'hard' set weight to 0 (effectively excluding the sample) when
+             detection > mask_thresh. Costs df_resid for that cell type's
+             regression.
+
+    Returns None when both weight_mode and mask_mode are 'none' (signaling
+    that no per-CT weight spec is needed). Otherwise returns a dict whose
+    keys are cell_types and values are pd.Series indexed by sample.
+    """
+    if weight_mode == "none" and mask_mode == "none":
+        return None
+
+    prop = pivot_long_to_wide(deconv, "proportion").reindex(
+        index=sample_index, columns=cell_types
+    )
+
+    if weight_mode == "ci-width":
+        if "CI_lower" not in deconv.columns or "CI_upper" not in deconv.columns:
+            raise ValueError(
+                "--per-celltype-weights ci-width requires CI_lower / "
+                "CI_upper. Run BetaValueDeconvolution with -bootstrap."
+            )
+        ci_lo = pivot_long_to_wide(deconv, "CI_lower").reindex(
+            index=sample_index, columns=cell_types
+        )
+        ci_hi = pivot_long_to_wide(deconv, "CI_upper").reindex(
+            index=sample_index, columns=cell_types
+        )
+        width = (ci_hi - ci_lo).clip(lower=eps)
+        w_mat = 1.0 / (width ** 2)
+    elif weight_mode == "ci-width-rel":
+        if "CI_lower" not in deconv.columns or "CI_upper" not in deconv.columns:
+            raise ValueError(
+                "--per-celltype-weights ci-width-rel requires CI_lower / "
+                "CI_upper. Run BetaValueDeconvolution with -bootstrap."
+            )
+        ci_lo = pivot_long_to_wide(deconv, "CI_lower").reindex(
+            index=sample_index, columns=cell_types
+        )
+        ci_hi = pivot_long_to_wide(deconv, "CI_upper").reindex(
+            index=sample_index, columns=cell_types
+        )
+        # Relative width on the proportion scale; floor proportion at eps
+        # so a zero-proportion sample doesn't blow up.
+        rel_width = ((ci_hi - ci_lo) / prop.clip(lower=1e-6)).clip(lower=eps)
+        w_mat = 1.0 / (rel_width ** 2)
+    else:  # 'none' precision factor: start from ones, only mask
+        w_mat = pd.DataFrame(1.0, index=sample_index, columns=cell_types)
+
+    # Detection mask
+    if mask_mode != "none":
+        if mask_source not in deconv.columns:
+            raise ValueError(
+                f"--per-celltype-mask-source {mask_source!r} not in deconv "
+                f"input. Run BetaValueDeconvolution with -bootstrap and "
+                f"-permutationTest to produce per-sample p_value/q_value."
+            )
+        det = pivot_long_to_wide(deconv, mask_source).reindex(
+            index=sample_index, columns=cell_types
+        )
+        if mask_mode == "soft":
+            # (1 - q) factor: samples where cell type is fully detected
+            # (q ≈ 0) get full weight; non-detected (q ≈ 1) get zero.
+            factor = (1.0 - det).clip(lower=0.0, upper=1.0)
+            w_mat = w_mat * factor
+        elif mask_mode == "hard":
+            # Drop samples where detection > threshold by setting weight=0.
+            keep = det <= mask_thresh
+            w_mat = w_mat.where(keep, 0.0)
+
+    # Replace NaN with 0 for safe handling in downstream WLS / hard-filter.
+    w_mat = w_mat.fillna(0.0)
+
+    out = {ct: w_mat[ct].astype(float) for ct in cell_types}
+
+    if verbose:
+        print(
+            f"Per-CT weights (mode={weight_mode}, mask={mask_mode}"
+            + (f", source={mask_source}" if mask_mode != "none" else "")
+            + (f", thresh={mask_thresh}" if mask_mode == "hard" else "")
+            + "):",
+            file=sys.stderr,
+        )
+        # Diagnostic: count of nonzero samples per cell type
+        for i, ct in enumerate(cell_types[:5]):
+            ws = out[ct]
+            nz = int((ws > 0).sum())
+            wmin = float(ws[ws > 0].min()) if nz > 0 else 0.0
+            wmax = float(ws.max())
+            print(
+                f"  {ct}: nonzero_samples={nz}/{len(ws)}, "
+                f"weight_range=[{wmin:.3g}, {wmax:.3g}]",
+                file=sys.stderr,
+            )
+        if len(cell_types) > 5:
+            print(
+                f"  ... and {len(cell_types) - 5} more cell types",
+                file=sys.stderr,
+            )
+
+    return out
+
+
+def _resolve_celltype_weights(
+    weights_spec, df: pd.DataFrame, cell_type: str
+) -> tuple:
+    """Return (df_for_ct, weights_for_ct) for one cell type's regression.
+
+    - weights_spec is None: no weighting -> (df unchanged, None).
+    - weights_spec is a pd.Series: per-sample weights -> (df unchanged,
+      aligned series).
+    - weights_spec is a dict: per-cell-type weights. Look up the Series
+      for `cell_type`, drop df rows whose weight is 0/NaN/<=0 (hard-mask
+      semantics), and return (filtered df, aligned positive weights).
+    """
+    if weights_spec is None:
+        return df, None
+    if isinstance(weights_spec, dict):
+        w_ct = weights_spec.get(cell_type)
+        if w_ct is None:
+            return df, None
+        aligned = w_ct.reindex(df.index)
+        mask = np.isfinite(aligned) & (aligned > 0)
+        if not mask.all():
+            return df.loc[mask], aligned.loc[mask]
+        return df, aligned
+    # pd.Series — per-sample
+    return df, weights_spec
 
 
 # -------- ALDEx2-style Monte Carlo over bootstrap CIs ---------------------
@@ -942,16 +1103,30 @@ def _aldex_mc_worker(args: tuple) -> list:
     needed = [group_col] + covariates
     df = df.dropna(subset=needed)
 
-    weights = None
-    if weights_arr is not None:
-        weights = pd.Series(weights_arr, index=sample_idx).reindex(df.index)
+    # Reconstitute weight spec. weights_arr can be:
+    #   None                      -> no weighting
+    #   np.ndarray (n_samples,)   -> per-sample WLS
+    #   dict[cell_type -> array]  -> per-(sample, cell-type) WLS / mask
+    weights_spec = None
+    if isinstance(weights_arr, dict):
+        weights_spec = {
+            ct: pd.Series(arr, index=sample_idx)
+            for ct, arr in weights_arr.items()
+        }
+    elif weights_arr is not None:
+        weights_spec = pd.Series(weights_arr, index=sample_idx).reindex(df.index)
 
     rows: list = []
     for ct in cell_types:
         if ct not in df.columns:
             continue
+        df_ct, w_ct = _resolve_celltype_weights(weights_spec, df, ct)
+        if df_ct.shape[0] < 3:
+            continue
         try:
-            res = fit_one_celltype(ct, df, group_col, covariates, test, weights)
+            res = fit_one_celltype(
+                ct, df_ct, group_col, covariates, test, w_ct
+            )
         except Exception:
             continue
         if isinstance(res, dict):
@@ -1020,10 +1195,18 @@ def run_aldex_mc(
     sd_arr = np.where(np.isfinite(sd_arr) & (sd_arr > 0), sd_arr, 0.0)
     w_arr = w_point.to_numpy()
 
-    weights_arr = (
-        weights.reindex(sample_idx).to_numpy()
-        if weights is not None else None
-    )
+    # Serialize weights for the worker:
+    #   pd.Series  -> numpy array (per-sample)
+    #   dict       -> dict of numpy arrays (per-cell-type)
+    if weights is None:
+        weights_arr = None
+    elif isinstance(weights, dict):
+        weights_arr = {
+            ct: ser.reindex(sample_idx).to_numpy()
+            for ct, ser in weights.items()
+        }
+    else:
+        weights_arr = weights.reindex(sample_idx).to_numpy()
 
     if verbose:
         nz_frac = float((sd_arr > 0).mean())
@@ -1264,7 +1447,56 @@ def main() -> int:
         "--weighted",
         action="store_true",
         help="Inverse-variance-weight samples by mean CI width across cell "
-             "types. Down-weights low-quality samples. Requires CI columns.",
+             "types (single weight per sample, applied to every cell-type "
+             "regression). Requires CI columns. Overridden by "
+             "--per-celltype-weights when set.",
+    )
+    p.add_argument(
+        "--per-celltype-weights",
+        choices=["none", "ci-width", "ci-width-rel"],
+        default="none",
+        help="Per-(sample, cell-type) inverse-variance weighting from the "
+             "bootstrap CI width. Strictly more powerful than --weighted "
+             "because deconvolution precision varies across cell types "
+             "within a sample. "
+             "ci-width: w = 1/(CI_upper - CI_lower)^2 on the proportion "
+             "scale (simple). "
+             "ci-width-rel: w = 1/((CI_upper-CI_lower)/proportion)^2 -- "
+             "the delta-method-correct GLS weight on log/CLR scale "
+             "(recommended). Overrides --weighted. Default: none.",
+    )
+    p.add_argument(
+        "--per-celltype-mask-by-detection",
+        choices=["none", "soft", "hard"],
+        default="none",
+        help="Mask per-(sample, cell-type) data points using the per-sample "
+             "permutation p_value / q_value from BetaValueDeconvolution as "
+             "a detection signal -- complementary to CI-based precision "
+             "weighting. "
+             "soft: multiply per-CT weight by (1 - detection); samples "
+             "where the cell type isn't reliably detected get smoothly "
+             "down-weighted, df_resid preserved. "
+             "hard: drop samples where detection > "
+             "--per-celltype-mask-thresh; clean exclusion but costs "
+             "df_resid. Default: none.",
+    )
+    p.add_argument(
+        "--per-celltype-mask-source",
+        choices=["p_value", "q_value"],
+        default="q_value",
+        help="Which detection column to use for "
+             "--per-celltype-mask-by-detection. q_value is "
+             "BH-corrected within-sample and is safer for hard masking; "
+             "p_value is raw and is more sensitive for soft masking. "
+             "Default: q_value.",
+    )
+    p.add_argument(
+        "--per-celltype-mask-thresh",
+        type=float,
+        default=0.5,
+        help="Detection threshold for --per-celltype-mask-by-detection "
+             "hard. Samples with detection > thresh are dropped from that "
+             "cell type's regression. Default: 0.5.",
     )
     p.add_argument(
         "--fdr-alpha",
@@ -1497,9 +1729,41 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # Compute per-sample weights if requested
-    weights = None
-    if args.weighted:
+    covariates = [c.strip() for c in args.covariates.split(",") if c.strip()]
+    cell_types = list(w_clr.columns)
+
+    # Compute weight specification.
+    # Three mutually exclusive modes:
+    #   weights_spec = None        -> OLS per cell type
+    #   weights_spec = pd.Series   -> per-sample WLS (current --weighted)
+    #   weights_spec = dict        -> per-(sample, cell-type) WLS with
+    #                                  optional detection mask
+    weights_spec = None
+    use_per_ct = (
+        args.per_celltype_weights != "none"
+        or args.per_celltype_mask_by_detection != "none"
+    )
+    if use_per_ct:
+        if args.weighted and args.verbose:
+            print(
+                "Note: --per-celltype-weights / --per-celltype-mask-by-"
+                "detection set; --weighted is overridden.",
+                file=sys.stderr,
+            )
+        try:
+            weights_spec = build_per_celltype_weights(
+                deconv=deconv,
+                sample_index=df.index,
+                cell_types=cell_types,
+                weight_mode=args.per_celltype_weights,
+                mask_mode=args.per_celltype_mask_by_detection,
+                mask_source=args.per_celltype_mask_source,
+                mask_thresh=args.per_celltype_mask_thresh,
+                verbose=args.verbose,
+            )
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
+    elif args.weighted:
         if "CI_lower" not in deconv.columns or "CI_upper" not in deconv.columns:
             print(
                 "WARNING: --weighted requires CI_lower/CI_upper; falling back "
@@ -1510,26 +1774,42 @@ def main() -> int:
             lo = pivot_long_to_wide(deconv, "CI_lower").reindex(df.index)
             hi = pivot_long_to_wide(deconv, "CI_upper").reindex(df.index)
             mean_width = (hi - lo).mean(axis=1)
-            weights = 1.0 / (mean_width.pow(2) + 1e-9)
+            weights_spec = 1.0 / (mean_width.pow(2) + 1e-9)
+
+    # `weights` retained as the legacy variable name throughout the rest
+    # of main() (some downstream call sites reuse it directly).
+    weights = weights_spec
 
     # ---- Fit per cell type --------------------------------------------
-    covariates = [c.strip() for c in args.covariates.split(",") if c.strip()]
-    cell_types = list(w_clr.columns)
-
     rows: list[dict] = []
     for ct in cell_types:
-        try:
-            res = fit_one_celltype(
-                ct, df, args.group_col, covariates, args.test, weights
-            )
-        except Exception as exc:  # pragma: no cover
+        df_ct, w_ct = _resolve_celltype_weights(weights_spec, df, ct)
+        if df_ct.shape[0] < 3:
+            # Hard mask removed nearly all samples for this cell type.
             if args.verbose:
-                print(f"WARNING: fit failed for {ct}: {exc}", file=sys.stderr)
+                print(
+                    f"WARNING: per-CT mask left {df_ct.shape[0]} samples "
+                    f"for {ct}; skipping.",
+                    file=sys.stderr,
+                )
             res = {
                 "cell_type": ct,
                 "p_value": np.nan,
-                "n_samples": 0,
+                "n_samples": int(df_ct.shape[0]),
             }
+        else:
+            try:
+                res = fit_one_celltype(
+                    ct, df_ct, args.group_col, covariates, args.test, w_ct
+                )
+            except Exception as exc:  # pragma: no cover
+                if args.verbose:
+                    print(f"WARNING: fit failed for {ct}: {exc}", file=sys.stderr)
+                res = {
+                    "cell_type": ct,
+                    "p_value": np.nan,
+                    "n_samples": 0,
+                }
         if isinstance(res, list):
             rows.extend(res)
         else:
