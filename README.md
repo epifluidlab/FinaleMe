@@ -12,7 +12,7 @@ Liu Y# et al. (2024) FinaleMe: Predicting DNA methylation by the fragmentation p
 - Apache Maven 3.8+:
 https://maven.apache.org/install.html (or use the build .jar file from release)
 - Optional for bigWig conversion speed/compatibility: `bedGraphToBigWig` (UCSC tools from here: https://hgdownload.soe.ucsc.edu/admin/exe/ and modify $PATH to allow the direct usage). If missing, FinaleMe falls back to built-in Java BigWig writing.
-- Optional for Step 5 (differential TOO analysis): Python 3.9+ with `pandas`, `numpy`, `statsmodels`.
+- Optional for Step 5 (differential TOO analysis): Python 3.9+ with `pandas`, `numpy`, `scipy`, `statsmodels`, `matplotlib` (the last only required if you use `--plot-pdf` to write per-cell-type violin/jitter plots).
 - Optional only for custom tissue reference-map generation: `wgbstools` (https://github.com/nloyfer/wgbs_tools) and `UXM_deconv` (https://github.com/nloyfer/UXM_deconv). They are not required for the default Steps 1-5 below.
 
 ## Quick install

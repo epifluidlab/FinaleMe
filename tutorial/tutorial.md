@@ -20,7 +20,7 @@ FinaleMe predicts CpG methylation from cfDNA fragment features derived from BAM/
 Default pipeline requirement summary:
 
 - Steps 1-5 in this tutorial require only FinaleMe (Java + jar build) and the pre-built reference panels downloaded by `setup_references.sh`.
-- Step 6 (differential analysis) requires Python 3.9+ with `pandas`, `numpy`, `statsmodels`.
+- Step 6 (differential analysis) requires Python 3.9+ with `pandas`, `numpy`, `scipy`, `statsmodels`, and (only when `--plot-pdf` is used to generate per-cell-type violin/jitter plots) `matplotlib`.
 - `wgbstools` and `UXM_deconv` are only needed for the optional custom atlas generation workflow (see [tutorial/tutorial_ref_maps.md](tutorial_ref_maps.md)).
 
 ## 2.1 Install source
