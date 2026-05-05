@@ -876,6 +876,100 @@ def _permutation_chunk_worker(args: tuple) -> dict:
     }
 
 
+# -------- Non-parametric companion test (Mann-Whitney / Kruskal-Wallis) ----
+
+def compute_nonparametric_pvalues(
+    w: pd.DataFrame,
+    metadata: pd.DataFrame,
+    group_col: str,
+    test: str,
+    results: pd.DataFrame,
+) -> pd.Series:
+    """Per-cell-type two-sided Mann-Whitney p-values, aligned with the rows
+    of `results`. Auto-extends to Kruskal-Wallis when the analysis has
+    three or more groups in omnibus mode (i.e. when MW does not apply).
+
+    The non-parametric test is rank-based and therefore invariant to the
+    monotone CLR transform — testing the proportions directly gives
+    identical p-values to testing the CLR-transformed values, so we
+    compute on the raw proportions for clarity.
+
+    Returns a Series of p-values indexed identically to `results`. NaN
+    where the row's level / cell type isn't sample-bearing in both groups.
+    """
+    if isinstance(metadata[group_col].dtype, pd.CategoricalDtype):
+        group_levels = list(metadata[group_col].cat.categories)
+    else:
+        group_levels = sorted(
+            metadata[group_col].dropna().unique().tolist()
+        )
+
+    common = w.index.intersection(metadata.index)
+    meta = metadata.loc[common]
+    group_samples = {
+        g: meta[meta[group_col] == g].index for g in group_levels
+    }
+
+    pvals: list = []
+    for _, row in results.iterrows():
+        ct = row.get("cell_type")
+        if ct is None or ct not in w.columns:
+            pvals.append(float("nan"))
+            continue
+        w_ct = w[ct]
+        if test == "pairwise":
+            lvl = row.get("level")
+            if (
+                lvl is None or lvl not in group_levels
+                or lvl == group_levels[0]  # reference level itself
+            ):
+                pvals.append(float("nan"))
+                continue
+            ref_g = group_levels[0]
+            v_ref = (
+                w_ct.reindex(group_samples[ref_g]).dropna().to_numpy()
+            )
+            v_lvl = (
+                w_ct.reindex(group_samples[lvl]).dropna().to_numpy()
+            )
+            if len(v_ref) < 1 or len(v_lvl) < 1:
+                pvals.append(float("nan"))
+                continue
+            try:
+                p = float(
+                    _scipy_stats.mannwhitneyu(
+                        v_ref, v_lvl, alternative="two-sided"
+                    ).pvalue
+                )
+            except Exception:
+                p = float("nan")
+            pvals.append(p)
+        else:
+            # omnibus: K=2 -> Mann-Whitney, K>=3 -> Kruskal-Wallis
+            arrs = [
+                w_ct.reindex(group_samples[g]).dropna().to_numpy()
+                for g in group_levels
+            ]
+            arrs = [a for a in arrs if len(a) >= 1]
+            if len(arrs) < 2:
+                pvals.append(float("nan"))
+                continue
+            try:
+                if len(arrs) == 2:
+                    p = float(
+                        _scipy_stats.mannwhitneyu(
+                            arrs[0], arrs[1], alternative="two-sided"
+                        ).pvalue
+                    )
+                else:
+                    p = float(_scipy_stats.kruskal(*arrs).pvalue)
+            except Exception:
+                p = float("nan")
+            pvals.append(p)
+
+    return pd.Series(pvals, index=results.index)
+
+
 # -------- Per-cell-type weights and detection masking --------------------
 
 def build_per_celltype_weights(
@@ -1411,14 +1505,24 @@ def plot_per_celltype_pdf(
             f"ERROR: --plot-pvalue-source {pvalue_source!r} not found in "
             f"results columns: {sorted(results.columns)}"
         )
+    has_mw = "p_value_mw" in results.columns
     if test == "pairwise" and "level" in results.columns:
         p_lookup: dict = {}
+        mw_lookup: dict = {}
         for _, r in results.iterrows():
             p_lookup.setdefault(r["cell_type"], {})[
                 r.get("level")
             ] = r.get(pvalue_source, float("nan"))
+            if has_mw:
+                mw_lookup.setdefault(r["cell_type"], {})[
+                    r.get("level")
+                ] = r.get("p_value_mw", float("nan"))
     else:
         p_lookup = dict(zip(results["cell_type"], results[pvalue_source]))
+        mw_lookup = (
+            dict(zip(results["cell_type"], results["p_value_mw"]))
+            if has_mw else {}
+        )
 
     # Group ordering: respect the Categorical category order when set
     # (so the user's --reference-group becomes the leftmost violin).
@@ -1535,6 +1639,15 @@ def plot_per_celltype_pdf(
             y_min, y_max = float(all_vals.min()), float(all_vals.max())
             y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
 
+            # Choose the non-parametric label: MW for K=2 group comparisons,
+            # KW when omnibus on K>=3 groups (the only case where MW
+            # doesn't apply directly).
+            np_label = (
+                "KW"
+                if (test != "pairwise" and len(group_levels) >= 3)
+                else "MW"
+            )
+
             # Comparison brackets.
             if test == "pairwise" and len(group_levels) >= 2:
                 # Pairwise: ref vs each non-ref level. One bracket per pair.
@@ -1543,32 +1656,48 @@ def plot_per_celltype_pdf(
                     if isinstance(p_lookup.get(ct), dict)
                     else {None: p_lookup.get(ct, float("nan"))}
                 )
+                mw_dict = (
+                    mw_lookup.get(ct, {})
+                    if isinstance(mw_lookup.get(ct), dict)
+                    else {None: mw_lookup.get(ct, float("nan"))}
+                )
                 bracket_y = y_max + 0.04 * y_range
                 tick = 0.015 * y_range
                 for j, g in enumerate(group_levels[1:], start=1):
                     p = p_dict.get(g, float("nan"))
                     if not np.isfinite(p):
                         continue
+                    mw_p = mw_dict.get(g, float("nan")) if has_mw else float("nan")
                     ax.plot(
                         [0, 0, j, j],
                         [bracket_y, bracket_y + tick,
                          bracket_y + tick, bracket_y],
                         color="black", linewidth=0.8,
                     )
+                    if np.isfinite(mw_p):
+                        label = f"p = {p:.3g}\n{np_label} p = {mw_p:.3g}"
+                    else:
+                        label = f"p = {p:.3g}"
                     ax.text(
                         (0 + j) / 2.0,
                         bracket_y + tick * 1.4,
-                        f"p = {p:.3g}",
-                        ha="center", va="bottom", fontsize=10,
+                        label,
+                        ha="center", va="bottom", fontsize=9,
                     )
-                    bracket_y += y_range * 0.10
+                    # Allocate enough vertical room for the two-line label.
+                    bracket_y += y_range * (0.14 if np.isfinite(mw_p) else 0.10)
             else:
                 # Omnibus: single p-value annotated at top.
                 p = p_lookup.get(ct, float("nan"))
+                mw_p = mw_lookup.get(ct, float("nan")) if has_mw else float("nan")
                 if np.isfinite(p):
+                    if np.isfinite(mw_p):
+                        label = f"p = {p:.3g}\n{np_label} p = {mw_p:.3g}"
+                    else:
+                        label = f"p = {p:.3g}"
                     ax.text(
                         0.5, 0.96,
-                        f"p = {p:.3g}",
+                        label,
                         transform=ax.transAxes,
                         ha="center", va="top", fontsize=10,
                         bbox=dict(boxstyle="round,pad=0.3",
@@ -2089,6 +2218,21 @@ def main() -> int:
             rows.append(res)
 
     results = pd.DataFrame(rows)
+
+    # ---- Non-parametric companion test (Mann-Whitney / Kruskal-Wallis)
+    # Always computed alongside the parametric test as a distribution-
+    # free sanity check. Two-sided MW for binary group comparisons (the
+    # typical case); auto-extends to Kruskal-Wallis when omnibus mode
+    # has K>=3 groups. Values appear in the output TSV as p_value_mw /
+    # q_value_mw and are also annotated on --plot-pdf brackets.
+    results["p_value_mw"] = compute_nonparametric_pvalues(
+        w=w.loc[df.index],
+        metadata=metadata.loc[df.index],
+        group_col=args.group_col,
+        test=args.test,
+        results=results,
+    )
+    results["q_value_mw"] = bh_correct(results["p_value_mw"].to_numpy())
 
     # ---- Empirical-Bayes variance shrinkage (limma-style) ------------
     # Recomputes p_value using moderated t (pairwise) / moderated F (omnibus)
