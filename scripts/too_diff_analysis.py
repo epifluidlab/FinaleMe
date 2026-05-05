@@ -76,6 +76,21 @@ except ImportError as exc:  # pragma: no cover
         f"too_diff_analysis.py requires scipy (pip install scipy): {exc}"
     )
 
+# matplotlib is only needed when --plot-pdf is set; defer import + error
+# until the user actually requests plotting so the rest of the script
+# stays usable on systems without matplotlib.
+def _import_matplotlib():
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend (writes files only)
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        return matplotlib, plt, PdfPages
+    except ImportError as exc:
+        sys.exit(
+            f"--plot-pdf requires matplotlib (pip install matplotlib): {exc}"
+        )
+
 
 # -------- IO ---------------------------------------------------------------
 
@@ -1355,6 +1370,239 @@ def bh_correct(p: np.ndarray) -> np.ndarray:
 
 # -------- Main ------------------------------------------------------------
 
+def plot_per_celltype_pdf(
+    w: pd.DataFrame,
+    metadata: pd.DataFrame,
+    results: pd.DataFrame,
+    group_col: str,
+    output_pdf: str,
+    plot_scale: str = "proportion",
+    pvalue_source: str = "p_value",
+    test: str = "pairwise",
+    sort_by: str = "p_value",
+    fdr_alpha: float = 0.05,
+    verbose: bool = False,
+) -> None:
+    """Write one violin+jitter plot per cell type to a multi-page PDF.
+
+    Each page: cell-type proportion (or log10-proportion / CLR) on the y-axis,
+    one violin + jittered points per group on the x-axis. A comparison
+    bracket with the user-selected p-value (3 significant figures) is drawn
+    between groups; a dashed line connects the per-group medians.
+
+    Cell types are ordered by `sort_by` (typically p_value, so the most
+    interesting plots appear first in the PDF).
+    """
+    _, plt, PdfPages = _import_matplotlib()
+
+    # Determine cell-type ordering (most-significant first if sort_by exists).
+    if sort_by in results.columns:
+        ordered_celltypes = (
+            results.sort_values(sort_by, na_position="last")["cell_type"]
+            .drop_duplicates()
+            .tolist()
+        )
+    else:
+        ordered_celltypes = list(w.columns)
+
+    # Build p-value lookup from the results DataFrame.
+    if pvalue_source not in results.columns:
+        sys.exit(
+            f"ERROR: --plot-pvalue-source {pvalue_source!r} not found in "
+            f"results columns: {sorted(results.columns)}"
+        )
+    if test == "pairwise" and "level" in results.columns:
+        p_lookup: dict = {}
+        for _, r in results.iterrows():
+            p_lookup.setdefault(r["cell_type"], {})[
+                r.get("level")
+            ] = r.get(pvalue_source, float("nan"))
+    else:
+        p_lookup = dict(zip(results["cell_type"], results[pvalue_source]))
+
+    # Group ordering: respect the Categorical category order when set
+    # (so the user's --reference-group becomes the leftmost violin).
+    if isinstance(metadata[group_col].dtype, pd.CategoricalDtype):
+        group_levels = list(metadata[group_col].cat.categories)
+    else:
+        group_levels = sorted(metadata[group_col].dropna().unique().tolist())
+
+    common_idx = w.index.intersection(metadata.index)
+    meta_aligned = metadata.loc[common_idx]
+
+    # Pre-compute CLR matrix once if the user wants the CLR scale.
+    if plot_scale == "clr":
+        try:
+            w_clr_full = clr_transform(w)
+        except Exception:
+            w_clr_full = None
+    else:
+        w_clr_full = None
+
+    rng = np.random.default_rng(0)  # reproducible jitter across runs
+
+    n_pages_written = 0
+    Path(output_pdf).parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(output_pdf) as pdf:
+        for ct in ordered_celltypes:
+            if ct not in w.columns:
+                continue
+
+            # y values per scale
+            if plot_scale == "log-proportion":
+                yvals_full = np.log10(w[ct].clip(lower=1e-7))
+                ylabel = f"log10(proportion) — {ct}"
+            elif plot_scale == "clr" and w_clr_full is not None:
+                yvals_full = w_clr_full[ct]
+                ylabel = f"CLR(proportion) — {ct}"
+            else:
+                yvals_full = w[ct]
+                ylabel = f"proportion — {ct}"
+
+            data_per_group = []
+            n_per_group = []
+            for g in group_levels:
+                samples_g = meta_aligned[
+                    meta_aligned[group_col] == g
+                ].index
+                vals_g = (
+                    yvals_full.reindex(samples_g)
+                    .dropna()
+                    .to_numpy()
+                )
+                data_per_group.append(vals_g)
+                n_per_group.append(len(vals_g))
+
+            if not any(len(v) > 0 for v in data_per_group):
+                continue  # nothing to plot for this cell type
+
+            fig, ax = plt.subplots(figsize=(5.5, 4.5))
+            positions = list(range(len(group_levels)))
+
+            # Violin (only for groups with >=2 points; matplotlib refuses
+            # otherwise). Sparse-group cell types still get jittered points.
+            violin_data = [v for v in data_per_group if len(v) >= 2]
+            violin_pos = [
+                p for p, v in zip(positions, data_per_group) if len(v) >= 2
+            ]
+            if violin_data:
+                parts = ax.violinplot(
+                    violin_data,
+                    positions=violin_pos,
+                    showmeans=False,
+                    showmedians=True,
+                    showextrema=False,
+                    widths=0.7,
+                )
+                for body in parts["bodies"]:
+                    body.set_alpha(0.35)
+                    body.set_edgecolor("black")
+                    body.set_linewidth(0.5)
+                if "cmedians" in parts:
+                    parts["cmedians"].set_color("black")
+                    parts["cmedians"].set_linewidth(1.0)
+
+            # Jittered points
+            for i, vals in enumerate(data_per_group):
+                if len(vals) == 0:
+                    continue
+                xj = i + rng.normal(0, 0.05, size=len(vals))
+                ax.scatter(
+                    xj, vals, s=22, alpha=0.75,
+                    edgecolor="black", linewidth=0.4, zorder=3,
+                )
+
+            # Dashed line connecting per-group medians
+            medians = [
+                float(np.median(v)) if len(v) else float("nan")
+                for v in data_per_group
+            ]
+            finite = [
+                (p, m) for p, m in zip(positions, medians)
+                if np.isfinite(m)
+            ]
+            if len(finite) >= 2:
+                xs, ys = zip(*finite)
+                ax.plot(
+                    xs, ys, color="black", linestyle="--",
+                    linewidth=0.9, alpha=0.6, zorder=2,
+                )
+
+            # Compute y-range for placing the comparison brackets.
+            all_vals = np.concatenate(
+                [v for v in data_per_group if len(v) > 0]
+            )
+            y_min, y_max = float(all_vals.min()), float(all_vals.max())
+            y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
+
+            # Comparison brackets.
+            if test == "pairwise" and len(group_levels) >= 2:
+                # Pairwise: ref vs each non-ref level. One bracket per pair.
+                p_dict = (
+                    p_lookup.get(ct, {})
+                    if isinstance(p_lookup.get(ct), dict)
+                    else {None: p_lookup.get(ct, float("nan"))}
+                )
+                bracket_y = y_max + 0.04 * y_range
+                tick = 0.015 * y_range
+                for j, g in enumerate(group_levels[1:], start=1):
+                    p = p_dict.get(g, float("nan"))
+                    if not np.isfinite(p):
+                        continue
+                    ax.plot(
+                        [0, 0, j, j],
+                        [bracket_y, bracket_y + tick,
+                         bracket_y + tick, bracket_y],
+                        color="black", linewidth=0.8,
+                    )
+                    ax.text(
+                        (0 + j) / 2.0,
+                        bracket_y + tick * 1.4,
+                        f"p = {p:.3g}",
+                        ha="center", va="bottom", fontsize=10,
+                    )
+                    bracket_y += y_range * 0.10
+            else:
+                # Omnibus: single p-value annotated at top.
+                p = p_lookup.get(ct, float("nan"))
+                if np.isfinite(p):
+                    ax.text(
+                        0.5, 0.96,
+                        f"p = {p:.3g}",
+                        transform=ax.transAxes,
+                        ha="center", va="top", fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.3",
+                                  facecolor="white",
+                                  edgecolor="lightgray"),
+                    )
+
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                [f"{g}\n(n={n})"
+                 for g, n in zip(group_levels, n_per_group)],
+                rotation=0,
+            )
+            ax.set_ylabel(ylabel)
+            ax.set_title(ct, fontsize=11)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+            # Make room for the bracket annotations at the top.
+            cur_lo, cur_hi = ax.get_ylim()
+            ax.set_ylim(cur_lo, cur_hi + 0.05 * y_range)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+            n_pages_written += 1
+
+    if verbose:
+        print(
+            f"Wrote {n_pages_written} cell-type plot(s) to {output_pdf}",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -1596,6 +1844,31 @@ def main() -> int:
         required=True,
         help="Output TSV path. One row per cell type (omnibus) or per "
              "(cell_type, level) pair (pairwise).",
+    )
+    p.add_argument(
+        "--plot-pdf",
+        default=None,
+        help="If set, write a multi-page PDF with one violin + jittered-"
+             "points plot per cell type comparing the groups. The chosen "
+             "p-value (see --plot-pvalue-source) is annotated as a "
+             "comparison bracket between groups, formatted to 3 "
+             "significant figures. Cell types are ordered most-significant "
+             "first. Requires matplotlib.",
+    )
+    p.add_argument(
+        "--plot-scale",
+        choices=["proportion", "log-proportion", "clr"],
+        default="proportion",
+        help="Y-axis scale for --plot-pdf. proportion: raw 0-1 fraction. "
+             "log-proportion: log10(proportion). clr: centered log-ratio "
+             "(matches the regression scale). Default: proportion.",
+    )
+    p.add_argument(
+        "--plot-pvalue-source",
+        default="p_value",
+        help="Which column from the results to display on the plots "
+             "(e.g. p_value, p_value_unshrunk, p_value_perm, p_value_mc). "
+             "Default: p_value.",
     )
     p.add_argument(
         "--verbose",
@@ -2083,6 +2356,29 @@ def main() -> int:
         print(
             results[results["significant"]][cols].head(15).to_string(index=False),
             file=sys.stderr,
+        )
+
+    # ---- Per-cell-type violin/jitter PDF -----------------------------
+    if args.plot_pdf is not None:
+        if args.verbose:
+            print(
+                f"Writing per-cell-type plots to {args.plot_pdf} "
+                f"(scale={args.plot_scale}, "
+                f"p-value source={args.plot_pvalue_source})...",
+                file=sys.stderr,
+            )
+        plot_per_celltype_pdf(
+            w=w.loc[df.index],
+            metadata=metadata.loc[df.index],
+            results=results,
+            group_col=args.group_col,
+            output_pdf=args.plot_pdf,
+            plot_scale=args.plot_scale,
+            pvalue_source=args.plot_pvalue_source,
+            test=args.test,
+            sort_by="q_value" if "q_value" in results.columns else "p_value",
+            fdr_alpha=args.fdr_alpha,
+            verbose=args.verbose,
         )
 
     return 0
