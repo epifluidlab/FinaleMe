@@ -1464,6 +1464,177 @@ def bh_correct(p: np.ndarray) -> np.ndarray:
 
 # -------- Main ------------------------------------------------------------
 
+def _draw_violin_panel(
+    ax,
+    ct: str,
+    w: pd.DataFrame,
+    group_levels: list,
+    meta_aligned: pd.DataFrame,
+    group_col: str,
+    plot_scale: str,
+    w_clr_full,
+    test: str,
+    rng,
+    panel_title: str,
+    primary_p_dict: dict,
+    primary_p_label: str,
+    secondary_p_dict: Optional[dict] = None,
+    secondary_p_label: Optional[str] = None,
+) -> None:
+    """Draw violins + jittered points + comparison brackets for one cell type
+    on the given axis, annotated with a primary p-value (and optional
+    secondary). Used by plot_per_celltype_pdf for both single-panel and
+    dual-panel layouts.
+
+    primary_p_dict is keyed by group level (pairwise) or has a sentinel
+    None key (omnibus). primary_p_label is e.g. "p" or "MW p".
+    """
+    if plot_scale == "log-proportion":
+        yvals_full = np.log10(w[ct].clip(lower=1e-7))
+        ylabel = f"log10(proportion) — {ct}"
+    elif plot_scale == "clr" and w_clr_full is not None:
+        yvals_full = w_clr_full[ct]
+        ylabel = f"CLR(proportion) — {ct}"
+    else:
+        yvals_full = w[ct]
+        ylabel = f"proportion — {ct}"
+
+    data_per_group = []
+    n_per_group = []
+    for g in group_levels:
+        samples_g = meta_aligned[meta_aligned[group_col] == g].index
+        vals_g = yvals_full.reindex(samples_g).dropna().to_numpy()
+        data_per_group.append(vals_g)
+        n_per_group.append(len(vals_g))
+
+    if not any(len(v) > 0 for v in data_per_group):
+        ax.text(
+            0.5, 0.5, "no data",
+            transform=ax.transAxes, ha="center", va="center",
+            color="gray",
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if panel_title:
+            ax.set_title(panel_title, fontsize=10)
+        return
+
+    positions = list(range(len(group_levels)))
+
+    violin_data = [v for v in data_per_group if len(v) >= 2]
+    violin_pos = [
+        p for p, v in zip(positions, data_per_group) if len(v) >= 2
+    ]
+    if violin_data:
+        parts = ax.violinplot(
+            violin_data,
+            positions=violin_pos,
+            showmeans=False,
+            showmedians=True,
+            showextrema=False,
+            widths=0.7,
+        )
+        for body in parts["bodies"]:
+            body.set_alpha(0.35)
+            body.set_edgecolor("black")
+            body.set_linewidth(0.5)
+        if "cmedians" in parts:
+            parts["cmedians"].set_color("black")
+            parts["cmedians"].set_linewidth(1.0)
+
+    for i, vals in enumerate(data_per_group):
+        if len(vals) == 0:
+            continue
+        xj = i + rng.normal(0, 0.05, size=len(vals))
+        ax.scatter(
+            xj, vals, s=22, alpha=0.75,
+            edgecolor="black", linewidth=0.4, zorder=3,
+        )
+
+    medians = [
+        float(np.median(v)) if len(v) else float("nan")
+        for v in data_per_group
+    ]
+    finite = [
+        (p, m) for p, m in zip(positions, medians) if np.isfinite(m)
+    ]
+    if len(finite) >= 2:
+        xs, ys = zip(*finite)
+        ax.plot(
+            xs, ys, color="black", linestyle="--",
+            linewidth=0.9, alpha=0.6, zorder=2,
+        )
+
+    all_vals = np.concatenate([v for v in data_per_group if len(v) > 0])
+    y_min, y_max = float(all_vals.min()), float(all_vals.max())
+    y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
+
+    if test == "pairwise" and len(group_levels) >= 2:
+        bracket_y = y_max + 0.04 * y_range
+        tick = 0.015 * y_range
+        for j, g in enumerate(group_levels[1:], start=1):
+            p = primary_p_dict.get(g, float("nan"))
+            sec_p = (
+                secondary_p_dict.get(g, float("nan"))
+                if secondary_p_dict is not None else float("nan")
+            )
+            if not np.isfinite(p):
+                continue
+            ax.plot(
+                [0, 0, j, j],
+                [bracket_y, bracket_y + tick,
+                 bracket_y + tick, bracket_y],
+                color="black", linewidth=0.8,
+            )
+            label = f"{primary_p_label} = {p:.3g}"
+            if secondary_p_label is not None and np.isfinite(sec_p):
+                label = label + f"\n{secondary_p_label} = {sec_p:.3g}"
+            ax.text(
+                (0 + j) / 2.0,
+                bracket_y + tick * 1.4,
+                label,
+                ha="center", va="bottom", fontsize=9,
+            )
+            two_line = (
+                secondary_p_label is not None and np.isfinite(sec_p)
+            )
+            bracket_y += y_range * (0.14 if two_line else 0.10)
+    else:
+        p = primary_p_dict.get(None, float("nan"))
+        sec_p = (
+            secondary_p_dict.get(None, float("nan"))
+            if secondary_p_dict is not None else float("nan")
+        )
+        if np.isfinite(p):
+            label = f"{primary_p_label} = {p:.3g}"
+            if secondary_p_label is not None and np.isfinite(sec_p):
+                label = label + f"\n{secondary_p_label} = {sec_p:.3g}"
+            ax.text(
+                0.5, 0.96,
+                label,
+                transform=ax.transAxes,
+                ha="center", va="top", fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3",
+                          facecolor="white",
+                          edgecolor="lightgray"),
+            )
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(
+        [f"{g}\n(n={n})"
+         for g, n in zip(group_levels, n_per_group)],
+        rotation=0,
+    )
+    ax.set_ylabel(ylabel)
+    if panel_title:
+        ax.set_title(panel_title, fontsize=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    cur_lo, cur_hi = ax.get_ylim()
+    ax.set_ylim(cur_lo, cur_hi + 0.05 * y_range)
+
+
 def plot_per_celltype_pdf(
     w: pd.DataFrame,
     metadata: pd.DataFrame,
@@ -1476,6 +1647,8 @@ def plot_per_celltype_pdf(
     sort_by: str = "p_value",
     fdr_alpha: float = 0.05,
     verbose: bool = False,
+    w_refined: Optional[pd.DataFrame] = None,
+    view_mode: str = "raw",
 ) -> None:
     """Write one violin+jitter plot per cell type to a multi-page PDF.
 
@@ -1534,16 +1707,25 @@ def plot_per_celltype_pdf(
     common_idx = w.index.intersection(metadata.index)
     meta_aligned = metadata.loc[common_idx]
 
-    # Pre-compute CLR matrix once if the user wants the CLR scale.
-    if plot_scale == "clr":
+    # Pre-compute CLR matrices once if the user wants the CLR scale.
+    def _maybe_clr(mat):
+        if plot_scale != "clr" or mat is None:
+            return None
         try:
-            w_clr_full = clr_transform(w)
+            return clr_transform(mat)
         except Exception:
-            w_clr_full = None
-    else:
-        w_clr_full = None
+            return None
+    w_clr_full = _maybe_clr(w)
+    w_refined_clr_full = _maybe_clr(w_refined) if w_refined is not None else None
+
+    np_label = (
+        "KW" if (test != "pairwise" and len(group_levels) >= 3) else "MW"
+    )
 
     rng = np.random.default_rng(0)  # reproducible jitter across runs
+
+    show_dual = (view_mode == "both" and w_refined is not None)
+    use_refined_only = (view_mode == "refined" and w_refined is not None)
 
     n_pages_written = 0
     Path(output_pdf).parent.mkdir(parents=True, exist_ok=True)
@@ -1552,178 +1734,85 @@ def plot_per_celltype_pdf(
             if ct not in w.columns:
                 continue
 
-            # y values per scale
-            if plot_scale == "log-proportion":
-                yvals_full = np.log10(w[ct].clip(lower=1e-7))
-                ylabel = f"log10(proportion) — {ct}"
-            elif plot_scale == "clr" and w_clr_full is not None:
-                yvals_full = w_clr_full[ct]
-                ylabel = f"CLR(proportion) — {ct}"
+            # Build per-cell-type p-value dicts (level -> p) for both
+            # parametric and non-parametric, with sentinel None key for
+            # omnibus mode.
+            if test == "pairwise" and "level" in results.columns:
+                param_dict = p_lookup.get(ct, {})
+                mw_dict = mw_lookup.get(ct, {}) if has_mw else {}
+                if not isinstance(param_dict, dict):
+                    param_dict = {None: param_dict}
+                if not isinstance(mw_dict, dict):
+                    mw_dict = {None: mw_dict}
             else:
-                yvals_full = w[ct]
-                ylabel = f"proportion — {ct}"
-
-            data_per_group = []
-            n_per_group = []
-            for g in group_levels:
-                samples_g = meta_aligned[
-                    meta_aligned[group_col] == g
-                ].index
-                vals_g = (
-                    yvals_full.reindex(samples_g)
-                    .dropna()
-                    .to_numpy()
-                )
-                data_per_group.append(vals_g)
-                n_per_group.append(len(vals_g))
-
-            if not any(len(v) > 0 for v in data_per_group):
-                continue  # nothing to plot for this cell type
-
-            fig, ax = plt.subplots(figsize=(5.5, 4.5))
-            positions = list(range(len(group_levels)))
-
-            # Violin (only for groups with >=2 points; matplotlib refuses
-            # otherwise). Sparse-group cell types still get jittered points.
-            violin_data = [v for v in data_per_group if len(v) >= 2]
-            violin_pos = [
-                p for p, v in zip(positions, data_per_group) if len(v) >= 2
-            ]
-            if violin_data:
-                parts = ax.violinplot(
-                    violin_data,
-                    positions=violin_pos,
-                    showmeans=False,
-                    showmedians=True,
-                    showextrema=False,
-                    widths=0.7,
-                )
-                for body in parts["bodies"]:
-                    body.set_alpha(0.35)
-                    body.set_edgecolor("black")
-                    body.set_linewidth(0.5)
-                if "cmedians" in parts:
-                    parts["cmedians"].set_color("black")
-                    parts["cmedians"].set_linewidth(1.0)
-
-            # Jittered points
-            for i, vals in enumerate(data_per_group):
-                if len(vals) == 0:
-                    continue
-                xj = i + rng.normal(0, 0.05, size=len(vals))
-                ax.scatter(
-                    xj, vals, s=22, alpha=0.75,
-                    edgecolor="black", linewidth=0.4, zorder=3,
-                )
-
-            # Dashed line connecting per-group medians
-            medians = [
-                float(np.median(v)) if len(v) else float("nan")
-                for v in data_per_group
-            ]
-            finite = [
-                (p, m) for p, m in zip(positions, medians)
-                if np.isfinite(m)
-            ]
-            if len(finite) >= 2:
-                xs, ys = zip(*finite)
-                ax.plot(
-                    xs, ys, color="black", linestyle="--",
-                    linewidth=0.9, alpha=0.6, zorder=2,
-                )
-
-            # Compute y-range for placing the comparison brackets.
-            all_vals = np.concatenate(
-                [v for v in data_per_group if len(v) > 0]
-            )
-            y_min, y_max = float(all_vals.min()), float(all_vals.max())
-            y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
-
-            # Choose the non-parametric label: MW for K=2 group comparisons,
-            # KW when omnibus on K>=3 groups (the only case where MW
-            # doesn't apply directly).
-            np_label = (
-                "KW"
-                if (test != "pairwise" and len(group_levels) >= 3)
-                else "MW"
-            )
-
-            # Comparison brackets.
-            if test == "pairwise" and len(group_levels) >= 2:
-                # Pairwise: ref vs each non-ref level. One bracket per pair.
-                p_dict = (
-                    p_lookup.get(ct, {})
-                    if isinstance(p_lookup.get(ct), dict)
-                    else {None: p_lookup.get(ct, float("nan"))}
-                )
+                param_dict = {None: p_lookup.get(ct, float("nan"))}
                 mw_dict = (
-                    mw_lookup.get(ct, {})
-                    if isinstance(mw_lookup.get(ct), dict)
-                    else {None: mw_lookup.get(ct, float("nan"))}
+                    {None: mw_lookup.get(ct, float("nan"))}
+                    if has_mw else {}
                 )
-                bracket_y = y_max + 0.04 * y_range
-                tick = 0.015 * y_range
-                for j, g in enumerate(group_levels[1:], start=1):
-                    p = p_dict.get(g, float("nan"))
-                    if not np.isfinite(p):
-                        continue
-                    mw_p = mw_dict.get(g, float("nan")) if has_mw else float("nan")
-                    ax.plot(
-                        [0, 0, j, j],
-                        [bracket_y, bracket_y + tick,
-                         bracket_y + tick, bracket_y],
-                        color="black", linewidth=0.8,
-                    )
-                    if np.isfinite(mw_p):
-                        label = f"p = {p:.3g}\n{np_label} p = {mw_p:.3g}"
-                    else:
-                        label = f"p = {p:.3g}"
-                    ax.text(
-                        (0 + j) / 2.0,
-                        bracket_y + tick * 1.4,
-                        label,
-                        ha="center", va="bottom", fontsize=9,
-                    )
-                    # Allocate enough vertical room for the two-line label.
-                    bracket_y += y_range * (0.14 if np.isfinite(mw_p) else 0.10)
+
+            if show_dual:
+                fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
+                # Left: raw data, annotated with the non-parametric (MW/KW)
+                # p-value -- which is computed on raw values upstream.
+                _draw_violin_panel(
+                    axes[0], ct, w, group_levels, meta_aligned, group_col,
+                    plot_scale, w_clr_full, test, rng,
+                    panel_title="Raw (NNLS output)",
+                    primary_p_dict=mw_dict if has_mw else {None: float("nan")},
+                    primary_p_label=f"{np_label} p",
+                )
+                # Right: refined data, annotated with the parametric p-value
+                # -- the regression is on refined CLR.
+                _draw_violin_panel(
+                    axes[1], ct, w_refined, group_levels, meta_aligned,
+                    group_col, plot_scale, w_refined_clr_full, test, rng,
+                    panel_title="Refined (zeros → CI_upper/2; used for regression)",
+                    primary_p_dict=param_dict,
+                    primary_p_label="p",
+                )
+                fig.suptitle(ct, fontsize=12, fontweight="bold")
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                n_pages_written += 1
             else:
-                # Omnibus: single p-value annotated at top.
-                p = p_lookup.get(ct, float("nan"))
-                mw_p = mw_lookup.get(ct, float("nan")) if has_mw else float("nan")
-                if np.isfinite(p):
-                    if np.isfinite(mw_p):
-                        label = f"p = {p:.3g}\n{np_label} p = {mw_p:.3g}"
-                    else:
-                        label = f"p = {p:.3g}"
-                    ax.text(
-                        0.5, 0.96,
-                        label,
-                        transform=ax.transAxes,
-                        ha="center", va="top", fontsize=10,
-                        bbox=dict(boxstyle="round,pad=0.3",
-                                  facecolor="white",
-                                  edgecolor="lightgray"),
-                    )
-
-            ax.set_xticks(positions)
-            ax.set_xticklabels(
-                [f"{g}\n(n={n})"
-                 for g, n in zip(group_levels, n_per_group)],
-                rotation=0,
-            )
-            ax.set_ylabel(ylabel)
-            ax.set_title(ct, fontsize=11)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-            # Make room for the bracket annotations at the top.
-            cur_lo, cur_hi = ax.get_ylim()
-            ax.set_ylim(cur_lo, cur_hi + 0.05 * y_range)
-
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-            n_pages_written += 1
+                # Single panel. Pick which matrix to plot and which p to
+                # call "primary"; show the other as a secondary line so
+                # readers still see both numbers.
+                if use_refined_only:
+                    plot_mat = w_refined
+                    plot_clr = w_refined_clr_full
+                    panel_title = ""  # cell-type name goes in ax title
+                    primary = param_dict
+                    primary_label = "p"
+                    secondary = mw_dict if has_mw else None
+                    secondary_label = f"{np_label} p" if has_mw else None
+                else:
+                    plot_mat = w
+                    plot_clr = w_clr_full
+                    panel_title = ""
+                    # When refinement is off, "p" matches what's drawn; keep
+                    # primary = parametric, secondary = MW.
+                    primary = param_dict
+                    primary_label = "p"
+                    secondary = mw_dict if has_mw else None
+                    secondary_label = f"{np_label} p" if has_mw else None
+                fig, ax = plt.subplots(figsize=(5.5, 4.5))
+                _draw_violin_panel(
+                    ax, ct, plot_mat, group_levels, meta_aligned, group_col,
+                    plot_scale, plot_clr, test, rng,
+                    panel_title=panel_title,
+                    primary_p_dict=primary,
+                    primary_p_label=primary_label,
+                    secondary_p_dict=secondary,
+                    secondary_p_label=secondary_label,
+                )
+                ax.set_title(ct, fontsize=11)
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                n_pages_written += 1
 
     if verbose:
         print(
@@ -2000,14 +2089,21 @@ def main() -> int:
              "Default: p_value.",
     )
     p.add_argument(
-        "--plot-show-refined",
-        action="store_true",
-        help="Plot the refined proportion matrix (the values the regression "
-             "actually sees) rather than the raw deconvolution output. "
-             "Only meaningful with --refine-zeros-with-ci, which silently "
-             "replaces zero proportions with CI_upper/2 for the regression. "
-             "Default behavior is to plot raw values so the violins reflect "
-             "what BetaValueDeconvolution actually reported.",
+        "--plot-view",
+        choices=["raw", "refined", "both", "auto"],
+        default="auto",
+        help="Which proportion matrix to show in --plot-pdf. "
+             "raw: deconvolution output as-is (honest diagnostic). "
+             "refined: the post-refine_zeros_with_ci values the regression "
+             "actually sees. "
+             "both: side-by-side dual panel per cell type, raw on left "
+             "(annotated with MW p) and refined on right (annotated with "
+             "parametric p). The dual panel is the most useful diagnostic "
+             "when --refine-zeros-with-ci is on: divergence between the "
+             "two panels' p-values means the regression's significance "
+             "leans on imputed values. "
+             "auto (default): both when --refine-zeros-with-ci is set, "
+             "raw otherwise.",
     )
     p.add_argument(
         "--verbose",
@@ -2545,24 +2641,42 @@ def main() -> int:
 
     # ---- Per-cell-type violin/jitter PDF -----------------------------
     if args.plot_pdf is not None:
-        # By default, plot the RAW proportion matrix (what BetaValueDeconvolution
-        # actually reported), not the post-refinement values the regression sees.
-        # This is so the violins are an honest diagnostic of the input.
-        # Use --plot-show-refined to switch back to the refined view.
-        w_for_plot = w if args.plot_show_refined else w_raw
-        plot_data_label = (
-            "refined-for-regression" if args.plot_show_refined else "raw"
+        # Resolve --plot-view auto: dual panel when refinement was applied
+        # (most informative diagnostic), single raw panel otherwise.
+        refinement_was_applied = (
+            args.refine_zeros_with_ci
+            and not w.equals(w_raw)
         )
+        if args.plot_view == "auto":
+            view_mode = "both" if refinement_was_applied else "raw"
+        else:
+            view_mode = args.plot_view
+        # If user asked for refined or both but refinement wasn't applied,
+        # quietly fall back to raw (no second matrix to compare to).
+        if view_mode in ("refined", "both") and not refinement_was_applied:
+            if args.verbose:
+                print(
+                    f"Note: --plot-view {view_mode} requested but "
+                    f"refinement was not applied; plotting raw only.",
+                    file=sys.stderr,
+                )
+            view_mode = "raw"
+
         if args.verbose:
             print(
                 f"Writing per-cell-type plots to {args.plot_pdf} "
-                f"(scale={args.plot_scale}, "
-                f"data={plot_data_label}, "
+                f"(scale={args.plot_scale}, view={view_mode}, "
                 f"p-value source={args.plot_pvalue_source})...",
                 file=sys.stderr,
             )
         plot_per_celltype_pdf(
-            w=w_for_plot.reindex(df.index),
+            w=w_raw.reindex(df.index),
+            w_refined=(
+                w.reindex(df.index)
+                if view_mode in ("refined", "both")
+                else None
+            ),
+            view_mode=view_mode,
             metadata=metadata.loc[df.index],
             results=results,
             group_col=args.group_col,
