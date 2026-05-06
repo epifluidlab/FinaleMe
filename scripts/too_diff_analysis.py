@@ -2000,6 +2000,16 @@ def main() -> int:
              "Default: p_value.",
     )
     p.add_argument(
+        "--plot-show-refined",
+        action="store_true",
+        help="Plot the refined proportion matrix (the values the regression "
+             "actually sees) rather than the raw deconvolution output. "
+             "Only meaningful with --refine-zeros-with-ci, which silently "
+             "replaces zero proportions with CI_upper/2 for the regression. "
+             "Default behavior is to plot raw values so the violins reflect "
+             "what BetaValueDeconvolution actually reported.",
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         help="Print loaded sample counts, fit warnings, and a summary table.",
@@ -2028,6 +2038,12 @@ def main() -> int:
 
     # ---- Pivot ---------------------------------------------------------
     w = pivot_long_to_wide(deconv, "proportion")
+    # Keep an unmodified copy of the raw proportion matrix. The plot path
+    # uses this so per-cell-type violins reflect what the deconvolution
+    # actually reported, not the refined values that the regression uses
+    # to avoid log(0) issues in CLR. (Opt back into refined view via
+    # --plot-show-refined if you want to see what the regression sees.)
+    w_raw = w.copy()
 
     # Optional zero refinement using CI_upper
     if args.refine_zeros_with_ci:
@@ -2040,6 +2056,27 @@ def main() -> int:
         else:
             ci_upper = pivot_long_to_wide(deconv, "CI_upper")
             w = refine_zeros_with_ci(w, ci_upper, min_ci=args.refine_zeros_ci_min)
+            if args.verbose:
+                # Count how many (sample, cell-type) cells changed.
+                changed_mask = (w_raw == 0) & (w > 0)
+                n_changed = int(changed_mask.sum().sum())
+                n_zero_total = int((w_raw == 0).sum().sum())
+                # Per-cell-type breakdown for cell types where the change
+                # is large (>= 25% of samples).
+                per_ct = changed_mask.sum(axis=0)
+                heavy = per_ct[per_ct >= max(1, int(0.25 * len(w_raw)))].sort_values(ascending=False)
+                print(
+                    f"--refine-zeros-with-ci: refined {n_changed:,} of "
+                    f"{n_zero_total:,} zero proportion cells to CI_upper/2 "
+                    f"(threshold: {args.refine_zeros_ci_min:g}).",
+                    file=sys.stderr,
+                )
+                if len(heavy) > 0:
+                    print(
+                        f"  Cell types with >=25% of samples refined: "
+                        f"{', '.join(f'{ct}({int(n)})' for ct, n in heavy.items())}",
+                        file=sys.stderr,
+                    )
 
     # Drop excluded cell types
     excluded = [c.strip() for c in args.exclude_cell_types.split(",") if c.strip()]
@@ -2220,13 +2257,17 @@ def main() -> int:
     results = pd.DataFrame(rows)
 
     # ---- Non-parametric companion test (Mann-Whitney / Kruskal-Wallis)
-    # Always computed alongside the parametric test as a distribution-
-    # free sanity check. Two-sided MW for binary group comparisons (the
-    # typical case); auto-extends to Kruskal-Wallis when omnibus mode
-    # has K>=3 groups. Values appear in the output TSV as p_value_mw /
-    # q_value_mw and are also annotated on --plot-pdf brackets.
+    # Computed on the RAW (unrefined) proportion matrix, so it serves as
+    # a refinement-bias detector: if --refine-zeros-with-ci is doing the
+    # heavy lifting (replacing many zeros with CI_upper/2), the
+    # parametric p_value will diverge from p_value_mw because MW sees
+    # mostly-zero ranks. Convergence -> robust signal; divergence ->
+    # the parametric significance leans on the imputed values.
+    # Two-sided MW for binary group comparisons; auto-extends to
+    # Kruskal-Wallis when omnibus mode has K>=3 groups.
+    w_raw_filtered = w_raw.reindex(index=df.index, columns=w.columns)
     results["p_value_mw"] = compute_nonparametric_pvalues(
-        w=w.loc[df.index],
+        w=w_raw_filtered,
         metadata=metadata.loc[df.index],
         group_col=args.group_col,
         test=args.test,
@@ -2504,15 +2545,24 @@ def main() -> int:
 
     # ---- Per-cell-type violin/jitter PDF -----------------------------
     if args.plot_pdf is not None:
+        # By default, plot the RAW proportion matrix (what BetaValueDeconvolution
+        # actually reported), not the post-refinement values the regression sees.
+        # This is so the violins are an honest diagnostic of the input.
+        # Use --plot-show-refined to switch back to the refined view.
+        w_for_plot = w if args.plot_show_refined else w_raw
+        plot_data_label = (
+            "refined-for-regression" if args.plot_show_refined else "raw"
+        )
         if args.verbose:
             print(
                 f"Writing per-cell-type plots to {args.plot_pdf} "
                 f"(scale={args.plot_scale}, "
+                f"data={plot_data_label}, "
                 f"p-value source={args.plot_pvalue_source})...",
                 file=sys.stderr,
             )
         plot_per_celltype_pdf(
-            w=w.loc[df.index],
+            w=w_for_plot.reindex(df.index),
             metadata=metadata.loc[df.index],
             results=results,
             group_col=args.group_col,
