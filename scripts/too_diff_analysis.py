@@ -616,6 +616,320 @@ def fit_one_celltype_tobit(
     return rows
 
 
+# -------- Hurdle (two-part) regression for compositional zeros -----------
+
+def fit_one_celltype_hurdle(
+    cell_type: str,
+    w_raw_for_ct: pd.Series,
+    df_meta: pd.DataFrame,
+    group_col: str,
+    covariates: list,
+    test: str,
+    weights: Optional[pd.Series] = None,
+    detect_floor: float = 1e-4,
+) -> object:
+    """Two-part hurdle regression for one cell type.
+
+    Stage 1 (Detection): logistic regression on the binary indicator
+        y_detect[i] = 1 if proportion[i] > detect_floor else 0
+        on group + covariates. Tests "does detection rate differ
+        between groups?" (a categorical question that is well-posed
+        for NNLS-output zeros: NNLS reported zero -> the cell type's
+        marker pattern wasn't fitted at all in this sample).
+
+    Stage 2 (Magnitude): OLS regression on log10(proportion), restricted
+        to samples where proportion > detect_floor, on group + covariates.
+        Tests "given that the cell type was detected, does its magnitude
+        differ between groups?" (a continuous question that is well-posed
+        only on the subset where NNLS produced a non-zero estimate).
+
+    Joint p-value: Fisher's combined probability test
+        chi2_combined = -2 * (log p_detect + log p_magnitude)
+        p_combined    = chi2.sf(chi2_combined, df=4)
+    Reasonable approximation when the two stages are roughly conditionally
+    independent given the cell type (which holds for our setup -- detection
+    and magnitude are functions of different parts of the data).
+
+    Why this is statistically more honest than Tobit for NNLS output:
+    Tobit assumes a normally-distributed latent variable and a true
+    detection floor below which observations are reported as the floor
+    value. NNLS-zeros are boundary solutions of a constrained optimization
+    (the unconstrained estimate would be negative, clipped to zero by the
+    non-negativity constraint), not censored measurements of a normal
+    latent variable. The hurdle decomposition matches the actual data-
+    generating process: the two questions ("is it there at all?" vs
+    "given it's there, how much?") are biologically distinct and each is
+    addressed by a model whose assumptions are satisfied by the
+    corresponding part of the data.
+
+    Returns the same shape as fit_one_celltype/fit_one_celltype_tobit:
+    dict (omnibus) or list of dicts (pairwise). Adds these columns:
+        p_value_detect      stage 1 p-value
+        p_value_magnitude   stage 2 p-value
+        effect_detect       stage 1 coefficient (log-odds)
+        effect_magnitude    stage 2 coefficient (log10 fold-change)
+        std_err_detect      stage 1 SE
+        std_err_magnitude   stage 2 SE
+        n_detected          number of samples where w > detect_floor
+        n_undetected        complement
+        method = "hurdle"
+    """
+    import patsy
+    import statsmodels.api as _sm
+
+    common = w_raw_for_ct.index.intersection(df_meta.index)
+    df = df_meta.reindex(common).copy()
+    y_raw = w_raw_for_ct.reindex(common).astype(float)
+
+    needed = [group_col] + covariates
+    valid = df[needed].notna().all(axis=1) & y_raw.notna()
+    df = df.loc[valid]
+    y_raw = y_raw.loc[valid]
+    if weights is not None:
+        weights = weights.reindex(df.index)
+
+    n_total = int(len(df))
+    if n_total < len(covariates) + 3:
+        return {
+            "cell_type": cell_type,
+            "p_value": float("nan"),
+            "n_samples": n_total,
+            "method": "hurdle",
+        }
+
+    detected = (y_raw > detect_floor)
+    n_detected = int(detected.sum())
+    n_undetected = n_total - n_detected
+
+    # --- Build design matrix (uniform across stages) ----------------
+    df["__y_dummy"] = detected.astype(float)
+    formula = build_formula("__y_dummy", group_col, covariates, df)
+    _, X_design = patsy.dmatrices(formula, df, return_type="dataframe")
+    col_names = list(X_design.columns)
+    X_full = X_design.to_numpy()
+    p_total = X_full.shape[1]
+    group_pattern = f'C(Q("{group_col}"))'
+    group_idx = [
+        i for i, name in enumerate(col_names)
+        if name.startswith(group_pattern)
+    ]
+
+    # --- Stage 1: Logistic regression on detection ------------------
+    # Both classes need to be present and at least p_total observations
+    # are needed to identify the logistic coefficients without perfect
+    # separation collapsing the SEs to infinity.
+    stage1_betas: dict = {}  # term name -> beta
+    stage1_ses: dict = {}
+    stage1_ps: dict = {}
+    if 0 < n_detected < n_total and n_total >= p_total + 1:
+        try:
+            logit_model = _sm.Logit(detected.astype(int).to_numpy(), X_full)
+            logit_fit = logit_model.fit(disp=0, maxiter=200)
+            for i, name in enumerate(col_names):
+                stage1_betas[name] = float(logit_fit.params[i])
+                stage1_ses[name] = float(logit_fit.bse[i])
+                stage1_ps[name] = float(logit_fit.pvalues[i])
+        except Exception:
+            pass  # leave dicts empty -> NaN downstream
+
+    # --- Stage 2: OLS on log10(w) for detected samples only ---------
+    # Need enough detected samples to identify the full design.
+    stage2_fit = None
+    if n_detected >= p_total + 1:
+        df_det = df.loc[detected].copy()
+        df_det["__y_log"] = np.log10(y_raw.loc[detected])
+        formula2 = (
+            f'Q("__y_log") ~ '
+            + " + ".join(
+                _quote_term(group_col, df_det, force_categorical=True)
+                if c == group_col else _quote_term(c, df_det)
+                for c in [group_col] + covariates
+            )
+        )
+        try:
+            if weights is not None:
+                w_det = weights.reindex(df_det.index).to_numpy()
+                stage2_fit = smf.wls(
+                    formula2, data=df_det, weights=w_det
+                ).fit()
+            else:
+                stage2_fit = smf.ols(formula2, data=df_det).fit()
+        except Exception:
+            stage2_fit = None
+
+    base = {
+        "cell_type": cell_type,
+        "n_samples": n_total,
+        "n_detected": n_detected,
+        "n_undetected": n_undetected,
+        "method": "hurdle",
+        "detect_floor": float(detect_floor),
+    }
+
+    def _fisher(p1, p2):
+        finite = [p for p in (p1, p2) if np.isfinite(p)]
+        if len(finite) == 0:
+            return float("nan")
+        if len(finite) == 1:
+            # Single-stage signal: report it directly rather than
+            # NaN-ing the cell type out entirely.
+            return float(finite[0])
+        # Both p-values present: Fisher's combined probability test.
+        # Floor at 1e-300 to avoid log(0) numerical problems.
+        chi2_stat = -2.0 * (
+            np.log(max(p1, 1e-300)) + np.log(max(p2, 1e-300))
+        )
+        return float(_scipy_stats.chi2.sf(chi2_stat, df=4))
+
+    if test == "omnibus":
+        # Omnibus = "any group difference" jointly across stages.
+        # Stage 1 omnibus: LR test of full vs no-group reduced model.
+        # Stage 2 omnibus: F-test for joint group factor (Type II ANOVA).
+        # Combine via Fisher's method.
+        p_detect_omni = float("nan")
+        p_mag_omni = float("nan")
+
+        if 0 < n_detected < n_total and group_idx:
+            try:
+                # Reduced model: drop group column block.
+                non_group_cols = [
+                    i for i in range(p_total) if i not in group_idx
+                ]
+                X_red = X_full[:, non_group_cols] if non_group_cols else None
+                y_int = detected.astype(int).to_numpy()
+                ll_full = (
+                    _sm.Logit(y_int, X_full).fit(disp=0, maxiter=200).llf
+                )
+                if X_red is not None and X_red.shape[1] > 0:
+                    ll_red = (
+                        _sm.Logit(y_int, X_red).fit(disp=0, maxiter=200).llf
+                    )
+                else:
+                    # Intercept-only -- llf of binomial at p_hat
+                    p_hat = float(detected.mean())
+                    p_hat = min(max(p_hat, 1e-9), 1 - 1e-9)
+                    ll_red = (
+                        n_detected * np.log(p_hat)
+                        + n_undetected * np.log(1 - p_hat)
+                    )
+                lr = 2.0 * (ll_full - ll_red)
+                p_detect_omni = float(
+                    _scipy_stats.chi2.sf(lr, df=len(group_idx))
+                )
+            except Exception:
+                p_detect_omni = float("nan")
+
+        if stage2_fit is not None and group_idx:
+            try:
+                anova = anova_lm(stage2_fit, typ=2)
+                row_label = next(
+                    (idx for idx in anova.index
+                     if idx.startswith(group_pattern)),
+                    None,
+                )
+                if row_label is not None:
+                    p_mag_omni = float(anova.loc[row_label, "PR(>F)"])
+            except Exception:
+                p_mag_omni = float("nan")
+
+        base["p_value"] = _fisher(p_detect_omni, p_mag_omni)
+        base["p_value_detect"] = p_detect_omni
+        base["p_value_magnitude"] = p_mag_omni
+        base["effect_detect"] = float("nan")
+        base["effect_magnitude"] = float("nan")
+        base["std_err_detect"] = float("nan")
+        base["std_err_magnitude"] = float("nan")
+        # Standard columns expected by the rest of the pipeline.
+        base["effect_clr"] = float("nan")
+        base["std_err"] = float("nan")
+        base["s2_resid"] = (
+            float(stage2_fit.mse_resid) if stage2_fit is not None
+            else float("nan")
+        )
+        base["df_resid"] = (
+            float(stage2_fit.df_resid) if stage2_fit is not None
+            else float("nan")
+        )
+        base["F_stat"] = float("nan")
+        base["df_group"] = float(len(group_idx)) if group_idx else float("nan")
+        base["max_effect_clr"] = float("nan")
+        base["max_effect_level"] = None
+        base["r_squared"] = float("nan")
+        return base
+
+    # ---- Pairwise: one row per non-reference level ----
+    rows = []
+    for i in group_idx:
+        term_name = col_names[i]
+        level = _strip_level(term_name, group_pattern)
+
+        # Stage 1
+        b_d = stage1_betas.get(term_name, float("nan"))
+        se_d = stage1_ses.get(term_name, float("nan"))
+        p_d = stage1_ps.get(term_name, float("nan"))
+
+        # Stage 2 -- look up the matching term in stage2_fit's params
+        b_m = float("nan"); se_m = float("nan"); p_m = float("nan")
+        if stage2_fit is not None:
+            try:
+                stage2_terms = list(stage2_fit.params.index)
+                # The patsy term name may include `T.<level>]` suffix.
+                matching = [
+                    t for t in stage2_terms
+                    if t.endswith(f"T.{level}]") or t == term_name
+                ]
+                if matching:
+                    b_m = float(stage2_fit.params[matching[0]])
+                    se_m = float(stage2_fit.bse[matching[0]])
+                    p_m = float(stage2_fit.pvalues[matching[0]])
+            except Exception:
+                pass
+
+        p_combined = _fisher(p_d, p_m)
+        rows.append({
+            **base,
+            "level": level,
+            "p_value": p_combined,
+            "p_value_detect": p_d,
+            "p_value_magnitude": p_m,
+            "effect_detect": float(b_d) if np.isfinite(b_d) else float("nan"),
+            "effect_magnitude": float(b_m) if np.isfinite(b_m) else float("nan"),
+            "std_err_detect": float(se_d) if np.isfinite(se_d) else float("nan"),
+            "std_err_magnitude": float(se_m) if np.isfinite(se_m) else float("nan"),
+            # Reuse the standard "effect_clr"/"std_err" columns to
+            # carry the magnitude estimate so downstream plots/tools
+            # (e.g. permutation t-statistic) work without special-casing
+            # the hurdle method.
+            "effect_clr": float(b_m) if np.isfinite(b_m) else float("nan"),
+            "std_err": float(se_m) if np.isfinite(se_m) else float("nan"),
+            "s2_resid": (
+                float(stage2_fit.mse_resid) if stage2_fit is not None
+                else float("nan")
+            ),
+            "df_resid": (
+                float(stage2_fit.df_resid) if stage2_fit is not None
+                else float("nan")
+            ),
+            "r_squared": (
+                float(stage2_fit.rsquared) if stage2_fit is not None
+                else float("nan")
+            ),
+        })
+    if not rows:
+        rows.append({
+            **base, "level": None,
+            "p_value": float("nan"),
+            "p_value_detect": float("nan"),
+            "p_value_magnitude": float("nan"),
+            "effect_clr": float("nan"),
+            "std_err": float("nan"),
+            "s2_resid": float("nan"),
+            "df_resid": float("nan"),
+            "r_squared": float("nan"),
+        })
+    return rows
+
+
 # -------- Empirical-Bayes variance shrinkage (limma / Smyth 2004) ----------
 
 def _winsorize(arr: np.ndarray, k: float = 1.5) -> np.ndarray:
@@ -2328,19 +2642,24 @@ def main() -> int:
     )
     p.add_argument(
         "--method",
-        choices=["ols", "tobit"],
+        choices=["ols", "tobit", "hurdle"],
         default="ols",
-        help="Regression method per cell type. ols (default): the existing "
-             "OLS/WLS on CLR-transformed proportions, with EB/MC/permutation "
-             "all available on top. tobit: left-censored regression on "
-             "log10(proportion); samples with proportion <= --tobit-floor "
-             "are treated as below detection (left-censored at "
-             "log10(--tobit-floor)) rather than imputed via "
-             "--refine-zeros-with-ci. The Tobit MLE handles the censoring "
-             "directly without inventing values, which is the right thing "
-             "to do when many samples sit at the NNLS zero floor. Note "
-             "that Tobit fits on raw proportions (CLR is bypassed) and "
-             "EB shrinkage / ALDEx2 MC are not applied to Tobit results.",
+        help="Regression method per cell type. "
+             "ols (default): OLS/WLS on CLR-transformed proportions, with "
+             "EB/MC/permutation available on top. "
+             "hurdle: two-part model -- stage 1 logistic regression on "
+             "(proportion > --hurdle-floor) for the detection question, "
+             "stage 2 OLS on log10(proportion) restricted to detected "
+             "samples for the magnitude question; joint p via Fisher's "
+             "combined probability test. This is the recommended method "
+             "for cohorts where many cell types sit at the NNLS zero floor. "
+             "tobit: left-censored MLE on log10(proportion). NOTE: Tobit's "
+             "censoring assumption (normal latent variable, fixed detection "
+             "threshold) is misspecified for NNLS-zero output (which is a "
+             "boundary solution of a non-negativity-constrained "
+             "optimization, not a true left-censored measurement). Tobit "
+             "p-values can be spuriously small when zeros are concentrated "
+             "in one group. Prefer --method hurdle.",
     )
     p.add_argument(
         "--tobit-floor",
@@ -2350,6 +2669,15 @@ def main() -> int:
              "--method tobit. Samples with proportion <= this value are "
              "treated as below detection. Default: 1e-4 (matches the "
              "BetaValueDeconvolution NNLS effective floor).",
+    )
+    p.add_argument(
+        "--hurdle-floor",
+        type=float,
+        default=1e-4,
+        help="Detection threshold on the proportion scale for "
+             "--method hurdle. Samples with proportion > this value count "
+             "as detected (stage 1 = 1; stage 2 includes them). Default: "
+             "1e-4 (matches the BetaValueDeconvolution NNLS floor).",
     )
     p.add_argument(
         "--tobit-fitted-output",
@@ -2557,6 +2885,22 @@ def main() -> int:
     )
 
     args = p.parse_args()
+
+    if args.method == "tobit":
+        print(
+            "WARNING: --method tobit -- Tobit's left-censored normal model "
+            "is misspecified for NNLS-output proportions. NNLS-zero values "
+            "are boundary solutions of a non-negativity-constrained "
+            "optimization, not true left-censored measurements of a normal "
+            "latent variable. Tobit p-values can be spuriously small "
+            "(several orders of magnitude smaller than the truth) "
+            "especially when zeros are concentrated in one group. "
+            "Consider --method hurdle for a more defensible alternative; "
+            "see the help text for details. The OLS shadow columns "
+            "(p_value_ols, q_value_ols) and Mann-Whitney columns "
+            "(p_value_mw, q_value_mw) in the output remain trustworthy.",
+            file=sys.stderr,
+        )
 
     # ---- Load deconv ---------------------------------------------------
     if args.deconv_files:
@@ -2820,6 +3164,32 @@ def main() -> int:
                 )
             return None
 
+    def _hurdle_fit_for_ct(ct, df_ct, w_ct):
+        if ct not in w_raw.columns:
+            return None
+        try:
+            meta_only = df_ct[
+                [c for c in df_ct.columns if c not in w_clr.columns]
+            ]
+            w_raw_ct = w_raw[ct].reindex(df_ct.index)
+            return fit_one_celltype_hurdle(
+                cell_type=ct,
+                w_raw_for_ct=w_raw_ct,
+                df_meta=meta_only,
+                group_col=args.group_col,
+                covariates=covariates,
+                test=args.test,
+                weights=w_ct,
+                detect_floor=args.hurdle_floor,
+            )
+        except Exception as exc:  # pragma: no cover
+            if args.verbose:
+                print(
+                    f"WARNING: Hurdle fit failed for {ct}: {exc}",
+                    file=sys.stderr,
+                )
+            return None
+
     # Suffixes copied from OLS into Tobit-primary rows, so the TSV always
     # carries an OLS shadow for the middle plot panel and for the
     # MW/OLS fallback when Tobit is NA.
@@ -2916,6 +3286,65 @@ def main() -> int:
                     # Carry over level from OLS if Tobit's row lacks it
                     # (shouldn't happen after the expansion above, but
                     # defensive for the omnibus path too).
+                    if (
+                        args.test == "pairwise"
+                        and (merged.get("level") is None
+                             or (isinstance(merged.get("level"), float)
+                                 and np.isnan(merged.get("level"))))
+                    ):
+                        merged["level"] = ols_match.get("level")
+                else:
+                    for _, dst in OLS_COPY_KEYS:
+                        merged[dst] = np.nan
+                rows.append(merged)
+        elif args.method == "hurdle":
+            # Hurdle: two-part model. We still run OLS in parallel and
+            # store it in the *_ols shadow columns so the middle plot
+            # panel can render with its own p/q (same scheme as Tobit).
+            hurdle_res = _hurdle_fit_for_ct(ct, df_ct, w_ct)
+            hurdle_list = _list_or_dict_to_list(hurdle_res)
+            ols_by_level = {r.get("level"): r for r in ols_list}
+
+            if not hurdle_list:
+                # Hurdle failed entirely: fall back to OLS.
+                if not ols_list:
+                    rows.append({
+                        "cell_type": ct, "p_value": np.nan,
+                        "n_samples": 0, "method": "hurdle_failed",
+                    })
+                else:
+                    for r in ols_list:
+                        merged = dict(r)
+                        for src, dst in OLS_COPY_KEYS:
+                            if src in merged:
+                                merged[dst] = merged[src]
+                        merged["method"] = "hurdle_failed_ols_fallback"
+                        rows.append(merged)
+                continue
+
+            # Same degenerate-row expansion as Tobit (single hurdle row
+            # without a level -> expand to OLS levels).
+            if (
+                args.test == "pairwise"
+                and len(hurdle_list) == 1
+                and hurdle_list[0].get("level") is None
+                and len(ols_list) >= 1
+            ):
+                template = hurdle_list[0]
+                hurdle_list = []
+                for ols_r in ols_list:
+                    new_row = dict(template)
+                    new_row["level"] = ols_r.get("level")
+                    hurdle_list.append(new_row)
+
+            for hr in hurdle_list:
+                merged = dict(hr)
+                ols_match = ols_by_level.get(hr.get("level"))
+                if ols_match is None and ols_list:
+                    ols_match = ols_list[0]
+                if ols_match is not None:
+                    for src, dst in OLS_COPY_KEYS:
+                        merged[dst] = ols_match.get(src, np.nan)
                     if (
                         args.test == "pairwise"
                         and (merged.get("level") is None
