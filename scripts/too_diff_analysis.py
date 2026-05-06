@@ -1897,6 +1897,12 @@ def _draw_violin_panel(
             s += f"  (q = {q_val:.3g})"
         return s
 
+    # Track the topmost y of any annotation so we can extend ylim to fit.
+    # Without this, when y_range is small (e.g. low-fraction cell types
+    # where most samples are at the floor), the bracket labels fall above
+    # the auto-determined y-limit and silently disappear.
+    annotation_top_y = None
+
     if test == "pairwise" and len(group_levels) >= 2:
         bracket_y = y_max + 0.04 * y_range
         tick = 0.015 * y_range
@@ -1937,6 +1943,15 @@ def _draw_violin_panel(
                 ha="center", va="bottom", fontsize=9,
             )
             two_line = sec_line is not None
+            n_lines = 2 if two_line else 1
+            # Approximate the top of the text label: text starts at
+            # bracket_y + tick*1.4 and grows upward by ~0.045 of y_range
+            # per line at fontsize 9.
+            text_top = bracket_y + tick * 1.4 + n_lines * 0.045 * y_range
+            annotation_top_y = (
+                text_top if annotation_top_y is None
+                else max(annotation_top_y, text_top)
+            )
             bracket_y += y_range * (0.14 if two_line else 0.10)
     else:
         p = primary_p_dict.get(None, float("nan"))
@@ -1984,7 +1999,12 @@ def _draw_violin_panel(
     ax.spines["right"].set_visible(False)
 
     cur_lo, cur_hi = ax.get_ylim()
-    ax.set_ylim(cur_lo, cur_hi + 0.05 * y_range)
+    upper_target = cur_hi + 0.05 * y_range
+    if annotation_top_y is not None:
+        # Need at least enough room to fit the topmost annotation plus a
+        # small safety margin.
+        upper_target = max(upper_target, annotation_top_y + 0.02 * y_range)
+    ax.set_ylim(cur_lo, upper_target)
 
 
 def plot_per_celltype_pdf(
@@ -2863,6 +2883,25 @@ def main() -> int:
                         rows.append(merged)
                 continue
 
+            # If Tobit returned a degenerate single-row sentinel (early
+            # return path: cell_type + NaN p_value + no `level` field),
+            # expand it to one row per OLS level so the (cell_type, level)
+            # pairing in the output TSV stays consistent and downstream
+            # lookups (plot dispatcher, BH correction) don't end up with
+            # NaN-keyed entries.
+            if (
+                args.test == "pairwise"
+                and len(tobit_list) == 1
+                and tobit_list[0].get("level") is None
+                and len(ols_list) >= 1
+            ):
+                template = tobit_list[0]
+                tobit_list = []
+                for ols_r in ols_list:
+                    new_row = dict(template)
+                    new_row["level"] = ols_r.get("level")
+                    tobit_list.append(new_row)
+
             # Tobit succeeded: emit Tobit-primary rows, with OLS shadow
             # in *_ols columns.
             for tr in tobit_list:
@@ -2874,6 +2913,16 @@ def main() -> int:
                 if ols_match is not None:
                     for src, dst in OLS_COPY_KEYS:
                         merged[dst] = ols_match.get(src, np.nan)
+                    # Carry over level from OLS if Tobit's row lacks it
+                    # (shouldn't happen after the expansion above, but
+                    # defensive for the omnibus path too).
+                    if (
+                        args.test == "pairwise"
+                        and (merged.get("level") is None
+                             or (isinstance(merged.get("level"), float)
+                                 and np.isnan(merged.get("level"))))
+                    ):
+                        merged["level"] = ols_match.get("level")
                 else:
                     for _, dst in OLS_COPY_KEYS:
                         merged[dst] = np.nan
