@@ -298,6 +298,291 @@ def _strip_level(term: str, group_pattern: str) -> str:
     return term[len(group_pattern):].lstrip(".[]")
 
 
+# -------- Tobit (left-censored) regression for low-fraction cell types -----
+
+def _tobit_fit_mle(
+    X: np.ndarray,
+    y: np.ndarray,
+    censored: np.ndarray,
+    L: float,
+    weights: Optional[np.ndarray] = None,
+) -> Optional[dict]:
+    """Fit a left-censored linear model by maximum likelihood.
+
+    Model: y_latent = X @ beta + eps,   eps ~ N(0, sigma^2)
+    Observed: y_obs[i] = y_latent[i] if not censored, else known to be <= L.
+
+    Log-likelihood:
+        sum_i  (1 - c_i) * (log phi((y_i - X_i beta)/sigma) - log sigma)
+              + c_i * log Phi((L - X_i beta)/sigma)
+    where phi/Phi are the standard normal pdf/cdf.
+
+    Returns dict with keys: beta (length p), sigma, se (length p, from
+    inverse Hessian of negative log-lik), cov (p x p covariance of beta),
+    log_lik. Returns None if optimization fails or there isn't enough data.
+    """
+    from scipy.optimize import minimize
+    norm = _scipy_stats.norm
+    n, p = X.shape
+    if weights is None:
+        weights = np.ones(n)
+    weights = np.asarray(weights, dtype=float)
+
+    # Need at least p+1 observed samples to identify beta and sigma.
+    if (~censored).sum() < p + 1:
+        return None
+
+    def neg_log_lik(theta):
+        beta = theta[:p]
+        log_sigma = theta[p]
+        sigma = np.exp(log_sigma)
+        mu = X @ beta
+        # observed contribution
+        obs_mask = ~censored
+        z_obs = (y[obs_mask] - mu[obs_mask]) / sigma
+        ll_obs = norm.logpdf(z_obs) - log_sigma
+        ll_obs = (weights[obs_mask] * ll_obs).sum()
+        # censored contribution (left-censored at L)
+        if censored.any():
+            z_cen = (L - mu[censored]) / sigma
+            ll_cen = norm.logcdf(z_cen)
+            ll_cen = (weights[censored] * ll_cen).sum()
+        else:
+            ll_cen = 0.0
+        return -(ll_obs + ll_cen)
+
+    # Initialize from OLS on observed-only subset.
+    obs_mask = ~censored
+    beta0, *_ = np.linalg.lstsq(X[obs_mask], y[obs_mask], rcond=None)
+    resid = y[obs_mask] - X[obs_mask] @ beta0
+    sigma0 = max(float(np.std(resid)), 1e-3)
+    theta0 = np.concatenate([beta0, [np.log(sigma0)]])
+
+    res = minimize(neg_log_lik, theta0, method="BFGS")
+    # BFGS often returns success=False when the objective is nearly flat
+    # (e.g. zero censored observations -> Tobit reduces to OLS) even when
+    # parameters are at the true optimum. Use a softer convergence check
+    # based on whether the objective value is finite and the parameters
+    # are non-degenerate.
+    if not np.isfinite(res.fun) or not np.all(np.isfinite(res.x)):
+        return None
+
+    beta_hat = res.x[:p]
+    sigma_hat = float(np.exp(res.x[p]))
+
+    # SE from inverse Hessian. BFGS returns hess_inv (approximation to
+    # the inverse Hessian of the negative log-likelihood), which is the
+    # asymptotic covariance for MLE. Use only the beta block.
+    try:
+        cov_full = np.asarray(res.hess_inv, dtype=float)
+        cov_beta = cov_full[:p, :p]
+        diag = np.diag(cov_beta)
+        diag = np.where(diag > 0, diag, np.nan)
+        se = np.sqrt(diag)
+    except Exception:
+        cov_beta = np.full((p, p), np.nan)
+        se = np.full(p, np.nan)
+
+    return {
+        "beta": beta_hat,
+        "sigma": sigma_hat,
+        "se": se,
+        "cov": cov_beta,
+        "log_lik": float(-res.fun),
+    }
+
+
+def _tobit_conditional_expectation(
+    X: np.ndarray, beta: np.ndarray, sigma: float, L: float
+) -> np.ndarray:
+    """For each row, E[y_latent | y_latent <= L, X] under the fitted normal
+    model. Used to "fill in" censored observations for visualization.
+
+    Closed form: E[y | y <= L] = mu - sigma * phi(alpha) / Phi(alpha)
+    where alpha = (L - mu) / sigma.
+    """
+    norm = _scipy_stats.norm
+    mu = X @ beta
+    alpha = (L - mu) / sigma
+    # Avoid divide-by-zero when alpha is extremely positive (Phi -> 1)
+    cdf = norm.cdf(alpha)
+    pdf = norm.pdf(alpha)
+    safe = np.where(cdf > 1e-12, cdf, 1e-12)
+    return mu - sigma * (pdf / safe)
+
+
+def fit_one_celltype_tobit(
+    cell_type: str,
+    w_raw_for_ct: pd.Series,
+    df_meta: pd.DataFrame,
+    group_col: str,
+    covariates: list,
+    test: str,
+    weights: Optional[pd.Series] = None,
+    censor_floor: float = 1e-4,
+    return_fitted: bool = False,
+) -> object:
+    """Tobit (left-censored) regression for one cell type's proportion.
+
+    The response is log10(proportion). Samples with raw proportion at or
+    below `censor_floor` are treated as left-censored at log10(censor_floor)
+    -- i.e. we know their true value is somewhere below the floor but not
+    exactly where. The MLE handles the censoring directly without imputing.
+
+    Returns a dict (omnibus) or list of dicts (pairwise) matching the
+    fit_one_celltype interface so it can be merged into the same results
+    DataFrame. The 'effect_clr' column is reused to carry the log10-scale
+    coefficient (a slight abuse of nomenclature but keeps downstream code
+    uniform; the value is interpretable as a log10 fold-change in
+    proportion).
+
+    If `return_fitted` is True, attaches a 'fitted_log10_props' Series to
+    the result (per sample) for visualization. For censored samples this
+    is the model's conditional expectation E[y | y <= L]; for observed
+    samples it's the raw log10(proportion).
+    """
+    import patsy
+    norm = _scipy_stats.norm
+
+    common = w_raw_for_ct.index.intersection(df_meta.index)
+    df = df_meta.reindex(common).copy()
+    y_raw = w_raw_for_ct.reindex(common).astype(float)
+
+    needed = [group_col] + covariates
+    valid = df[needed].notna().all(axis=1) & y_raw.notna()
+    df = df.loc[valid]
+    y_raw = y_raw.loc[valid]
+    if weights is not None:
+        weights = weights.reindex(df.index)
+
+    if len(df) < len(covariates) + 3:
+        return {
+            "cell_type": cell_type,
+            "p_value": float("nan"),
+            "n_samples": int(len(df)),
+            "method": "tobit",
+        }
+
+    # Censoring on the proportion scale at or below `censor_floor`.
+    L = float(np.log10(censor_floor))
+    censored = (y_raw <= censor_floor).to_numpy()
+    y = np.log10(y_raw.clip(lower=censor_floor)).to_numpy()
+    # For censored rows, y is set to L (the censoring threshold) — the
+    # MLE uses `censored` to know whether to apply pdf or cdf.
+    y[censored] = L
+
+    # Build design matrix with patsy. We don't actually use the y from
+    # patsy (we substitute our log10/censored values), but patsy gives
+    # us the column ordering for the Categorical group.
+    df["__y_dummy"] = y  # placeholder
+    formula = build_formula("__y_dummy", group_col, covariates, df)
+    _, X_design = patsy.dmatrices(formula, df, return_type="dataframe")
+    X = X_design.to_numpy()
+    col_names = list(X_design.columns)
+
+    weights_arr = (
+        weights.to_numpy() if weights is not None else None
+    )
+    fit = _tobit_fit_mle(X, y, censored, L, weights=weights_arr)
+    if fit is None:
+        return {
+            "cell_type": cell_type,
+            "p_value": float("nan"),
+            "n_samples": int(len(df)),
+            "method": "tobit",
+        }
+
+    base = {
+        "cell_type": cell_type,
+        "n_samples": int(len(df)),
+        "n_censored": int(censored.sum()),
+        "n_observed": int((~censored).sum()),
+        "s2_resid": float(fit["sigma"] ** 2),
+        "df_resid": float(len(df) - len(fit["beta"])),
+        "method": "tobit",
+        "censor_floor": float(censor_floor),
+    }
+
+    group_pattern = f'C(Q("{group_col}"))'
+    group_idx = [
+        i for i, name in enumerate(col_names)
+        if name.startswith(group_pattern)
+    ]
+
+    # Build the optional per-sample fitted Series for visualization.
+    fitted_series = None
+    if return_fitted:
+        fit_log10 = _tobit_conditional_expectation(
+            X, fit["beta"], fit["sigma"], L
+        )
+        # Observed samples keep their actual log10 proportion; censored
+        # samples take the conditional expectation.
+        fit_log10 = np.where(censored, fit_log10, y)
+        fitted_series = pd.Series(fit_log10, index=df.index)
+        base["fitted_log10_props"] = fitted_series
+
+    if test == "omnibus":
+        # Wald chi-square test on the joint group coefficients.
+        if not group_idx:
+            base["p_value"] = float("nan")
+            base["F_stat"] = float("nan")
+            base["df_group"] = float("nan")
+        else:
+            beta_g = fit["beta"][group_idx]
+            cov_g = fit["cov"][np.ix_(group_idx, group_idx)]
+            try:
+                W = float(beta_g @ np.linalg.solve(cov_g, beta_g))
+                q = len(group_idx)
+                p_chi = float(_scipy_stats.chi2.sf(W, df=q))
+                base["p_value"] = p_chi
+                base["F_stat"] = W / q  # for downstream column compat
+                base["df_group"] = float(q)
+            except Exception:
+                base["p_value"] = float("nan")
+                base["F_stat"] = float("nan")
+                base["df_group"] = float("nan")
+        if group_idx:
+            mags = [
+                (col_names[i], float(fit["beta"][i])) for i in group_idx
+            ]
+            top_term, top_coef = max(mags, key=lambda x: abs(x[1]))
+            base["max_effect_clr"] = top_coef
+            base["max_effect_level"] = _strip_level(top_term, group_pattern)
+        else:
+            base["max_effect_clr"] = float("nan")
+            base["max_effect_level"] = None
+        base["r_squared"] = float("nan")
+        return base
+
+    # Pairwise: emit one row per non-reference group level.
+    rows = []
+    for i in group_idx:
+        term_name = col_names[i]
+        level = _strip_level(term_name, group_pattern)
+        beta_val = float(fit["beta"][i])
+        se_val = float(fit["se"][i]) if np.isfinite(fit["se"][i]) else float("nan")
+        if np.isfinite(se_val) and se_val > 0:
+            t_val = beta_val / se_val
+            p_val = float(2.0 * norm.sf(abs(t_val)))
+        else:
+            p_val = float("nan")
+        rows.append({
+            **base,
+            "level": level,
+            "effect_clr": beta_val,  # log10-scale coefficient
+            "std_err": se_val,
+            "p_value": p_val,
+            "r_squared": float("nan"),
+        })
+    if not rows:
+        rows.append({
+            **base, "level": None, "effect_clr": float("nan"),
+            "std_err": float("nan"), "p_value": float("nan"),
+            "r_squared": float("nan"),
+        })
+    return rows
+
+
 # -------- Empirical-Bayes variance shrinkage (limma / Smyth 2004) ----------
 
 def _winsorize(arr: np.ndarray, k: float = 1.5) -> np.ndarray:
@@ -1649,6 +1934,7 @@ def plot_per_celltype_pdf(
     verbose: bool = False,
     w_refined: Optional[pd.DataFrame] = None,
     view_mode: str = "raw",
+    tobit_fitted_log10: Optional[dict] = None,
 ) -> None:
     """Write one violin+jitter plot per cell type to a multi-page PDF.
 
@@ -1752,9 +2038,21 @@ def plot_per_celltype_pdf(
                 )
 
             if show_dual:
-                fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
+                # Determine panel count: 3 if a Tobit fit is available
+                # for this cell type, otherwise 2.
+                tobit_series = (
+                    tobit_fitted_log10.get(ct)
+                    if tobit_fitted_log10 is not None else None
+                )
+                n_panels = 3 if tobit_series is not None else 2
+                fig, axes = plt.subplots(
+                    1, n_panels,
+                    figsize=(5.5 * n_panels, 4.8),
+                )
+                if n_panels == 1:
+                    axes = [axes]
                 # Left: raw data, annotated with the non-parametric (MW/KW)
-                # p-value -- which is computed on raw values upstream.
+                # p-value -- computed on raw values upstream.
                 _draw_violin_panel(
                     axes[0], ct, w, group_levels, meta_aligned, group_col,
                     plot_scale, w_clr_full, test, rng,
@@ -1762,15 +2060,53 @@ def plot_per_celltype_pdf(
                     primary_p_dict=mw_dict if has_mw else {None: float("nan")},
                     primary_p_label=f"{np_label} p",
                 )
-                # Right: refined data, annotated with the parametric p-value
-                # -- the regression is on refined CLR.
+                # Middle: refined data, annotated with the parametric p
+                # from the OLS regression on refined CLR.
                 _draw_violin_panel(
                     axes[1], ct, w_refined, group_levels, meta_aligned,
                     group_col, plot_scale, w_refined_clr_full, test, rng,
-                    panel_title="Refined (zeros → CI_upper/2; used for regression)",
+                    panel_title="Refined (zeros → CI_upper/2; OLS)",
                     primary_p_dict=param_dict,
                     primary_p_label="p",
                 )
+                # Right (if available): Tobit-fitted values. Censored
+                # samples sit at the model's conditional expectation;
+                # observed samples retain their actual values.
+                if tobit_series is not None:
+                    # Convert log10 -> proportion for the proportion scale.
+                    if plot_scale == "proportion":
+                        w_tobit_ct = pd.DataFrame(
+                            {ct: 10 ** tobit_series},
+                            index=tobit_series.index,
+                        )
+                    elif plot_scale == "log-proportion":
+                        # Already log10; convert back to proportion before
+                        # the panel log10s it again -> 10^(log10 of proportion)
+                        # which equals 10^tobit_series. Same as above.
+                        w_tobit_ct = pd.DataFrame(
+                            {ct: 10 ** tobit_series},
+                            index=tobit_series.index,
+                        )
+                    else:  # CLR -- not directly meaningful for Tobit
+                        w_tobit_ct = pd.DataFrame(
+                            {ct: 10 ** tobit_series},
+                            index=tobit_series.index,
+                        )
+                    # Use the Tobit p-value if --method=tobit was used
+                    # AND this cell-type's results are Tobit. We can
+                    # detect by whether the row's "method" is tobit.
+                    tobit_p_dict = param_dict  # primary p row is the
+                                               # Tobit p when method=tobit
+                    _draw_violin_panel(
+                        axes[2], ct, w_tobit_ct, group_levels, meta_aligned,
+                        group_col, plot_scale, None, test, rng,
+                        panel_title=(
+                            "Tobit-fitted (left-censored regression; "
+                            "censored → conditional expectation)"
+                        ),
+                        primary_p_dict=tobit_p_dict,
+                        primary_p_label="Tobit p",
+                    )
                 fig.suptitle(ct, fontsize=12, fontweight="bold")
                 fig.tight_layout()
                 pdf.savefig(fig)
@@ -1916,6 +2252,31 @@ def main() -> int:
              "types (single weight per sample, applied to every cell-type "
              "regression). Requires CI columns. Overridden by "
              "--per-celltype-weights when set.",
+    )
+    p.add_argument(
+        "--method",
+        choices=["ols", "tobit"],
+        default="ols",
+        help="Regression method per cell type. ols (default): the existing "
+             "OLS/WLS on CLR-transformed proportions, with EB/MC/permutation "
+             "all available on top. tobit: left-censored regression on "
+             "log10(proportion); samples with proportion <= --tobit-floor "
+             "are treated as below detection (left-censored at "
+             "log10(--tobit-floor)) rather than imputed via "
+             "--refine-zeros-with-ci. The Tobit MLE handles the censoring "
+             "directly without inventing values, which is the right thing "
+             "to do when many samples sit at the NNLS zero floor. Note "
+             "that Tobit fits on raw proportions (CLR is bypassed) and "
+             "EB shrinkage / ALDEx2 MC are not applied to Tobit results.",
+    )
+    p.add_argument(
+        "--tobit-floor",
+        type=float,
+        default=1e-4,
+        help="Left-censoring threshold on the proportion scale for "
+             "--method tobit. Samples with proportion <= this value are "
+             "treated as below detection. Default: 1e-4 (matches the "
+             "BetaValueDeconvolution NNLS effective floor).",
     )
     p.add_argument(
         "--per-celltype-weights",
@@ -2316,11 +2677,16 @@ def main() -> int:
     weights = weights_spec
 
     # ---- Fit per cell type --------------------------------------------
+    # Tobit takes a different path: it uses the raw-proportion matrix
+    # (not CLR) and explicit left-censoring at --tobit-floor. We collect
+    # per-cell-type fitted Series for the visualization.
+    tobit_fitted_log10: dict = {}  # ct -> pd.Series of log10 fitted values
+    tobit_censored_mask: dict = {}  # ct -> pd.Series of bool (True if censored)
+
     rows: list[dict] = []
     for ct in cell_types:
         df_ct, w_ct = _resolve_celltype_weights(weights_spec, df, ct)
         if df_ct.shape[0] < 3:
-            # Hard mask removed nearly all samples for this cell type.
             if args.verbose:
                 print(
                     f"WARNING: per-CT mask left {df_ct.shape[0]} samples "
@@ -2334,9 +2700,50 @@ def main() -> int:
             }
         else:
             try:
-                res = fit_one_celltype(
-                    ct, df_ct, args.group_col, covariates, args.test, w_ct
-                )
+                if args.method == "tobit":
+                    # Tobit fit takes raw proportions (not CLR). We
+                    # build a meta-only df and pass the raw-proportion
+                    # Series for this cell type separately.
+                    if ct not in w_raw.columns:
+                        res = {
+                            "cell_type": ct, "p_value": np.nan,
+                            "n_samples": 0, "method": "tobit",
+                        }
+                    else:
+                        meta_only = df_ct[
+                            [c for c in df_ct.columns if c not in w_clr.columns]
+                        ]
+                        w_raw_ct = w_raw[ct].reindex(df_ct.index)
+                        # Censored mask (for visualization)
+                        cens_mask = (w_raw_ct <= args.tobit_floor)
+                        tobit_censored_mask[ct] = cens_mask
+                        res = fit_one_celltype_tobit(
+                            cell_type=ct,
+                            w_raw_for_ct=w_raw_ct,
+                            df_meta=meta_only,
+                            group_col=args.group_col,
+                            covariates=covariates,
+                            test=args.test,
+                            weights=w_ct,
+                            censor_floor=args.tobit_floor,
+                            return_fitted=True,
+                        )
+                        # Pop the per-sample fitted Series out of the
+                        # result dict(s) so it doesn't pollute the TSV.
+                        if isinstance(res, list):
+                            for r in res:
+                                fs = r.pop("fitted_log10_props", None)
+                                if fs is not None:
+                                    tobit_fitted_log10[ct] = fs
+                        else:
+                            fs = res.pop("fitted_log10_props", None)
+                            if fs is not None:
+                                tobit_fitted_log10[ct] = fs
+                else:
+                    res = fit_one_celltype(
+                        ct, df_ct, args.group_col, covariates,
+                        args.test, w_ct,
+                    )
             except Exception as exc:  # pragma: no cover
                 if args.verbose:
                     print(f"WARNING: fit failed for {ct}: {exc}", file=sys.stderr)
@@ -2687,6 +3094,11 @@ def main() -> int:
             sort_by="q_value" if "q_value" in results.columns else "p_value",
             fdr_alpha=args.fdr_alpha,
             verbose=args.verbose,
+            tobit_fitted_log10=(
+                tobit_fitted_log10
+                if (args.method == "tobit" and tobit_fitted_log10)
+                else None
+            ),
         )
 
     return 0
