@@ -1763,8 +1763,10 @@ def _draw_violin_panel(
     panel_title: str,
     primary_p_dict: dict,
     primary_p_label: str,
+    primary_q_dict: Optional[dict] = None,
     secondary_p_dict: Optional[dict] = None,
     secondary_p_label: Optional[str] = None,
+    secondary_q_dict: Optional[dict] = None,
 ) -> None:
     """Draw violins + jittered points + comparison brackets for one cell type
     on the given axis, annotated with a primary p-value (and optional
@@ -1854,14 +1856,30 @@ def _draw_violin_panel(
     y_min, y_max = float(all_vals.min()), float(all_vals.max())
     y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
 
+    def _format_pq(p_label, p_val, q_val):
+        if not np.isfinite(p_val):
+            return None
+        s = f"{p_label} = {p_val:.3g}"
+        if q_val is not None and np.isfinite(q_val):
+            s += f"  (q = {q_val:.3g})"
+        return s
+
     if test == "pairwise" and len(group_levels) >= 2:
         bracket_y = y_max + 0.04 * y_range
         tick = 0.015 * y_range
         for j, g in enumerate(group_levels[1:], start=1):
             p = primary_p_dict.get(g, float("nan"))
+            q_primary = (
+                primary_q_dict.get(g, float("nan"))
+                if primary_q_dict is not None else None
+            )
             sec_p = (
                 secondary_p_dict.get(g, float("nan"))
                 if secondary_p_dict is not None else float("nan")
+            )
+            sec_q = (
+                secondary_q_dict.get(g, float("nan"))
+                if secondary_q_dict is not None else None
             )
             if not np.isfinite(p):
                 continue
@@ -1871,29 +1889,45 @@ def _draw_violin_panel(
                  bracket_y + tick, bracket_y],
                 color="black", linewidth=0.8,
             )
-            label = f"{primary_p_label} = {p:.3g}"
-            if secondary_p_label is not None and np.isfinite(sec_p):
-                label = label + f"\n{secondary_p_label} = {sec_p:.3g}"
+            primary_line = _format_pq(primary_p_label, p, q_primary)
+            sec_line = (
+                _format_pq(secondary_p_label, sec_p, sec_q)
+                if secondary_p_label is not None else None
+            )
+            label = primary_line
+            if sec_line is not None:
+                label = label + "\n" + sec_line
             ax.text(
                 (0 + j) / 2.0,
                 bracket_y + tick * 1.4,
                 label,
                 ha="center", va="bottom", fontsize=9,
             )
-            two_line = (
-                secondary_p_label is not None and np.isfinite(sec_p)
-            )
+            two_line = sec_line is not None
             bracket_y += y_range * (0.14 if two_line else 0.10)
     else:
         p = primary_p_dict.get(None, float("nan"))
+        q_primary = (
+            primary_q_dict.get(None, float("nan"))
+            if primary_q_dict is not None else None
+        )
         sec_p = (
             secondary_p_dict.get(None, float("nan"))
             if secondary_p_dict is not None else float("nan")
         )
+        sec_q = (
+            secondary_q_dict.get(None, float("nan"))
+            if secondary_q_dict is not None else None
+        )
         if np.isfinite(p):
-            label = f"{primary_p_label} = {p:.3g}"
-            if secondary_p_label is not None and np.isfinite(sec_p):
-                label = label + f"\n{secondary_p_label} = {sec_p:.3g}"
+            primary_line = _format_pq(primary_p_label, p, q_primary)
+            sec_line = (
+                _format_pq(secondary_p_label, sec_p, sec_q)
+                if secondary_p_label is not None else None
+            )
+            label = primary_line
+            if sec_line is not None:
+                label = label + "\n" + sec_line
             ax.text(
                 0.5, 0.96,
                 label,
@@ -1965,23 +1999,36 @@ def plot_per_celltype_pdf(
             f"results columns: {sorted(results.columns)}"
         )
     has_mw = "p_value_mw" in results.columns
-    if test == "pairwise" and "level" in results.columns:
-        p_lookup: dict = {}
-        mw_lookup: dict = {}
-        for _, r in results.iterrows():
-            p_lookup.setdefault(r["cell_type"], {})[
-                r.get("level")
-            ] = r.get(pvalue_source, float("nan"))
-            if has_mw:
-                mw_lookup.setdefault(r["cell_type"], {})[
-                    r.get("level")
-                ] = r.get("p_value_mw", float("nan"))
-    else:
-        p_lookup = dict(zip(results["cell_type"], results[pvalue_source]))
-        mw_lookup = (
-            dict(zip(results["cell_type"], results["p_value_mw"]))
-            if has_mw else {}
-        )
+    has_q = "q_value" in results.columns
+    has_q_mw = "q_value_mw" in results.columns
+    # When --method=tobit, OLS shadow lives in p_value_ols / q_value_ols;
+    # the primary p_value/q_value are Tobit. When --method=ols, p_value
+    # IS OLS and there's no separate ols column.
+    has_ols_shadow = "p_value_ols" in results.columns
+    has_q_ols_shadow = "q_value_ols" in results.columns
+
+    def _build_lookup(col_name):
+        """Build {cell_type: {level: value}} or {cell_type: value} from
+        a results column, robust to the column being absent."""
+        if col_name not in results.columns:
+            return {}
+        if test == "pairwise" and "level" in results.columns:
+            out: dict = {}
+            for _, r in results.iterrows():
+                out.setdefault(r["cell_type"], {})[r.get("level")] = (
+                    r.get(col_name, float("nan"))
+                )
+            return out
+        return dict(zip(results["cell_type"], results[col_name]))
+
+    # Primary p (current --plot-pvalue-source -- usually p_value)
+    p_lookup = _build_lookup(pvalue_source)
+    q_lookup = _build_lookup("q_value")
+    mw_lookup = _build_lookup("p_value_mw")
+    mw_q_lookup = _build_lookup("q_value_mw")
+    # OLS-shadow columns (only present when --method=tobit ran OLS too).
+    ols_lookup = _build_lookup("p_value_ols")
+    ols_q_lookup = _build_lookup("q_value_ols")
 
     # Group ordering: respect the Categorical category order when set
     # (so the user's --reference-group becomes the leftmost violin).
@@ -2020,26 +2067,28 @@ def plot_per_celltype_pdf(
             if ct not in w.columns:
                 continue
 
-            # Build per-cell-type p-value dicts (level -> p) for both
-            # parametric and non-parametric, with sentinel None key for
-            # omnibus mode.
-            if test == "pairwise" and "level" in results.columns:
-                param_dict = p_lookup.get(ct, {})
-                mw_dict = mw_lookup.get(ct, {}) if has_mw else {}
-                if not isinstance(param_dict, dict):
-                    param_dict = {None: param_dict}
-                if not isinstance(mw_dict, dict):
-                    mw_dict = {None: mw_dict}
-            else:
-                param_dict = {None: p_lookup.get(ct, float("nan"))}
-                mw_dict = (
-                    {None: mw_lookup.get(ct, float("nan"))}
-                    if has_mw else {}
-                )
+            # Build per-cell-type (p, q) dicts for each panel. When
+            # --method=tobit, primary p_lookup IS Tobit and ols_lookup
+            # is OLS-on-refined; otherwise primary IS OLS and there's
+            # no separate ols_lookup.
+            def _per_ct(lookup):
+                v = lookup.get(ct, {}) if lookup else {}
+                if test == "pairwise" and "level" in results.columns:
+                    return v if isinstance(v, dict) else {None: v}
+                return {None: v if not isinstance(v, dict) else v.get(None, float("nan"))}
+
+            param_dict = _per_ct(p_lookup)        # primary (Tobit if method=tobit, else OLS)
+            param_q_dict = _per_ct(q_lookup)
+            mw_dict = _per_ct(mw_lookup) if has_mw else {}
+            mw_q_dict = _per_ct(mw_q_lookup) if has_q_mw else {}
+            ols_dict = (
+                _per_ct(ols_lookup) if has_ols_shadow else param_dict
+            )
+            ols_q_dict = (
+                _per_ct(ols_q_lookup) if has_q_ols_shadow else param_q_dict
+            )
 
             if show_dual:
-                # Determine panel count: 3 if a Tobit fit is available
-                # for this cell type, otherwise 2.
                 tobit_series = (
                     tobit_fitted_log10.get(ct)
                     if tobit_fitted_log10 is not None else None
@@ -2051,52 +2100,31 @@ def plot_per_celltype_pdf(
                 )
                 if n_panels == 1:
                     axes = [axes]
-                # Left: raw data, annotated with the non-parametric (MW/KW)
-                # p-value -- computed on raw values upstream.
+                # Left: raw data with MW (p, q).
                 _draw_violin_panel(
                     axes[0], ct, w, group_levels, meta_aligned, group_col,
                     plot_scale, w_clr_full, test, rng,
                     panel_title="Raw (NNLS output)",
                     primary_p_dict=mw_dict if has_mw else {None: float("nan")},
                     primary_p_label=f"{np_label} p",
+                    primary_q_dict=mw_q_dict if has_q_mw else None,
                 )
-                # Middle: refined data, annotated with the parametric p
-                # from the OLS regression on refined CLR.
+                # Middle: refined data with OLS (p, q). When --method=ols
+                # this is just the primary; when --method=tobit this is
+                # the OLS shadow column from the parallel OLS fit.
                 _draw_violin_panel(
                     axes[1], ct, w_refined, group_levels, meta_aligned,
                     group_col, plot_scale, w_refined_clr_full, test, rng,
                     panel_title="Refined (zeros → CI_upper/2; OLS)",
-                    primary_p_dict=param_dict,
+                    primary_p_dict=ols_dict,
                     primary_p_label="p",
+                    primary_q_dict=ols_q_dict,
                 )
-                # Right (if available): Tobit-fitted values. Censored
-                # samples sit at the model's conditional expectation;
-                # observed samples retain their actual values.
                 if tobit_series is not None:
-                    # Convert log10 -> proportion for the proportion scale.
-                    if plot_scale == "proportion":
-                        w_tobit_ct = pd.DataFrame(
-                            {ct: 10 ** tobit_series},
-                            index=tobit_series.index,
-                        )
-                    elif plot_scale == "log-proportion":
-                        # Already log10; convert back to proportion before
-                        # the panel log10s it again -> 10^(log10 of proportion)
-                        # which equals 10^tobit_series. Same as above.
-                        w_tobit_ct = pd.DataFrame(
-                            {ct: 10 ** tobit_series},
-                            index=tobit_series.index,
-                        )
-                    else:  # CLR -- not directly meaningful for Tobit
-                        w_tobit_ct = pd.DataFrame(
-                            {ct: 10 ** tobit_series},
-                            index=tobit_series.index,
-                        )
-                    # Use the Tobit p-value if --method=tobit was used
-                    # AND this cell-type's results are Tobit. We can
-                    # detect by whether the row's "method" is tobit.
-                    tobit_p_dict = param_dict  # primary p row is the
-                                               # Tobit p when method=tobit
+                    w_tobit_ct = pd.DataFrame(
+                        {ct: 10 ** tobit_series},
+                        index=tobit_series.index,
+                    )
                     _draw_violin_panel(
                         axes[2], ct, w_tobit_ct, group_levels, meta_aligned,
                         group_col, plot_scale, None, test, rng,
@@ -2104,8 +2132,9 @@ def plot_per_celltype_pdf(
                             "Tobit-fitted (left-censored regression; "
                             "censored → conditional expectation)"
                         ),
-                        primary_p_dict=tobit_p_dict,
+                        primary_p_dict=param_dict,  # primary = Tobit
                         primary_p_label="Tobit p",
+                        primary_q_dict=param_q_dict,
                     )
                 fig.suptitle(ct, fontsize=12, fontweight="bold")
                 fig.tight_layout()
@@ -2113,36 +2142,27 @@ def plot_per_celltype_pdf(
                 plt.close(fig)
                 n_pages_written += 1
             else:
-                # Single panel. Pick which matrix to plot and which p to
-                # call "primary"; show the other as a secondary line so
-                # readers still see both numbers.
+                # Single panel: primary p is whatever the user picked
+                # via --plot-pvalue-source; MW shown as secondary.
                 if use_refined_only:
                     plot_mat = w_refined
                     plot_clr = w_refined_clr_full
-                    panel_title = ""  # cell-type name goes in ax title
-                    primary = param_dict
-                    primary_label = "p"
-                    secondary = mw_dict if has_mw else None
-                    secondary_label = f"{np_label} p" if has_mw else None
                 else:
                     plot_mat = w
                     plot_clr = w_clr_full
-                    panel_title = ""
-                    # When refinement is off, "p" matches what's drawn; keep
-                    # primary = parametric, secondary = MW.
-                    primary = param_dict
-                    primary_label = "p"
-                    secondary = mw_dict if has_mw else None
-                    secondary_label = f"{np_label} p" if has_mw else None
                 fig, ax = plt.subplots(figsize=(5.5, 4.5))
                 _draw_violin_panel(
                     ax, ct, plot_mat, group_levels, meta_aligned, group_col,
                     plot_scale, plot_clr, test, rng,
-                    panel_title=panel_title,
-                    primary_p_dict=primary,
-                    primary_p_label=primary_label,
-                    secondary_p_dict=secondary,
-                    secondary_p_label=secondary_label,
+                    panel_title="",
+                    primary_p_dict=param_dict,
+                    primary_p_label="p",
+                    primary_q_dict=param_q_dict,
+                    secondary_p_dict=mw_dict if has_mw else None,
+                    secondary_p_label=(
+                        f"{np_label} p" if has_mw else None
+                    ),
+                    secondary_q_dict=mw_q_dict if has_q_mw else None,
                 )
                 ax.set_title(ct, fontsize=11)
                 fig.tight_layout()
@@ -2695,6 +2715,71 @@ def main() -> int:
     tobit_censored_mask: dict = {}  # ct -> pd.Series of bool (True if censored)
 
     rows: list[dict] = []
+
+    def _list_or_dict_to_list(x):
+        if x is None:
+            return []
+        return x if isinstance(x, list) else [x]
+
+    def _ols_fit_for_ct(ct, df_ct, w_ct):
+        try:
+            return fit_one_celltype(
+                ct, df_ct, args.group_col, covariates, args.test, w_ct,
+            )
+        except Exception as exc:  # pragma: no cover
+            if args.verbose:
+                print(
+                    f"WARNING: OLS fit failed for {ct}: {exc}",
+                    file=sys.stderr,
+                )
+            return None
+
+    def _tobit_fit_for_ct(ct, df_ct, w_ct):
+        if ct not in w_raw.columns:
+            return None
+        try:
+            meta_only = df_ct[
+                [c for c in df_ct.columns if c not in w_clr.columns]
+            ]
+            w_raw_ct = w_raw[ct].reindex(df_ct.index)
+            tobit_censored_mask[ct] = (w_raw_ct <= args.tobit_floor)
+            res = fit_one_celltype_tobit(
+                cell_type=ct,
+                w_raw_for_ct=w_raw_ct,
+                df_meta=meta_only,
+                group_col=args.group_col,
+                covariates=covariates,
+                test=args.test,
+                weights=w_ct,
+                censor_floor=args.tobit_floor,
+                return_fitted=True,
+            )
+            for r in _list_or_dict_to_list(res):
+                fs = r.pop("fitted_log10_props", None)
+                if fs is not None:
+                    tobit_fitted_log10[ct] = fs
+            return res
+        except Exception as exc:  # pragma: no cover
+            if args.verbose:
+                print(
+                    f"WARNING: Tobit fit failed for {ct}: {exc}",
+                    file=sys.stderr,
+                )
+            return None
+
+    # Suffixes copied from OLS into Tobit-primary rows, so the TSV always
+    # carries an OLS shadow for the middle plot panel and for the
+    # MW/OLS fallback when Tobit is NA.
+    OLS_COPY_KEYS = (
+        ("p_value", "p_value_ols"),
+        ("effect_clr", "effect_clr_ols"),
+        ("std_err", "std_err_ols"),
+        ("s2_resid", "s2_resid_ols"),
+        ("df_resid", "df_resid_ols"),
+        ("F_stat", "F_stat_ols"),
+        ("df_group", "df_group_ols"),
+    )
+
     for ct in cell_types:
         df_ct, w_ct = _resolve_celltype_weights(weights_spec, df, ct)
         if df_ct.shape[0] < 3:
@@ -2704,69 +2789,70 @@ def main() -> int:
                     f"for {ct}; skipping.",
                     file=sys.stderr,
                 )
-            res = {
-                "cell_type": ct,
-                "p_value": np.nan,
+            rows.append({
+                "cell_type": ct, "p_value": np.nan,
                 "n_samples": int(df_ct.shape[0]),
-            }
-        else:
-            try:
-                if args.method == "tobit":
-                    # Tobit fit takes raw proportions (not CLR). We
-                    # build a meta-only df and pass the raw-proportion
-                    # Series for this cell type separately.
-                    if ct not in w_raw.columns:
-                        res = {
-                            "cell_type": ct, "p_value": np.nan,
-                            "n_samples": 0, "method": "tobit",
-                        }
-                    else:
-                        meta_only = df_ct[
-                            [c for c in df_ct.columns if c not in w_clr.columns]
-                        ]
-                        w_raw_ct = w_raw[ct].reindex(df_ct.index)
-                        # Censored mask (for visualization)
-                        cens_mask = (w_raw_ct <= args.tobit_floor)
-                        tobit_censored_mask[ct] = cens_mask
-                        res = fit_one_celltype_tobit(
-                            cell_type=ct,
-                            w_raw_for_ct=w_raw_ct,
-                            df_meta=meta_only,
-                            group_col=args.group_col,
-                            covariates=covariates,
-                            test=args.test,
-                            weights=w_ct,
-                            censor_floor=args.tobit_floor,
-                            return_fitted=True,
-                        )
-                        # Pop the per-sample fitted Series out of the
-                        # result dict(s) so it doesn't pollute the TSV.
-                        if isinstance(res, list):
-                            for r in res:
-                                fs = r.pop("fitted_log10_props", None)
-                                if fs is not None:
-                                    tobit_fitted_log10[ct] = fs
-                        else:
-                            fs = res.pop("fitted_log10_props", None)
-                            if fs is not None:
-                                tobit_fitted_log10[ct] = fs
+            })
+            continue
+
+        # Always run OLS (so MW + OLS p/q stay populated even when Tobit
+        # fails). When --method=tobit we also run Tobit and use it as
+        # the primary p_value, copying OLS into *_ols suffixes.
+        ols_res = _ols_fit_for_ct(ct, df_ct, w_ct)
+        ols_list = _list_or_dict_to_list(ols_res)
+
+        if args.method == "tobit":
+            tobit_res = _tobit_fit_for_ct(ct, df_ct, w_ct)
+            tobit_list = _list_or_dict_to_list(tobit_res)
+            # Index OLS by level for pairwise so we can pair them.
+            ols_by_level = {r.get("level"): r for r in ols_list}
+
+            if not tobit_list:
+                # Tobit failed entirely: fall back to OLS so MW + OLS
+                # numbers still appear in the TSV. Tag with method=ols
+                # and add a NaN p_value_ols mirror so the schema is
+                # consistent with successful Tobit rows.
+                if not ols_list:
+                    rows.append({
+                        "cell_type": ct, "p_value": np.nan,
+                        "n_samples": 0, "method": "tobit_failed",
+                    })
                 else:
-                    res = fit_one_celltype(
-                        ct, df_ct, args.group_col, covariates,
-                        args.test, w_ct,
-                    )
-            except Exception as exc:  # pragma: no cover
-                if args.verbose:
-                    print(f"WARNING: fit failed for {ct}: {exc}", file=sys.stderr)
-                res = {
-                    "cell_type": ct,
-                    "p_value": np.nan,
-                    "n_samples": 0,
-                }
-        if isinstance(res, list):
-            rows.extend(res)
+                    for r in ols_list:
+                        merged = dict(r)
+                        # Promote OLS to also live in the *_ols mirror.
+                        for src, dst in OLS_COPY_KEYS:
+                            if src in merged:
+                                merged[dst] = merged[src]
+                        merged["method"] = "tobit_failed_ols_fallback"
+                        # The primary p_value stays as OLS (since Tobit
+                        # failed); user can still see q_value normally.
+                        rows.append(merged)
+                continue
+
+            # Tobit succeeded: emit Tobit-primary rows, with OLS shadow
+            # in *_ols columns.
+            for tr in tobit_list:
+                merged = dict(tr)
+                ols_match = ols_by_level.get(tr.get("level"))
+                if ols_match is None and ols_list:
+                    # Omnibus or single-row case
+                    ols_match = ols_list[0]
+                if ols_match is not None:
+                    for src, dst in OLS_COPY_KEYS:
+                        merged[dst] = ols_match.get(src, np.nan)
+                else:
+                    for _, dst in OLS_COPY_KEYS:
+                        merged[dst] = np.nan
+                rows.append(merged)
         else:
-            rows.append(res)
+            # OLS-only path
+            if ols_list:
+                rows.extend(ols_list)
+            else:
+                rows.append({
+                    "cell_type": ct, "p_value": np.nan, "n_samples": 0,
+                })
 
     results = pd.DataFrame(rows)
 
@@ -3031,6 +3117,13 @@ def main() -> int:
 
     # ---- BH FDR -------------------------------------------------------
     results["q_value"] = bh_correct(results["p_value"].to_numpy())
+    # When --method=tobit, the OLS shadow lives in p_value_ols; BH-correct
+    # it independently so the middle plot panel can display its own
+    # q_value distinct from the Tobit primary q_value.
+    if "p_value_ols" in results.columns:
+        results["q_value_ols"] = bh_correct(
+            results["p_value_ols"].to_numpy()
+        )
     results["significant"] = results["q_value"] <= args.fdr_alpha
 
     # Sort by q-value (significant cell types first)
