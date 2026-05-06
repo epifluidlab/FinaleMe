@@ -2279,6 +2279,17 @@ def main() -> int:
              "BetaValueDeconvolution NNLS effective floor).",
     )
     p.add_argument(
+        "--tobit-fitted-output",
+        default=None,
+        help="Path for a per-(sample, cell-type) long-format TSV with the "
+             "raw NNLS proportion, the OLS-refined proportion, the "
+             "Tobit-fitted proportion (model conditional expectation for "
+             "censored samples; observed value otherwise), and a censored "
+             "flag. If omitted, defaults to a sidecar file next to "
+             "--output named '{output_stem}.tobit_fitted.tsv'. Only "
+             "written when --method tobit is set.",
+    )
+    p.add_argument(
         "--per-celltype-weights",
         choices=["none", "ci-width", "ci-width-rel"],
         default="none",
@@ -3028,6 +3039,64 @@ def main() -> int:
     # ---- Output -------------------------------------------------------
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     results.to_csv(args.output, sep="\t", index=False, na_rep="NA")
+
+    # Sidecar TSV with per-(sample, cell-type) Tobit-fitted proportions
+    # (and the matching raw + OLS-refined values for direct comparison).
+    if args.method == "tobit" and tobit_fitted_log10:
+        rows_fitted: list = []
+        for ct, fitted_series in tobit_fitted_log10.items():
+            cens_mask = tobit_censored_mask.get(ct, pd.Series(dtype=bool))
+            for sample in fitted_series.index:
+                log10_fit = fitted_series.loc[sample]
+                fitted_prop = (
+                    float(10 ** log10_fit) if np.isfinite(log10_fit)
+                    else float("nan")
+                )
+                raw_prop = (
+                    float(w_raw.at[sample, ct])
+                    if (ct in w_raw.columns and sample in w_raw.index)
+                    else float("nan")
+                )
+                refined_prop = (
+                    float(w.at[sample, ct])
+                    if (ct in w.columns and sample in w.index)
+                    else float("nan")
+                )
+                is_cens = bool(cens_mask.get(sample, False)) \
+                    if hasattr(cens_mask, "get") else False
+                rows_fitted.append({
+                    "sample": sample,
+                    "cell_type": ct,
+                    "proportion_raw": raw_prop,
+                    "proportion_refined": refined_prop,
+                    "proportion_tobit_fitted": fitted_prop,
+                    "censored": is_cens,
+                    "censor_floor": float(args.tobit_floor),
+                })
+        if rows_fitted:
+            fitted_df = pd.DataFrame(rows_fitted)
+            # Sort for readability: by sample then cell_type
+            fitted_df = fitted_df.sort_values(
+                ["sample", "cell_type"]
+            ).reset_index(drop=True)
+            if args.tobit_fitted_output is not None:
+                fitted_path = args.tobit_fitted_output
+            else:
+                # Sidecar next to --output
+                out_path = Path(args.output)
+                stem = out_path.with_suffix("") if out_path.suffix else out_path
+                fitted_path = str(stem) + ".tobit_fitted.tsv"
+            Path(fitted_path).parent.mkdir(parents=True, exist_ok=True)
+            fitted_df.to_csv(
+                fitted_path, sep="\t", index=False, na_rep="NA"
+            )
+            n_cens_total = int(fitted_df["censored"].sum())
+            print(
+                f"Wrote Tobit-fitted proportions to {fitted_path}: "
+                f"{len(fitted_df):,} (sample, cell-type) rows; "
+                f"{n_cens_total:,} censored.",
+                file=sys.stderr,
+            )
 
     n_sig = int(results["significant"].sum())
     print(
