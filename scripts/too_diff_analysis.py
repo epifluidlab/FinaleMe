@@ -492,13 +492,34 @@ def fit_one_celltype_tobit(
             "method": "tobit",
         }
 
+    # Finite-sample correction. Tobit MLE returns the maximum-likelihood
+    # sigma (no division by df) and asymptotic SEs calibrated under the
+    # standard-normal reference distribution. With n ~ 10 and p ~ 4, both
+    # are systematically anti-conservative -- sigma is biased downward by
+    # n/(n-p), SEs scale with sigma, and the asymptotic chi-square/normal
+    # test reference distributions give p-values orders of magnitude too
+    # small (e.g. p ~ 1e-188 instead of ~1e-7 for a typical small-N hit).
+    #
+    # We apply two OLS-style corrections to bring small-N Tobit into line:
+    #   sigma_corrected^2 = sigma_mle^2 * n / (n - p)   (Bessel)
+    #   SE_corrected      = SE_mle * sqrt(n / (n - p))
+    #   pairwise p:  Student-t with df = n - p, not normal
+    #   omnibus  p:  F-distribution with df1=q, df2=n-p, not chi-square
+    n_total = int(len(df))
+    p_total = int(len(fit["beta"]))
+    df_resid_finite = max(1, n_total - p_total)
+    fs_factor = np.sqrt(n_total / df_resid_finite) if df_resid_finite > 0 else 1.0
+    se_corrected = fit["se"] * fs_factor
+    sigma_corrected_sq = float(fit["sigma"] ** 2) * (n_total / df_resid_finite)
+    cov_corrected = fit["cov"] * (n_total / df_resid_finite)
+
     base = {
         "cell_type": cell_type,
-        "n_samples": int(len(df)),
+        "n_samples": n_total,
         "n_censored": int(censored.sum()),
         "n_observed": int((~censored).sum()),
-        "s2_resid": float(fit["sigma"] ** 2),
-        "df_resid": float(len(df) - len(fit["beta"])),
+        "s2_resid": sigma_corrected_sq,
+        "df_resid": float(df_resid_finite),
         "method": "tobit",
         "censor_floor": float(censor_floor),
     }
@@ -522,20 +543,25 @@ def fit_one_celltype_tobit(
         base["fitted_log10_props"] = fitted_series
 
     if test == "omnibus":
-        # Wald chi-square test on the joint group coefficients.
+        # Wald F-test on the joint group coefficients with finite-sample
+        # corrected covariance (df-adjusted from the BFGS Hessian).
         if not group_idx:
             base["p_value"] = float("nan")
             base["F_stat"] = float("nan")
             base["df_group"] = float("nan")
         else:
             beta_g = fit["beta"][group_idx]
-            cov_g = fit["cov"][np.ix_(group_idx, group_idx)]
+            cov_g = cov_corrected[np.ix_(group_idx, group_idx)]
             try:
                 W = float(beta_g @ np.linalg.solve(cov_g, beta_g))
                 q = len(group_idx)
-                p_chi = float(_scipy_stats.chi2.sf(W, df=q))
-                base["p_value"] = p_chi
-                base["F_stat"] = W / q  # for downstream column compat
+                # Wald F = W/q; F-distribution with (q, n-p) df.
+                F_val = W / q if q > 0 else float("nan")
+                p_F = float(
+                    _scipy_stats.f.sf(F_val, dfn=q, dfd=df_resid_finite)
+                )
+                base["p_value"] = p_F
+                base["F_stat"] = F_val
                 base["df_group"] = float(q)
             except Exception:
                 base["p_value"] = float("nan")
@@ -560,10 +586,17 @@ def fit_one_celltype_tobit(
         term_name = col_names[i]
         level = _strip_level(term_name, group_pattern)
         beta_val = float(fit["beta"][i])
-        se_val = float(fit["se"][i]) if np.isfinite(fit["se"][i]) else float("nan")
-        if np.isfinite(se_val) and se_val > 0:
+        # Finite-sample corrected SE (df-adjusted, OLS-style).
+        se_val = (
+            float(se_corrected[i]) if np.isfinite(se_corrected[i])
+            else float("nan")
+        )
+        if np.isfinite(se_val) and se_val > 0 and df_resid_finite > 0:
             t_val = beta_val / se_val
-            p_val = float(2.0 * norm.sf(abs(t_val)))
+            # Student-t with df = n - p for the Wald p-value.
+            p_val = float(
+                2.0 * _scipy_stats.t.sf(abs(t_val), df=df_resid_finite)
+            )
         else:
             p_val = float("nan")
         rows.append({
