@@ -381,7 +381,7 @@ def _tobit_fit_mle(
 
     # Need at least p+1 observed samples to identify beta and sigma.
     if (~censored).sum() < p + 1:
-        return None
+        return None, "insufficient_observed"
 
     def neg_log_lik(theta):
         beta = theta[:p]
@@ -416,7 +416,7 @@ def _tobit_fit_mle(
     # based on whether the objective value is finite and the parameters
     # are non-degenerate.
     if not np.isfinite(res.fun) or not np.all(np.isfinite(res.x)):
-        return None
+        return None, "optimizer_failed"
 
     beta_hat = res.x[:p]
     sigma_hat = float(np.exp(res.x[p]))
@@ -452,13 +452,18 @@ def _tobit_fit_mle(
         except Exception:
             pass
 
+    # If both numerical Hessian inversion AND BFGS hess_inv fallback
+    # produced non-finite SEs across the board, the information matrix
+    # is singular at the MLE -- mark the status so it surfaces in the
+    # TSV instead of just disappearing as NaN p-values.
+    status = "ok" if np.any(np.isfinite(se)) else "singular_hessian"
     return {
         "beta": beta_hat,
         "sigma": sigma_hat,
         "se": se,
         "cov": cov_beta,
         "log_lik": float(-res.fun),
-    }
+    }, status
 
 
 def _tobit_conditional_expectation(
@@ -530,6 +535,7 @@ def fit_one_celltype_tobit(
             "p_value": float("nan"),
             "n_samples": int(len(df)),
             "method": "tobit",
+            "tobit_status": "insufficient_total",
         }
 
     # Censoring on the proportion scale at or below `censor_floor`.
@@ -552,13 +558,14 @@ def fit_one_celltype_tobit(
     weights_arr = (
         weights.to_numpy() if weights is not None else None
     )
-    fit = _tobit_fit_mle(X, y, censored, L, weights=weights_arr)
+    fit, fit_status = _tobit_fit_mle(X, y, censored, L, weights=weights_arr)
     if fit is None:
         return {
             "cell_type": cell_type,
             "p_value": float("nan"),
             "n_samples": int(len(df)),
             "method": "tobit",
+            "tobit_status": fit_status,
         }
 
     # Finite-sample correction. Tobit MLE returns the maximum-likelihood
@@ -591,6 +598,7 @@ def fit_one_celltype_tobit(
         "df_resid": float(df_resid_finite),
         "method": "tobit",
         "censor_floor": float(censor_floor),
+        "tobit_status": fit_status,
     }
 
     group_pattern = f'C(Q("{group_col}"))'
@@ -3319,6 +3327,7 @@ def main() -> int:
                     rows.append({
                         "cell_type": ct, "p_value": np.nan,
                         "n_samples": 0, "method": "tobit_failed",
+                        "tobit_status": "fit_unavailable",
                     })
                 else:
                     for r in ols_list:
@@ -3328,6 +3337,7 @@ def main() -> int:
                             if src in merged:
                                 merged[dst] = merged[src]
                         merged["method"] = "tobit_failed_ols_fallback"
+                        merged["tobit_status"] = "fit_unavailable"
                         # The primary p_value stays as OLS (since Tobit
                         # failed); user can still see q_value normally.
                         rows.append(merged)
