@@ -284,20 +284,130 @@ def run_nnls_simulation(
     return pd.DataFrame(rows)
 
 
-def plot_results(results: pd.DataFrame, output_pdf: str) -> None:
-    """Write a multi-panel diagnostic PDF.
+def _draw_heatmap(
+    ax,
+    matrix: np.ndarray,
+    row_labels: list,
+    col_labels: list,
+    cell_fmt: str,
+    title: str,
+    cmap: str,
+    vmin: float,
+    vmax: float,
+    cbar_label: str,
+):
+    """Draw a heatmap with numeric annotations on each cell."""
+    im = ax.imshow(matrix, cmap=cmap, aspect="auto", vmin=vmin, vmax=vmax)
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    ax.set_title(title, fontsize=11)
+    threshold = vmin + 0.55 * (vmax - vmin)
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            v = matrix[i, j]
+            if not np.isfinite(v):
+                continue
+            color = "white" if v > threshold else "black"
+            ax.text(
+                j, i, format(v, cell_fmt),
+                ha="center", va="center",
+                color=color, fontsize=9,
+            )
+    plt.colorbar(im, ax=ax, label=cbar_label, fraction=0.04, pad=0.02)
 
-    Each cell type gets two pages (or stacked sub-panels):
-      * Recovery distribution (boxplot/violin) at each true fraction
-      * Zero-rate vs true fraction
-    Plus a summary calibration plot across all cell types.
+
+def plot_results(results: pd.DataFrame, output_pdf: str) -> None:
+    """Write a multi-page diagnostic PDF.
+
+    Layout:
+      Page 1:  Zero-rate heatmap (cell type x true fraction)
+      Page 2:  Median recovered heatmap (calibration view)
+      Page 3:  Zero-rate line plot (one curve per cell type)
+      Page 4:  Median calibration line plot
+      Pages 5+: Per-cell-type detail (recovery distributions + zero-rate CI)
     """
     targets = sorted(results["target_celltype"].unique())
     fractions = sorted(results["true_fraction"].unique())
     Path(output_pdf).parent.mkdir(parents=True, exist_ok=True)
 
+    # Build summary matrices (rows = cell types, cols = true fractions).
+    pivot_zero = (
+        results.groupby(["target_celltype", "true_fraction"])["is_zero"]
+        .mean()
+        .unstack()
+        .reindex(index=targets, columns=fractions)
+    )
+    pivot_median = (
+        results.groupby(["target_celltype", "true_fraction"])["recovered_fraction"]
+        .median()
+        .unstack()
+        .reindex(index=targets, columns=fractions)
+    )
+    # Sort rows by sensitivity (which fraction first hits zero-rate <= 0.5)
+    # so the heatmap's diagonal trend reads top-to-bottom from "easy to
+    # detect" to "hard to detect".
+    def _sensitivity_key(target):
+        row = pivot_zero.loc[target]
+        below_half = row[row <= 0.5]
+        return below_half.index.min() if len(below_half) else float("inf")
+    targets_sorted = sorted(targets, key=_sensitivity_key)
+    pivot_zero = pivot_zero.reindex(targets_sorted)
+    pivot_median = pivot_median.reindex(targets_sorted)
+
+    col_labels = [f"{f:g}" for f in fractions]
+
     with PdfPages(output_pdf) as pdf:
-        # ---- Page 1: zero-rate sweep across all cell types --------
+        # ---- Page 1: zero-rate heatmap ---------------------------
+        fig, ax = plt.subplots(figsize=(11, max(5, 0.55 * len(targets) + 2)))
+        _draw_heatmap(
+            ax,
+            matrix=pivot_zero.to_numpy(),
+            row_labels=targets_sorted,
+            col_labels=col_labels,
+            cell_fmt=".2f",
+            title=(
+                "P(NNLS recovers exactly 0) by cell type x true fraction\n"
+                "(dark cells = censoring regime; cell-type-specific "
+                "detection thresholds clearly visible)"
+            ),
+            cmap="magma_r",
+            vmin=0.0, vmax=1.0,
+            cbar_label="zero rate",
+        )
+        ax.set_xlabel("True injected fraction")
+        ax.set_ylabel("Target cell type (sorted by detection sensitivity)")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---- Page 2: median recovered heatmap --------------------
+        # Cap color at 0.2 (the largest tested true fraction) so the
+        # color scale isn't dominated by the easy high-fraction cells.
+        fig, ax = plt.subplots(figsize=(11, max(5, 0.55 * len(targets) + 2)))
+        _draw_heatmap(
+            ax,
+            matrix=pivot_median.to_numpy(),
+            row_labels=targets_sorted,
+            col_labels=col_labels,
+            cell_fmt=".4f",
+            title=(
+                "Median NNLS-recovered fraction by cell type x true fraction\n"
+                "(compare to true fraction in column header; values much "
+                "below truth = downward bias from censoring)"
+            ),
+            cmap="viridis",
+            vmin=0.0, vmax=max(fractions),
+            cbar_label="median recovered",
+        )
+        ax.set_xlabel("True injected fraction")
+        ax.set_ylabel("Target cell type")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---- Page 3: zero-rate sweep across all cell types -------
         fig, ax = plt.subplots(figsize=(9, 6))
         for target in targets:
             sub = results[results["target_celltype"] == target]

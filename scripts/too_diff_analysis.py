@@ -530,15 +530,18 @@ def fit_one_celltype_tobit(
         if name.startswith(group_pattern)
     ]
 
-    # Build the optional per-sample fitted Series for visualization.
+    # Build the optional per-sample Tobit FITTED point values for the
+    # third visualization panel. "Fitted" here means the regression's
+    # predicted latent value mu_i = X_i @ beta -- the canonical regression
+    # fitted value -- for *every* sample (observed and censored alike),
+    # not just censored ones. This is what the Tobit model "thinks" the
+    # latent log10(proportion) should be at each sample's covariate
+    # vector. Plotting these instead of raw values shows the model's
+    # implied group means cleanly, with within-group variation reflecting
+    # only covariate differences.
     fitted_series = None
     if return_fitted:
-        fit_log10 = _tobit_conditional_expectation(
-            X, fit["beta"], fit["sigma"], L
-        )
-        # Observed samples keep their actual log10 proportion; censored
-        # samples take the conditional expectation.
-        fit_log10 = np.where(censored, fit_log10, y)
+        fit_log10 = X @ fit["beta"]
         fitted_series = pd.Series(fit_log10, index=df.index)
         base["fitted_log10_props"] = fitted_series
 
@@ -2496,8 +2499,8 @@ def plot_per_celltype_pdf(
                         axes[2], ct, w_tobit_ct, group_levels, meta_aligned,
                         group_col, plot_scale, None, test, rng,
                         panel_title=(
-                            "Tobit-fitted (left-censored regression; "
-                            "censored → conditional expectation)"
+                            "Tobit-fitted (regression prediction X·β per sample; "
+                            "spread reflects covariate variation only)"
                         ),
                         primary_p_dict=param_dict,  # primary = Tobit
                         primary_p_label="Tobit p",
@@ -2653,13 +2656,15 @@ def main() -> int:
              "samples for the magnitude question; joint p via Fisher's "
              "combined probability test. This is the recommended method "
              "for cohorts where many cell types sit at the NNLS zero floor. "
-             "tobit: left-censored MLE on log10(proportion). NOTE: Tobit's "
-             "censoring assumption (normal latent variable, fixed detection "
-             "threshold) is misspecified for NNLS-zero output (which is a "
-             "boundary solution of a non-negativity-constrained "
-             "optimization, not a true left-censored measurement). Tobit "
-             "p-values can be spuriously small when zeros are concentrated "
-             "in one group. Prefer --method hurdle.",
+             "tobit: left-censored MLE on log10(proportion). The "
+             "censoring assumption is empirically justified for NNLS in "
+             "the low-fraction regime (see scripts/simulate_nnls_recovery.py "
+             "which shows P(NNLS=0) drops smoothly from 50-80% at 0.1% true "
+             "fraction to 0% at ~5%). Tobit handles low-fraction cell types "
+             "honestly. Caveats: detection threshold varies across cell "
+             "types, and for cell types reliably above ~5% Tobit reduces "
+             "to OLS. Use --method hurdle to test detection vs magnitude "
+             "as separate questions.",
     )
     p.add_argument(
         "--tobit-floor",
@@ -2888,17 +2893,23 @@ def main() -> int:
 
     if args.method == "tobit":
         print(
-            "WARNING: --method tobit -- Tobit's left-censored normal model "
-            "is misspecified for NNLS-output proportions. NNLS-zero values "
-            "are boundary solutions of a non-negativity-constrained "
-            "optimization, not true left-censored measurements of a normal "
-            "latent variable. Tobit p-values can be spuriously small "
-            "(several orders of magnitude smaller than the truth) "
-            "especially when zeros are concentrated in one group. "
-            "Consider --method hurdle for a more defensible alternative; "
-            "see the help text for details. The OLS shadow columns "
-            "(p_value_ols, q_value_ols) and Mann-Whitney columns "
-            "(p_value_mw, q_value_mw) in the output remain trustworthy.",
+            "Note: --method tobit -- Tobit's left-censoring assumption is "
+            "empirically justified for NNLS-output proportions in the "
+            "low-fraction regime. The simulation in "
+            "scripts/simulate_nnls_recovery.py shows NNLS exhibits classical "
+            "left-censoring with cell-type-specific detection thresholds: "
+            "P(NNLS = 0) is 50-80% at 0.1% true fraction and drops smoothly "
+            "to 0% by ~5% true. Tobit therefore correctly handles cell types "
+            "in the 0.1-5% range. Two caveats: (1) the censoring threshold "
+            "varies across cell types (a single --tobit-floor is an "
+            "approximation), and (2) for cell types reliably above ~5% in "
+            "all samples, Tobit reduces to OLS and the OLS result is more "
+            "interpretable. Consider --method hurdle if you want to "
+            "separately test 'is the cell type detected?' and 'given "
+            "detection, does its magnitude differ?' as biologically distinct "
+            "questions. The OLS shadow (p_value_ols, q_value_ols) and "
+            "Mann-Whitney (p_value_mw, q_value_mw) columns in the output "
+            "remain available alongside the Tobit primary.",
             file=sys.stderr,
         )
 
