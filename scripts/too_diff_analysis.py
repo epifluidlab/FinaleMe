@@ -363,6 +363,22 @@ def _tobit_fit_mle(
         weights = np.ones(n)
     weights = np.asarray(weights, dtype=float)
 
+    # Normalize incoming weights to mean=1 (precision-weight semantics).
+    # Without this, large weights from --weighted (e.g. 1/CI_width^2 with
+    # CI widths ~ 0.02-0.05 -> weights of 400-2500) get treated as
+    # FREQUENCY weights inside the log-likelihood: each observation is
+    # effectively replicated w_i times, and the implied effective sample
+    # size becomes N * mean(w) instead of N. The Fisher information
+    # scales with this fake N, the SEs shrink by sqrt(mean(w)), and
+    # Wald p-values collapse by orders of magnitude even when the actual
+    # group difference is small.
+    # Normalizing to mean=1 keeps the effective sample size at N while
+    # preserving the relative precision weighting between samples (so a
+    # tight-CI sample still informs more than a wide-CI sample).
+    w_mean = float(weights.mean()) if weights.size else 1.0
+    if w_mean > 0:
+        weights = weights / w_mean
+
     # Need at least p+1 observed samples to identify beta and sigma.
     if (~censored).sum() < p + 1:
         return None
