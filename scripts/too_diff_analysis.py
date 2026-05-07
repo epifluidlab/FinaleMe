@@ -300,6 +300,41 @@ def _strip_level(term: str, group_pattern: str) -> str:
 
 # -------- Tobit (left-censored) regression for low-fraction cell types -----
 
+def _numerical_hessian(f, x: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    """Symmetric central-difference Hessian of a scalar function at x.
+
+    Used for Tobit's asymptotic covariance, replacing BFGS's iterative
+    hess_inv approximation. The BFGS approximation can be substantially
+    off (especially in small-N or near-flat regions of the likelihood),
+    producing SE estimates that are too small and p-values orders of
+    magnitude too small. Numerical Hessian gives the exact information
+    matrix at the converged MLE.
+
+    Step size scales with each coordinate's magnitude so the
+    finite-difference accuracy is uniform across very different
+    parameter scales (e.g. log_sigma ~ -1 vs beta_age ~ 1e-3).
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    H = np.zeros((n, n), dtype=float)
+    # Per-coordinate step size, floored so step doesn't vanish at x=0.
+    h = eps * np.maximum(np.abs(x), 1.0)
+    for i in range(n):
+        for j in range(i + 1):  # lower triangle
+            xpp = x.copy(); xpp[i] += h[i]; xpp[j] += h[j]
+            xpm = x.copy(); xpm[i] += h[i]; xpm[j] -= h[j]
+            xmp = x.copy(); xmp[i] -= h[i]; xmp[j] += h[j]
+            xmm = x.copy(); xmm[i] -= h[i]; xmm[j] -= h[j]
+            val = (f(xpp) - f(xpm) - f(xmp) + f(xmm)) / (
+                4.0 * h[i] * h[j]
+            )
+            H[i, j] = val
+            H[j, i] = val
+    return H
+
+
+
+
 def _tobit_fit_mle(
     X: np.ndarray,
     y: np.ndarray,
@@ -370,18 +405,36 @@ def _tobit_fit_mle(
     beta_hat = res.x[:p]
     sigma_hat = float(np.exp(res.x[p]))
 
-    # SE from inverse Hessian. BFGS returns hess_inv (approximation to
-    # the inverse Hessian of the negative log-likelihood), which is the
-    # asymptotic covariance for MLE. Use only the beta block.
+    # Asymptotic covariance from the (numerical) information matrix at
+    # the converged MLE. This replaces the BFGS hess_inv approximation,
+    # which is built up iteratively during optimization and can deviate
+    # substantially from the true inverse Hessian when the likelihood
+    # surface is near-flat or when the optimizer terminates in a
+    # poorly-curved region. The mismatch produces SEs that are too small
+    # and Wald p-values that are orders of magnitude too small (we have
+    # observed Tobit p ~ 1e-5 for cell types whose group difference is
+    # visually negligible). Computing H numerically at theta_hat and
+    # inverting gives the correct asymptotic covariance.
+    cov_beta = np.full((p, p), np.nan)
+    se = np.full(p, np.nan)
     try:
-        cov_full = np.asarray(res.hess_inv, dtype=float)
+        H = _numerical_hessian(neg_log_lik, res.x)
+        cov_full = np.linalg.inv(H)
         cov_beta = cov_full[:p, :p]
         diag = np.diag(cov_beta)
         diag = np.where(diag > 0, diag, np.nan)
         se = np.sqrt(diag)
-    except Exception:
-        cov_beta = np.full((p, p), np.nan)
-        se = np.full(p, np.nan)
+    except (np.linalg.LinAlgError, Exception):
+        # Hessian was singular or numerical-diff failed; fall back to
+        # BFGS hess_inv as a last resort.
+        try:
+            cov_full = np.asarray(res.hess_inv, dtype=float)
+            cov_beta = cov_full[:p, :p]
+            diag = np.diag(cov_beta)
+            diag = np.where(diag > 0, diag, np.nan)
+            se = np.sqrt(diag)
+        except Exception:
+            pass
 
     return {
         "beta": beta_hat,
