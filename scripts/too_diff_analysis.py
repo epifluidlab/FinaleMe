@@ -607,20 +607,52 @@ def fit_one_celltype_tobit(
         if name.startswith(group_pattern)
     ]
 
-    # Build the optional per-sample Tobit FITTED point values for the
-    # third visualization panel. "Fitted" here means the regression's
-    # predicted latent value mu_i = X_i @ beta -- the canonical regression
-    # fitted value -- for *every* sample (observed and censored alike),
-    # not just censored ones. This is what the Tobit model "thinks" the
-    # latent log10(proportion) should be at each sample's covariate
-    # vector. Plotting these instead of raw values shows the model's
-    # implied group means cleanly, with within-group variation reflecting
-    # only covariate differences.
-    fitted_series = None
+    # Build the optional per-sample Tobit-derived series used by the
+    # visualization panels:
+    #   fitted_log10_props : the regression's predicted latent value
+    #       mu_i = X_i @ beta for *every* sample (observed and censored
+    #       alike). Plotting these shows the implied covariate-only
+    #       trend; group-wise means become covariate-adjusted group
+    #       centers for the option-1 overlay bars.
+    #   imputed_log10_props : per-sample log10(proportion) where
+    #       uncensored samples keep their observed value and censored
+    #       samples are replaced by the Tobit conditional expectation
+    #       E[Y* | Y* <= L, X] = X_i @ beta - sigma * phi(alpha)/Phi(alpha).
+    #       This is the model's view of what the latent fraction would
+    #       have been if we could see below the detection floor; useful
+    #       as the option-2 panel where imputed dots are drawn as open
+    #       circles to distinguish them from observed (filled) dots.
+    #   censored_mask : per-sample bool flag matching the fit's `censored`
+    #       array. Surfaced so the plot dispatcher knows which samples
+    #       to render with the imputation marker.
     if return_fitted:
         fit_log10 = X @ fit["beta"]
         fitted_series = pd.Series(fit_log10, index=df.index)
         base["fitted_log10_props"] = fitted_series
+
+        # Imputed series: observed log10(prop) for uncensored, model's
+        # conditional expectation under censoring for censored. Use the
+        # finite-sample-corrected sigma so the imputation matches the
+        # variance structure used elsewhere in the small-N corrections.
+        sigma_for_imp = float(np.sqrt(sigma_corrected_sq))
+        imputed_log10 = np.where(
+            censored,
+            np.nan,  # filled below
+            y,       # observed log10(prop) (pre-clipped at L for censored
+                     # rows, so we must overwrite those — done next)
+        )
+        if censored.any():
+            imputed_log10[censored] = _tobit_conditional_expectation(
+                X[censored], fit["beta"], sigma_for_imp, L
+            )
+        # Re-fill uncensored rows with the unclipped observed log10(prop)
+        # — y was clipped at L for censored rows, but uncensored rows
+        # already hold their true observed value, so no change there.
+        imputed_series = pd.Series(imputed_log10, index=df.index)
+        base["imputed_log10_props"] = imputed_series
+
+        censored_series = pd.Series(censored, index=df.index, dtype=bool)
+        base["censored_mask"] = censored_series
 
     if test == "omnibus":
         # Wald F-test on the joint group coefficients with finite-sample
@@ -1682,6 +1714,183 @@ def compute_nonparametric_pvalues(
     return pd.Series(pvals, index=results.index)
 
 
+# -------- Covariate-corrected (NNLS-scale) panel & companion tests --------
+
+def covariate_correct_and_test(
+    w: pd.DataFrame,
+    metadata: pd.DataFrame,
+    group_col: str,
+    covariates: list,
+    test: str,
+) -> dict:
+    """Per cell type, fit OLS  w[ct] ~ group + covariates  on the raw
+    NNLS-proportion scale (no CLR, no refinement), then subtract the
+    covariate-only effect  beta_cov · (X_cov - mean(X_cov))  per sample
+    so that each corrected value carries only intercept + group effect
+    + residual. Re-run Mann-Whitney (or Kruskal-Wallis) on the corrected
+    values; report the OLS group-term p-value from the same fit.
+
+    By the Frisch-Waugh-Lovell theorem the OLS p-value for the group
+    coefficient in the full model is identical to the OLS p-value you
+    would get from a one-way ANOVA on the corrected values, so the
+    label "OLS p on covariate-corrected NNLS" is honest. The MW p,
+    however, differs from MW on raw values because the rank order
+    changes once covariate-driven within-group variation is removed
+    (this is the whole point of the covariate-corrected panel).
+
+    Returns a dict with keys:
+      w_corrected : pd.DataFrame (samples x cell_types) on the
+          proportion scale; values can go slightly below 0 when the
+          covariate effect overshoots the raw value, and that is shown
+          honestly to the reader.
+      ols_p, mw_p : nested dicts of shape  {ct: {level: p}}  (pairwise)
+          or  {ct: {None: p}}  (omnibus). NaN where the cell type has
+          insufficient samples or the OLS fit failed.
+    """
+    if isinstance(metadata[group_col].dtype, pd.CategoricalDtype):
+        group_levels = list(metadata[group_col].cat.categories)
+    else:
+        group_levels = sorted(
+            metadata[group_col].dropna().unique().tolist()
+        )
+
+    common = w.index.intersection(metadata.index)
+    meta = metadata.loc[common]
+    needed = [group_col] + covariates
+    valid = meta[needed].notna().all(axis=1)
+    meta_valid = meta[valid]
+
+    w_corr = pd.DataFrame(
+        np.nan, index=w.index, columns=w.columns, dtype=float
+    )
+    ols_p_lookup: dict = {}
+    mw_p_lookup: dict = {}
+    group_pattern = f'C(Q("{group_col}"))'
+
+    import patsy
+
+    for ct in w.columns:
+        df = meta_valid.copy()
+        df["__y__"] = w[ct].reindex(df.index)
+        df = df.dropna(subset=["__y__"])
+        if len(df) < len(covariates) + 2:
+            ols_p_lookup[ct] = {None: float("nan")}
+            mw_p_lookup[ct] = {None: float("nan")}
+            continue
+
+        formula = build_formula("__y__", group_col, covariates, df)
+        try:
+            fit = smf.ols(formula, data=df).fit()
+        except Exception:
+            ols_p_lookup[ct] = {None: float("nan")}
+            mw_p_lookup[ct] = {None: float("nan")}
+            continue
+
+        # Build covariate-corrected values  y_adj = y - beta_cov ·
+        # (X_cov - mean(X_cov)). The intercept and group-dummy columns
+        # are excluded so y_adj keeps the intercept and the per-sample
+        # group effect; only the covariate-driven within-group variation
+        # is removed.
+        try:
+            _, X_design = patsy.dmatrices(
+                formula, df, return_type="dataframe"
+            )
+            cov_cols = [
+                c for c in X_design.columns
+                if c != "Intercept" and not c.startswith(group_pattern)
+            ]
+            if cov_cols:
+                X_cov = X_design[cov_cols].to_numpy()
+                X_cov_mean = X_cov.mean(axis=0, keepdims=True)
+                beta_cov = np.array(
+                    [float(fit.params[c]) for c in cov_cols]
+                )
+                cov_effect = (X_cov - X_cov_mean) @ beta_cov
+            else:
+                cov_effect = np.zeros(len(df))
+        except Exception:
+            cov_effect = np.zeros(len(df))
+
+        y_orig = df["__y__"].to_numpy()
+        y_adj = y_orig - cov_effect
+        for sample, val in zip(df.index, y_adj):
+            w_corr.at[sample, ct] = float(val)
+
+        # OLS group-term p-value(s) from the full fit. By FWL these are
+        # identical to OLS p-values from a one-way ANOVA on y_adj.
+        group_params = [
+            t for t in fit.params.index if t.startswith(group_pattern)
+        ]
+        if test == "omnibus":
+            try:
+                anova = anova_lm(fit, typ=2)
+                row_label = next(
+                    (idx for idx in anova.index
+                     if idx.startswith(group_pattern)),
+                    None,
+                )
+                ols_p_lookup[ct] = {
+                    None: (float(anova.loc[row_label, "PR(>F)"])
+                           if row_label is not None else float("nan"))
+                }
+            except Exception:
+                ols_p_lookup[ct] = {None: float("nan")}
+        else:
+            ols_p_lookup[ct] = {
+                _strip_level(t, group_pattern): float(fit.pvalues[t])
+                for t in group_params
+            }
+
+        # MW (or KW) p-values on the corrected values per group.
+        groups_arr = df[group_col].to_numpy()
+        if test == "pairwise":
+            per_level: dict = {}
+            ref_g = group_levels[0]
+            ref_mask = (groups_arr == ref_g)
+            v_ref = y_adj[ref_mask]
+            for g in group_levels[1:]:
+                g_mask = (groups_arr == g)
+                v_g = y_adj[g_mask]
+                if len(v_ref) >= 1 and len(v_g) >= 1:
+                    try:
+                        per_level[g] = float(
+                            _scipy_stats.mannwhitneyu(
+                                v_ref, v_g, alternative="two-sided"
+                            ).pvalue
+                        )
+                    except Exception:
+                        per_level[g] = float("nan")
+                else:
+                    per_level[g] = float("nan")
+            mw_p_lookup[ct] = per_level
+        else:
+            arrs = []
+            for g in group_levels:
+                v_g = y_adj[groups_arr == g]
+                if len(v_g) >= 1:
+                    arrs.append(v_g)
+            if len(arrs) >= 2:
+                try:
+                    if len(arrs) == 2:
+                        p_mw = float(_scipy_stats.mannwhitneyu(
+                            arrs[0], arrs[1],
+                            alternative="two-sided",
+                        ).pvalue)
+                    else:
+                        p_mw = float(_scipy_stats.kruskal(*arrs).pvalue)
+                except Exception:
+                    p_mw = float("nan")
+            else:
+                p_mw = float("nan")
+            mw_p_lookup[ct] = {None: p_mw}
+
+    return {
+        "w_corrected": w_corr,
+        "ols_p": ols_p_lookup,
+        "mw_p": mw_p_lookup,
+    }
+
+
 # -------- Per-cell-type weights and detection masking --------------------
 
 def build_per_celltype_weights(
@@ -2176,6 +2385,74 @@ def bh_correct(p: np.ndarray) -> np.ndarray:
 
 # -------- Main ------------------------------------------------------------
 
+def _series_to_celltype_df(
+    log10_series: pd.Series, ct: str, plot_scale: str
+) -> pd.DataFrame:
+    """Wrap a per-sample log10(proportion) Series into a single-column
+    DataFrame on the user's plot scale, ready to feed into
+    _draw_violin_panel as `w`.
+
+    plot_scale="proportion": values become 10**log10_series.
+    plot_scale="log-proportion": values become 10**log10_series (the
+        panel function will re-log10 internally for its display).
+    plot_scale="clr": no clean per-celltype CLR (it's a relative
+        transform across all cell types); fall back to log10 directly so
+        the plot still renders something interpretable.
+    """
+    if plot_scale == "clr":
+        vals = log10_series
+    else:
+        vals = 10 ** log10_series
+    return pd.DataFrame({ct: vals.astype(float)}, index=log10_series.index)
+
+
+def _tobit_floor_in_plot_scale(
+    tobit_floor: Optional[float], plot_scale: str
+) -> Optional[float]:
+    """Convert the Tobit detection-floor value (a raw proportion, e.g.
+    1e-4) to whatever scale the violin panels are drawing on. Returns
+    None if the floor isn't supplied or can't be expressed.
+    """
+    if tobit_floor is None or not np.isfinite(tobit_floor):
+        return None
+    if plot_scale == "proportion":
+        return float(tobit_floor)
+    if plot_scale == "log-proportion":
+        return float(np.log10(max(tobit_floor, 1e-30)))
+    # clr scale: no clean per-celltype reference; skip the line.
+    return None
+
+
+def _compute_tobit_overlay_bars(
+    tobit_fit_series: pd.Series,
+    meta_aligned: pd.DataFrame,
+    group_col: str,
+    group_levels: list,
+    plot_scale: str,
+) -> dict:
+    """Compute per-group horizontal-bar y-values for the Tobit panel-3
+    overlay. Each bar position is the within-group mean of the Tobit
+    X·β prediction (log10 scale), back-transformed to the panel's
+    plot_scale. Mean of X·β over a group equals X̄_group · β — the
+    covariate-adjusted group mean at within-group covariate values.
+    """
+    out: dict = {}
+    for g in group_levels:
+        samples_g = meta_aligned[meta_aligned[group_col] == g].index
+        vals = tobit_fit_series.reindex(samples_g).dropna()
+        if vals.empty:
+            out[g] = float("nan")
+            continue
+        m_log10 = float(vals.mean())
+        if plot_scale == "proportion":
+            out[g] = float(10 ** m_log10)
+        elif plot_scale == "log-proportion":
+            out[g] = float(m_log10)
+        else:  # clr or any other scale — no meaningful back-transform.
+            out[g] = float("nan")
+    return out
+
+
 def _draw_violin_panel(
     ax,
     ct: str,
@@ -2194,6 +2471,9 @@ def _draw_violin_panel(
     secondary_p_dict: Optional[dict] = None,
     secondary_p_label: Optional[str] = None,
     secondary_q_dict: Optional[dict] = None,
+    overlay_bars: Optional[dict] = None,
+    imputed_mask_series: Optional[pd.Series] = None,
+    floor_line_y: Optional[float] = None,
 ) -> None:
     """Draw violins + jittered points + comparison brackets for one cell type
     on the given axis, annotated with a primary p-value (and optional
@@ -2202,6 +2482,20 @@ def _draw_violin_panel(
 
     primary_p_dict is keyed by group level (pairwise) or has a sentinel
     None key (omnibus). primary_p_label is e.g. "p" or "MW p".
+
+    Optional overlays (used by Tobit panels):
+
+    overlay_bars : dict {level -> y_value_in_native_units}
+        Draws a short horizontal bar at each group's x-position at the
+        given y-value. Used to display covariate-adjusted Tobit-fitted
+        group means on top of the raw violin.
+    imputed_mask_series : pd.Series of bool, indexed by sample
+        When provided, samples flagged True are rendered as open circles
+        (model-imputed latent values) instead of filled (observed). Used
+        by the Tobit option-2 latent panel.
+    floor_line_y : float
+        Draws a dashed horizontal reference line at this y-value (e.g.,
+        the censoring threshold). Used by the Tobit option-2 panel.
     """
     if plot_scale == "log-proportion":
         yvals_full = np.log10(w[ct].clip(lower=1e-7))
@@ -2213,11 +2507,18 @@ def _draw_violin_panel(
         yvals_full = w[ct]
         ylabel = f"proportion — {ct}"
 
+    # Pair sample IDs with values per group so we can split into
+    # observed/imputed when imputed_mask_series is provided.
+    samples_per_group = []
     data_per_group = []
     n_per_group = []
     for g in group_levels:
         samples_g = meta_aligned[meta_aligned[group_col] == g].index
-        vals_g = yvals_full.reindex(samples_g).dropna().to_numpy()
+        yvals_g = yvals_full.reindex(samples_g)
+        valid = yvals_g.notna()
+        samples_g_valid = samples_g[valid]
+        vals_g = yvals_g[valid].to_numpy()
+        samples_per_group.append(samples_g_valid)
         data_per_group.append(vals_g)
         n_per_group.append(len(vals_g))
 
@@ -2256,14 +2557,67 @@ def _draw_violin_panel(
             parts["cmedians"].set_color("black")
             parts["cmedians"].set_linewidth(1.0)
 
-    for i, vals in enumerate(data_per_group):
-        if len(vals) == 0:
-            continue
-        xj = i + rng.normal(0, 0.05, size=len(vals))
-        ax.scatter(
-            xj, vals, s=22, alpha=0.75,
-            edgecolor="black", linewidth=0.4, zorder=3,
+    # Optional dashed reference line at the censoring floor (used by the
+    # Tobit option-2 latent panel). Drawn behind the violins/points.
+    if floor_line_y is not None and np.isfinite(floor_line_y):
+        ax.axhline(
+            floor_line_y,
+            linestyle="--", color="gray", linewidth=0.8,
+            alpha=0.7, zorder=1,
         )
+
+    # Scatter: split into observed (filled) vs imputed (open) when
+    # imputed_mask_series is provided, otherwise the original single-pass
+    # filled scatter.
+    for i, (samples_g, vals_g) in enumerate(
+        zip(samples_per_group, data_per_group)
+    ):
+        if len(vals_g) == 0:
+            continue
+        if imputed_mask_series is not None:
+            imputed_g = (
+                imputed_mask_series.reindex(samples_g)
+                .fillna(False)
+                .astype(bool)
+                .to_numpy()
+            )
+            obs_idx = ~imputed_g
+            if obs_idx.any():
+                xj_obs = i + rng.normal(0, 0.05, size=int(obs_idx.sum()))
+                ax.scatter(
+                    xj_obs, vals_g[obs_idx],
+                    s=22, alpha=0.85,
+                    edgecolor="black", linewidth=0.4, zorder=3,
+                )
+            if imputed_g.any():
+                xj_imp = i + rng.normal(0, 0.05, size=int(imputed_g.sum()))
+                ax.scatter(
+                    xj_imp, vals_g[imputed_g],
+                    s=34, alpha=0.95,
+                    facecolor="none", edgecolor="C3",
+                    linewidth=1.4, zorder=4, marker="o",
+                )
+        else:
+            xj = i + rng.normal(0, 0.05, size=len(vals_g))
+            ax.scatter(
+                xj, vals_g, s=22, alpha=0.75,
+                edgecolor="black", linewidth=0.4, zorder=3,
+            )
+
+    # Optional overlay bars at fitted group means (used by Tobit
+    # option-1 panel). Drawn after points so the bar sits visibly on top
+    # of the scatter / violin.
+    if overlay_bars is not None:
+        for i, g in enumerate(group_levels):
+            bar_y = overlay_bars.get(g, float("nan"))
+            if not np.isfinite(bar_y):
+                continue
+            ax.plot(
+                [i - 0.22, i + 0.22],
+                [bar_y, bar_y],
+                color="C3", linewidth=2.4, solid_capstyle="round",
+                zorder=5,
+            )
 
     medians = [
         float(np.median(v)) if len(v) else float("nan")
@@ -2281,6 +2635,19 @@ def _draw_violin_panel(
 
     all_vals = np.concatenate([v for v in data_per_group if len(v) > 0])
     y_min, y_max = float(all_vals.min()), float(all_vals.max())
+    # Extend the y range to cover overlay bars and the floor reference
+    # line so the auto-fit ylim logic (below) doesn't truncate them.
+    extra_y = []
+    if overlay_bars is not None:
+        extra_y.extend(
+            float(v) for v in overlay_bars.values()
+            if isinstance(v, (int, float)) and np.isfinite(v)
+        )
+    if floor_line_y is not None and np.isfinite(floor_line_y):
+        extra_y.append(float(floor_line_y))
+    if extra_y:
+        y_min = min(y_min, min(extra_y))
+        y_max = max(y_max, max(extra_y))
     y_range = y_max - y_min if y_max > y_min else max(abs(y_max), 1.0)
 
     def _format_pq(p_label, p_val, q_val):
@@ -2416,6 +2783,10 @@ def plot_per_celltype_pdf(
     w_refined: Optional[pd.DataFrame] = None,
     view_mode: str = "raw",
     tobit_fitted_log10: Optional[dict] = None,
+    tobit_imputed_log10: Optional[dict] = None,
+    tobit_censored_mask: Optional[dict] = None,
+    tobit_floor: Optional[float] = None,
+    w_covariate_corrected: Optional[pd.DataFrame] = None,
 ) -> None:
     """Write one violin+jitter plot per cell type to a multi-page PDF.
 
@@ -2476,6 +2847,24 @@ def plot_per_celltype_pdf(
     # OLS-shadow columns (only present when --method=tobit ran OLS too).
     ols_lookup = _build_lookup("p_value_ols")
     ols_q_lookup = _build_lookup("q_value_ols")
+    # Covariate-corrected NNLS panel companion stats (populated when
+    # --covariates is non-empty and covariate_correct_and_test ran).
+    has_cov_corrected = (
+        w_covariate_corrected is not None
+        and "p_value_mw_adj" in results.columns
+    )
+    mw_adj_lookup = (
+        _build_lookup("p_value_mw_adj") if has_cov_corrected else {}
+    )
+    mw_adj_q_lookup = (
+        _build_lookup("q_value_mw_adj") if has_cov_corrected else {}
+    )
+    ols_adj_lookup = (
+        _build_lookup("p_value_ols_adj") if has_cov_corrected else {}
+    )
+    ols_adj_q_lookup = (
+        _build_lookup("q_value_ols_adj") if has_cov_corrected else {}
+    )
 
     # Group ordering: respect the Categorical category order when set
     # (so the user's --reference-group becomes the leftmost violin).
@@ -2534,55 +2923,163 @@ def plot_per_celltype_pdf(
             ols_q_dict = (
                 _per_ct(ols_q_lookup) if has_q_ols_shadow else param_q_dict
             )
+            mw_adj_dict = _per_ct(mw_adj_lookup) if has_cov_corrected else {}
+            mw_adj_q_dict = (
+                _per_ct(mw_adj_q_lookup) if has_cov_corrected else {}
+            )
+            ols_adj_dict = _per_ct(ols_adj_lookup) if has_cov_corrected else {}
+            ols_adj_q_dict = (
+                _per_ct(ols_adj_q_lookup) if has_cov_corrected else {}
+            )
 
             if show_dual:
-                tobit_series = (
+                tobit_fit_series = (
                     tobit_fitted_log10.get(ct)
                     if tobit_fitted_log10 is not None else None
                 )
-                n_panels = 3 if tobit_series is not None else 2
+                tobit_imp_series = (
+                    tobit_imputed_log10.get(ct)
+                    if tobit_imputed_log10 is not None else None
+                )
+                tobit_cens_series = (
+                    tobit_censored_mask.get(ct)
+                    if tobit_censored_mask is not None else None
+                )
+                # Variable-panel layout. Always 2 base panels:
+                #   * Raw (NNLS output) + MW p
+                #   * Refined + OLS p (CLR-OLS, the inferential pipeline)
+                # Optionally append:
+                #   * Covariate-corrected NNLS + MW p (corrected) +
+                #     OLS p on raw scale via FWL (when has_cov_corrected)
+                #   * Raw + Tobit p with red bars at Tobit-fitted
+                #     covariate-adjusted group means (when Tobit fit
+                #     data available)
+                #   * Tobit latent (open red circles for imputed dots,
+                #     dashed line at the censoring floor) (Tobit only)
+                show_tobit_panels = (
+                    tobit_fit_series is not None
+                    and tobit_imp_series is not None
+                )
+                show_cov_panel = (
+                    has_cov_corrected
+                    and w_covariate_corrected is not None
+                )
+                n_panels = 2
+                if show_cov_panel:
+                    n_panels += 1
+                if show_tobit_panels:
+                    n_panels += 2
                 fig, axes = plt.subplots(
                     1, n_panels,
                     figsize=(5.5 * n_panels, 4.8),
                 )
                 if n_panels == 1:
                     axes = [axes]
-                # Left: raw data with MW (p, q).
+                # Panel walker: increment as we render each panel so the
+                # downstream layout doesn't have to know which earlier
+                # panels were enabled.
+                panel_idx = 0
+                # Panel: raw data with MW (p, q).
                 _draw_violin_panel(
-                    axes[0], ct, w, group_levels, meta_aligned, group_col,
-                    plot_scale, w_clr_full, test, rng,
+                    axes[panel_idx], ct, w, group_levels, meta_aligned,
+                    group_col, plot_scale, w_clr_full, test, rng,
                     panel_title="Raw (NNLS output)",
                     primary_p_dict=mw_dict if has_mw else {None: float("nan")},
                     primary_p_label=f"{np_label} p",
                     primary_q_dict=mw_q_dict if has_q_mw else None,
                 )
-                # Middle: refined data with OLS (p, q). When --method=ols
-                # this is just the primary; when --method=tobit this is
-                # the OLS shadow column from the parallel OLS fit.
+                panel_idx += 1
+                # Panel: refined data with OLS (p, q). When
+                # --method=ols this is the primary; when --method=tobit
+                # this is the OLS shadow from the parallel OLS fit.
                 _draw_violin_panel(
-                    axes[1], ct, w_refined, group_levels, meta_aligned,
-                    group_col, plot_scale, w_refined_clr_full, test, rng,
+                    axes[panel_idx], ct, w_refined, group_levels,
+                    meta_aligned, group_col, plot_scale,
+                    w_refined_clr_full, test, rng,
                     panel_title="Refined (zeros → CI_upper/2; OLS)",
                     primary_p_dict=ols_dict,
                     primary_p_label="p",
                     primary_q_dict=ols_q_dict,
                 )
-                if tobit_series is not None:
-                    w_tobit_ct = pd.DataFrame(
-                        {ct: 10 ** tobit_series},
-                        index=tobit_series.index,
+                panel_idx += 1
+                if show_cov_panel:
+                    # Covariate-corrected NNLS panel: same proportion
+                    # scale as raw, but each sample's value has the
+                    # within-group covariate-driven variation removed
+                    # via OLS-on-raw. MW p (rerun on the corrected
+                    # values) and OLS p (group-term from the same fit;
+                    # FWL = OLS p on a one-way ANOVA of corrected
+                    # values) are annotated together so the reader can
+                    # see whether the parametric and rank-based tests
+                    # converge once the nuisance covariates are partialled
+                    # out.
+                    _draw_violin_panel(
+                        axes[panel_idx], ct, w_covariate_corrected,
+                        group_levels, meta_aligned, group_col,
+                        plot_scale, None, test, rng,
+                        panel_title=(
+                            "NNLS, covariate-corrected (β_cov · ΔX_cov "
+                            "removed)"
+                        ),
+                        primary_p_dict=mw_adj_dict,
+                        primary_p_label=f"{np_label} p (adj)",
+                        primary_q_dict=mw_adj_q_dict,
+                        secondary_p_dict=ols_adj_dict,
+                        secondary_p_label="OLS p (adj)",
+                        secondary_q_dict=ols_adj_q_dict,
+                    )
+                    panel_idx += 1
+                if show_tobit_panels:
+                    # Same raw data as panel 1, with overlay bars at
+                    # the covariate-adjusted Tobit-fitted group means.
+                    # Convert log10 -> proportion for the bar y-position
+                    # by taking the mean of the X·β predictions per
+                    # group.
+                    tobit_bars = _compute_tobit_overlay_bars(
+                        tobit_fit_series=tobit_fit_series,
+                        meta_aligned=meta_aligned,
+                        group_col=group_col,
+                        group_levels=group_levels,
+                        plot_scale=plot_scale,
                     )
                     _draw_violin_panel(
-                        axes[2], ct, w_tobit_ct, group_levels, meta_aligned,
-                        group_col, plot_scale, None, test, rng,
+                        axes[panel_idx], ct, w, group_levels,
+                        meta_aligned, group_col, plot_scale,
+                        w_clr_full, test, rng,
                         panel_title=(
-                            "Tobit-fitted (regression prediction X·β per sample; "
-                            "spread reflects covariate variation only)"
+                            "Raw + Tobit-fitted group means (red bars)"
                         ),
                         primary_p_dict=param_dict,  # primary = Tobit
                         primary_p_label="Tobit p",
                         primary_q_dict=param_q_dict,
+                        overlay_bars=tobit_bars,
                     )
+                    panel_idx += 1
+                    # Tobit-imputed latent values per sample. Censored
+                    # samples get E[Y*|Y<L,X] (open red circles);
+                    # uncensored samples keep their observed log10(prop)
+                    # (filled black-edged circles). Floor line drawn at
+                    # tobit_floor (proportion-scale).
+                    w_latent_ct = _series_to_celltype_df(
+                        tobit_imp_series, ct, plot_scale
+                    )
+                    floor_y = _tobit_floor_in_plot_scale(
+                        tobit_floor, plot_scale
+                    )
+                    _draw_violin_panel(
+                        axes[panel_idx], ct, w_latent_ct, group_levels,
+                        meta_aligned, group_col, plot_scale, None,
+                        test, rng,
+                        panel_title=(
+                            "Tobit latent (○ = imputed, < detection floor)"
+                        ),
+                        primary_p_dict=param_dict,  # primary = Tobit
+                        primary_p_label="Tobit p",
+                        primary_q_dict=param_q_dict,
+                        imputed_mask_series=tobit_cens_series,
+                        floor_line_y=floor_y,
+                    )
+                    panel_idx += 1
                 fig.suptitle(ct, fontsize=12, fontweight="bold")
                 fig.tight_layout()
                 pdf.savefig(fig)
@@ -3197,7 +3694,10 @@ def main() -> int:
     # (not CLR) and explicit left-censoring at --tobit-floor. We collect
     # per-cell-type fitted Series for the visualization.
     tobit_fitted_log10: dict = {}  # ct -> pd.Series of log10 fitted values
-    tobit_censored_mask: dict = {}  # ct -> pd.Series of bool (True if censored)
+    tobit_imputed_log10: dict = {}  # ct -> pd.Series of log10 values, censored
+                                    #     rows replaced by E[Y*|Y<L,X]
+    tobit_censored_mask: dict = {}  # ct -> pd.Series of bool (True if censored
+                                    #     in the fit; matches fit-time mask)
 
     rows: list[dict] = []
 
@@ -3227,6 +3727,10 @@ def main() -> int:
                 [c for c in df_ct.columns if c not in w_clr.columns]
             ]
             w_raw_ct = w_raw[ct].reindex(df_ct.index)
+            # Provisional censored mask from raw values + tobit_floor; the
+            # fit may drop rows with NaN covariates so we'll overwrite
+            # this with the fit-time mask via the returned `censored_mask`
+            # series below (fit-time mask is the authoritative one).
             tobit_censored_mask[ct] = (w_raw_ct <= args.tobit_floor)
             res = fit_one_celltype_tobit(
                 cell_type=ct,
@@ -3243,6 +3747,12 @@ def main() -> int:
                 fs = r.pop("fitted_log10_props", None)
                 if fs is not None:
                     tobit_fitted_log10[ct] = fs
+                im = r.pop("imputed_log10_props", None)
+                if im is not None:
+                    tobit_imputed_log10[ct] = im
+                cm = r.pop("censored_mask", None)
+                if cm is not None:
+                    tobit_censored_mask[ct] = cm
             return res
         except Exception as exc:  # pragma: no cover
             if args.verbose:
@@ -3475,6 +3985,77 @@ def main() -> int:
         results=results,
     )
     results["q_value_mw"] = bh_correct(results["p_value_mw"].to_numpy())
+
+    # ---- Covariate-corrected NNLS panel companion stats --------------
+    # For the covariate-corrected visualization panel: per cell type,
+    # fit OLS on raw NNLS proportions (not CLR), strip the within-group
+    # covariate-driven variation, and rerun MW/KW + report the OLS
+    # group-term p-value. This shows the user what the data looks like
+    # once age/sex/etc. effects are removed, alongside the original
+    # raw + refined views. Skipped when no covariates are configured
+    # (would be redundant with the raw panel).
+    w_covariate_corrected: Optional[pd.DataFrame] = None
+    cov_corrected_mw_lookup: dict = {}
+    cov_corrected_ols_lookup: dict = {}
+    cov_corrected_mw_q_lookup: dict = {}
+    cov_corrected_ols_q_lookup: dict = {}
+    if covariates:
+        cc = covariate_correct_and_test(
+            w=w_raw_filtered,
+            metadata=metadata.loc[df.index],
+            group_col=args.group_col,
+            covariates=covariates,
+            test=args.test,
+        )
+        w_covariate_corrected = cc["w_corrected"]
+        cov_corrected_mw_lookup = cc["mw_p"]
+        cov_corrected_ols_lookup = cc["ols_p"]
+
+        # Add per-(cell_type, level) p-value columns to results so the
+        # TSV self-documents the corrected-panel numbers, and so BH
+        # operates over the same cell-type universe as the other
+        # q-value columns.
+        def _flat_pval_for_row(lookup: dict, row) -> float:
+            ct = row.get("cell_type")
+            d = lookup.get(ct, {})
+            if not isinstance(d, dict):
+                return float("nan")
+            if args.test == "pairwise" and "level" in results.columns:
+                return float(d.get(row.get("level"), float("nan")))
+            # omnibus: lookup keyed by None
+            if None in d:
+                return float(d[None])
+            # fallback if pairwise lookups exist but row has no level
+            return float(next(iter(d.values()), float("nan")))
+
+        results["p_value_mw_adj"] = results.apply(
+            lambda r: _flat_pval_for_row(cov_corrected_mw_lookup, r),
+            axis=1,
+        )
+        results["p_value_ols_adj"] = results.apply(
+            lambda r: _flat_pval_for_row(cov_corrected_ols_lookup, r),
+            axis=1,
+        )
+        results["q_value_mw_adj"] = bh_correct(
+            results["p_value_mw_adj"].to_numpy()
+        )
+        results["q_value_ols_adj"] = bh_correct(
+            results["p_value_ols_adj"].to_numpy()
+        )
+
+        # Build {ct: {level: q}} dicts mirroring the lookup shape so
+        # the plot dispatcher can annotate the corrected panel without
+        # re-deriving from the results DataFrame.
+        for col, dst in (
+            ("q_value_mw_adj", cov_corrected_mw_q_lookup),
+            ("q_value_ols_adj", cov_corrected_ols_q_lookup),
+        ):
+            for _, r in results.iterrows():
+                ct = r.get("cell_type")
+                if ct is None:
+                    continue
+                lvl = r.get("level") if args.test == "pairwise" else None
+                dst.setdefault(ct, {})[lvl] = float(r.get(col, float("nan")))
 
     # ---- Empirical-Bayes variance shrinkage (limma-style) ------------
     # Recomputes p_value using moderated t (pairwise) / moderated F (omnibus)
@@ -3861,6 +4442,24 @@ def main() -> int:
                 tobit_fitted_log10
                 if (args.method == "tobit" and tobit_fitted_log10)
                 else None
+            ),
+            tobit_imputed_log10=(
+                tobit_imputed_log10
+                if (args.method == "tobit" and tobit_imputed_log10)
+                else None
+            ),
+            tobit_censored_mask=(
+                tobit_censored_mask
+                if (args.method == "tobit" and tobit_censored_mask)
+                else None
+            ),
+            tobit_floor=(
+                float(args.tobit_floor)
+                if args.method == "tobit" else None
+            ),
+            w_covariate_corrected=(
+                w_covariate_corrected.reindex(df.index)
+                if w_covariate_corrected is not None else None
             ),
         )
 
