@@ -1660,6 +1660,55 @@ def test_pipeline_mean_coverage_uses_all_markers_not_only_used_markers(tmp_path)
             f"mean_coverage {mc} looks like used-marker coverage {expected_used_markers_cov}"
 
 
+def test_coverage_tier_uses_pre_imputation_counts(tmp_path):
+    """Regression: coverage_tier/mean_coverage must not be computed on imputed n.
+
+    Build a cohort where sample ``s_0`` has almost no observed reads (one marker
+    with n=1, all others absent), but same-group donors have deep coverage so
+    imputation fills nearly all markers. The sample should still report ULTRALOW
+    based on pre-imputation depth.
+    """
+    from finaleme_too.config import TOOConfig
+    from finaleme_too.pipeline import TOOPipeline
+    from finaleme_too.preprocessing.coverage import FRAGMENT_LENGTH_BP
+
+    # n_samples=8 -> first 4 are group A, giving s_0 exactly 3 same-group donors.
+    sheet, reference, marker_regions = _build_synth_cohort(tmp_path, n_samples=8)
+
+    # Replace s_0 with a BED containing a single low-count marker.
+    bed = Path(sheet.samples[0].methylation_file)
+    first = bed.read_text().splitlines()[0].split("\t")
+    first[7] = "1"  # total_count
+    bed.write_text("\n".join(["\t".join(first)]) + "\n")
+
+    cfg = TOOConfig()
+    cfg.threads = 1
+    cfg.uncertainty.n_bootstrap = 5
+    cfg.uncertainty.seed = 11
+    cfg.markers.n_per_type = 0  # skip marker selection
+    cfg.coverage.tier_high = 10.0
+    cfg.coverage.tier_low = 0.5
+
+    out_dir = tmp_path / "out_cov_pre_impute"
+    out_dir.mkdir(exist_ok=True)
+    TOOPipeline(cfg).run(sheet, reference, marker_regions, out_dir)
+
+    qc = pd.read_csv(out_dir / "qc_summary.tsv", sep="\t")
+    sid = sheet.samples[0].sample_id
+    tier = str(qc.loc[qc["metric"] == "coverage_tier", sid].iloc[0])
+    mean_cov = float(qc.loc[qc["metric"] == "mean_coverage", sid].iloc[0])
+    pct_imputed = float(qc.loc[qc["metric"] == "pct_imputed", sid].iloc[0])
+
+    total_marker_width = int(np.sum(marker_regions.end - marker_regions.start))
+    expected_pre_impute_cov = (1 * FRAGMENT_LENGTH_BP) / total_marker_width
+
+    assert pct_imputed > 0.9, "sanity check: cohort imputation should have run"
+    assert tier == "ULTRALOW", f"expected ULTRALOW from raw depth, got {tier}"
+    assert abs(mean_cov - expected_pre_impute_cov) < 1e-3, (
+        f"mean_coverage {mean_cov} should use pre-imputation depth {expected_pre_impute_cov}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # April 2026 — .too.tsv header comment documenting reliability semantics
 # ---------------------------------------------------------------------------

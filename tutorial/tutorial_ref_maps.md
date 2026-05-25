@@ -624,7 +624,7 @@ results/cgi_shore_atlas/
 
 ---
 
-## 9. Training a FinaleMe calibration for `finaleme-too`
+## 9. Training a FinaleMe calibration for `finaleme-too` (Still under development, DO NOT USE IT!)
 
 The Python `finaleme-too` package (a separate tool from `BetaValueDeconvolution`) can use a
 per-CpG-density calibration model to map FinaleMe predictions onto the same scale as
